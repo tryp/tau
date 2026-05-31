@@ -587,7 +587,7 @@ export function registerBackgroundJobs(
                                 `- decision "check": inspect the output first\n` +
                                 `- decision "keep": let it continue running\n` +
                                 `- decision "kill": terminate it\n\n` +
-                                `Do NOT use jobs action "attach" on this job — it will block indefinitely.`,
+                                `Use jobs action "attach" with a timeout to monitor its progress with periodic updates.`,
                             display: true,
                             details: {
                                 jobId: job.id,
@@ -763,13 +763,19 @@ export function registerBackgroundJobs(
         name: "jobs",
         label: "Background Jobs",
         description:
-            "List, inspect, kill, or attach to background jobs. Output is read from disk files.",
+            "List, inspect, kill, or attach to background jobs. Output is read from disk files. " +
+            "Jobs(attach) is non-blocking — it polls the job periodically and streams progress " +
+            "updates to the agent. The agent can abort at any time, and a configurable timeout " +
+            "(default 10 min) prevents indefinite blocking.",
         promptSnippet: "Manage background jobs (list/output/kill/attach)",
         promptGuidelines: [
             "Use jobs with action 'list' to see all background jobs.",
             "Use jobs with action 'output' to read a job's output from its log file.",
             "Use jobs with action 'kill' to terminate a running background job.",
-            "Use jobs with action 'attach' to wait for a running job and get its final output.",
+            "Use jobs with action 'attach' to monitor a running job with progress polling; " +
+                "attach is safe to use — it will not block indefinitely (has a timeout).",
+            "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
+                "default is 600 (10 minutes).",
         ],
         parameters: Type.Object({
             action: StringEnum(["list", "output", "kill", "attach"] as const, {
@@ -784,6 +790,13 @@ export function registerBackgroundJobs(
                 Type.Boolean({
                     description:
                         "For attach: wait for completion (default true)",
+                })
+            ),
+            timeout: Type.Optional(
+                Type.Number({
+                    description:
+                        "For attach: max seconds to wait before returning partial output " +
+                        "(default 600 = 10 minutes)",
                 })
             ),
         }),
@@ -865,41 +878,137 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
 
+                    // If already done or wait=false, return output immediately
                     const waitForCompletion = params.wait ?? true;
-                    const skipWait =
-                        state.pendingDecisionJobId === job.id &&
-                        job.status === "running";
+                    if (job.status !== "running" || !waitForCompletion) {
+                        const output = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        job.outputConsumed = true;
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        job.status !== "running"
+                                            ? `Attach finished for ${job.id}. Status: ${job.status}\nLog: ${job.logPath}\n\n${output}`
+                                            : `Job ${job.id} (${job.status})\nLog: ${job.logPath}\n\n${output}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
 
-                    if (
-                        job.status === "running" &&
-                        waitForCompletion &&
-                        !skipWait
-                    ) {
-                        if (!job.donePromise) createJobDonePromise(job);
+                    // Ensure donePromise exists
+                    if (!job.donePromise) createJobDonePromise(job);
 
+                    const POLL_INTERVAL_MS = 5_000;
+                    const MAX_ATTACH_MS =
+                        (params.timeout ?? 600) * 1_000;
+                    const deadline = Date.now() + MAX_ATTACH_MS;
+
+                    // Non-blocking poll loop with progress updates.
+                    // Polls periodically; exits promptly when the job completes
+                    // (via donePromise race), the signal is aborted, or the
+                    // timeout expires.
+                    while (job.status === "running") {
+                        // Check abort signal
+                        if (signal?.aborted) {
+                            break;
+                        }
+
+                        // Check timeout
+                        if (Date.now() >= deadline) {
+                            break;
+                        }
+
+                        // Read latest output
+                        const tail = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        const runtime = formatDuration(
+                            Date.now() - job.startTime
+                        );
+                        const timeLeft = Math.round(
+                            (deadline - Date.now()) / 1000
+                        );
+
+                        // Send progress update to agent
                         onUpdate?.({
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Attaching to ${job.id} (${job.status})...`,
+                                    text:
+                                        `Attaching to ${job.id} (running ${runtime}, ` +
+                                        `${timeLeft}s timeout remaining)...\n\n${tail}`,
                                 },
                             ],
                             details: undefined,
                         });
 
-                        await job.donePromise;
+                        // Wait for either the next poll interval or job completion
+                        await Promise.race([
+                            new Promise<void>((resolve) =>
+                                setTimeout(resolve, POLL_INTERVAL_MS)
+                            ),
+                            job.donePromise,
+                        ]);
                     }
 
+                    // Read final output
                     const output = await readOutputTail(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
                     job.outputConsumed = true;
+
+                    if (signal?.aborted) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `Attach aborted for ${job.id}. ` +
+                                        `Job is still running.\n` +
+                                        `Log: ${job.logPath}\n\n${output}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    if (Date.now() >= deadline) {
+                        const runtime = formatDuration(
+                            Date.now() - job.startTime
+                        );
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `⚠️ Attach timed out after ${MAX_ATTACH_MS / 1000}s ` +
+                                        `for ${job.id}. Job is still running ` +
+                                        `(${runtime}).\n` +
+                                        `PID: ${job.pid}\n` +
+                                        `Log: ${job.logPath}\n\n${output}\n\n` +
+                                        `Use jobs(output) to check again, ` +
+                                        `or jobs(kill) to terminate.`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
                     return {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Attach finished for ${job.id}. Status: ${job.status}\nLog: ${job.logPath}\n\n${output}`,
+                                text:
+                                    `Attach finished for ${job.id}. ` +
+                                    `Status: ${job.status}\n` +
+                                    `Log: ${job.logPath}\n\n${output}`,
                             },
                         ],
                         details: undefined,
