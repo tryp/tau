@@ -37,6 +37,11 @@ export class TauState {
     /** Model context window in tokens. Used by agent_bg to choose fork vs summary. */
     contextWindowTokens?: number;
 
+    // ── Background jobs widget visibility ───────────────────────────
+
+    /** When true, the pill-bar jobs widget above the editor is hidden. */
+    jobsWidgetHidden = true;
+
     // ── Reload bridge ──────────────────────────────────────────────────
 
     /**

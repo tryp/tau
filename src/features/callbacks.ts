@@ -27,7 +27,7 @@ import type {
     ExtensionAPI,
     ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -45,6 +45,11 @@ export interface ScheduledCallback {
     fired: boolean;
     /** Timer handle (not persisted). */
     timer?: ReturnType<typeof setTimeout>;
+    /** Optional job ID to link this callback to. When the job completes
+     *  or is killed, the callback is automatically cancelled. */
+    linkedJobId?: string;
+    /** Optional group label for bulk cancel operations. */
+    group?: string;
 }
 
 // ─── Duration parsing ───────────────────────────────────────────────
@@ -85,21 +90,95 @@ function callbacksDir(sessionId: string): string {
     return join(homedir(), ".pi", "callbacks", sessionId);
 }
 
-// ─── Feature registration ───────────────────────────────────────────
+// ─── Module-level state ────────────────────────────────────────────
+//
+// Kept at module level so exported functions like cancelCallbacksForJob()
+// can access the live callback map without complex wiring.
 
-export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
-    let nextId = 1;
-    const callbacks = new Map<string, ScheduledCallback>();
-    let watcher: ReturnType<typeof watch> | null = null;
-    let sessionId = "";
+const callbacks = new Map<string, ScheduledCallback>();
+let cbNextId = 1;
+let _pi: ExtensionAPI | null = null;
+let _sessionId = "";
+let _watcher: ReturnType<typeof watch> | null = null;
 
-    // ── Core operations ────────────────────────────────────────────
-
-    function generateId(): string {
-        return `cb-${nextId++}`;
+/**
+ * Cancel all pending callbacks linked to a given job ID.
+ * Called by the background jobs feature when a job completes or is killed.
+ */
+export function cancelCallbacksForJob(jobId: string): number {
+    let count = 0;
+    for (const [id, cb] of callbacks) {
+        if (cb.linkedJobId === jobId && !cb.fired) {
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            count++;
+        }
     }
+    if (count > 0) persistState();
+    return count;
+}
 
-    function scheduleCallback(cb: ScheduledCallback): void {
+/**
+ * Cancel all pending callbacks in a given group.
+ */
+export function cancelCallbacksForGroup(group: string): number {
+    let count = 0;
+    for (const [id, cb] of callbacks) {
+        if (cb.group === group && !cb.fired) {
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            count++;
+        }
+    }
+    if (count > 0) persistState();
+    return count;
+}
+
+/**
+ * Schedule a callback linked to a background job.
+ * Auto-cancelled when the job completes via cancelCallbacksForJob().
+ * Returns the callback ID, or null if remindIn is invalid.
+ */
+export function scheduleJobReminder(
+    jobId: string,
+    remindIn: string,
+    message?: string
+): string | null {
+    const delayMs = parseDurationToMs(remindIn);
+    if (delayMs === null) return null;
+
+    const now = new Date();
+    const fireAt = new Date(now.getTime() + delayMs);
+    const id = generateId();
+
+    const cb: ScheduledCallback = {
+        id,
+        message: message ?? `check on job ${jobId}`,
+        fireAt: fireAt.toISOString(),
+        createdAt: now.toISOString(),
+        source: "agent",
+        fired: false,
+        linkedJobId: jobId,
+    };
+
+    scheduleCallback(cb);
+    persistState();
+    return id;
+}
+
+// ─── Core operations (module-level) ────────────────────────────────
+
+function generateId(): string {
+    return `cb-${cbNextId++}`;
+}
+
+function scheduleCallback(cb: ScheduledCallback): void {
         callbacks.set(cb.id, cb);
         const delay = new Date(cb.fireAt).getTime() - Date.now();
 
@@ -119,184 +198,194 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
         }
     }
 
-    function fireCallback(id: string): void {
-        const cb = callbacks.get(id);
-        if (!cb || cb.fired) return;
+function fireCallback(id: string): void {
+    const cb = callbacks.get(id);
+    if (!cb || cb.fired) return;
 
-        cb.fired = true;
-        if (cb.timer) {
-            clearTimeout(cb.timer);
-            cb.timer = undefined;
-        }
+    cb.fired = true;
+    if (cb.timer) {
+        clearTimeout(cb.timer);
+        cb.timer = undefined;
+    }
 
-        const elapsed = formatDuration(
-            Date.now() - new Date(cb.createdAt).getTime()
-        );
+    const elapsed = formatDuration(
+        Date.now() - new Date(cb.createdAt).getTime()
+    );
 
-        pi.sendUserMessage(
+    if (_pi) {
+        _pi.sendUserMessage(
             `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${cb.message}\n</callback>`,
             { deliverAs: "followUp" }
         );
-
-        // Remove from map after firing
-        callbacks.delete(id);
-
-        // Update persisted state
-        persistState();
     }
 
-    function cancelCallback(id: string): boolean {
-        const cb = callbacks.get(id);
-        if (!cb || cb.fired) return false;
+    // Remove from map after firing
+    callbacks.delete(id);
 
+    // Update persisted state
+    persistState();
+}
+
+function cancelCallback(id: string): boolean {
+    const cb = callbacks.get(id);
+    if (!cb || cb.fired) return false;
+
+    if (cb.timer) {
+        clearTimeout(cb.timer);
+        cb.timer = undefined;
+    }
+    callbacks.delete(id);
+    persistState();
+    return true;
+}
+
+function cancelAll(): number {
+    let count = 0;
+    for (const cb of callbacks.values()) {
         if (cb.timer) {
             clearTimeout(cb.timer);
             cb.timer = undefined;
         }
-        callbacks.delete(id);
-        persistState();
-        return true;
+        count++;
+    }
+    callbacks.clear();
+    persistState();
+    return count;
+}
+
+function persistState(): void {
+    if (!_pi) return;
+    const pending = Array.from(callbacks.values())
+        .filter((cb) => !cb.fired)
+        .map((cb) => ({
+            id: cb.id,
+            message: cb.message,
+            fireAt: cb.fireAt,
+            createdAt: cb.createdAt,
+            source: cb.source,
+            linkedJobId: cb.linkedJobId,
+            group: cb.group,
+        }));
+
+    _pi.appendEntry("callbacks-state", {
+        callbacks: pending,
+        nextId: cbNextId,
+    });
+}
+
+// ── External callback watcher (module-level) ──────────────────────
+
+function startExternalWatcher(sid: string): void {
+    const dir = callbacksDir(sid);
+    try {
+        mkdirSync(dir, { recursive: true });
+    } catch {
+        // Directory may already exist
     }
 
-    function cancelAll(): number {
-        let count = 0;
-        for (const cb of callbacks.values()) {
-            if (cb.timer) {
-                clearTimeout(cb.timer);
-                cb.timer = undefined;
+    try {
+        _watcher = watch(dir, (eventType, filename) => {
+            if (!filename) return;
+            if (eventType !== "rename" && eventType !== "change") return;
+            if (!filename.endsWith(".json")) return;
+
+            const filepath = join(dir, filename);
+            try {
+                const raw = readFileSync(filepath, "utf-8");
+                const payload = JSON.parse(raw) as {
+                    message: string;
+                    source?: string;
+                };
+
+                if (payload.message) {
+                    const cb: ScheduledCallback = {
+                        id: generateId(),
+                        message: payload.message,
+                        fireAt: new Date().toISOString(),
+                        createdAt: new Date().toISOString(),
+                        source: "external",
+                        fired: false,
+                    };
+
+                    // Fire immediately for external callbacks
+                    callbacks.set(cb.id, cb);
+                    fireCallback(cb.id);
+                }
+
+                // Clean up the file
+                try {
+                    rmSync(filepath);
+                } catch {
+                    // Already removed
+                }
+            } catch {
+                // File might not be fully written yet — ignore
             }
-            count++;
-        }
-        callbacks.clear();
-        persistState();
-        return count;
-    }
-
-    function persistState(): void {
-        const pending = Array.from(callbacks.values())
-            .filter((cb) => !cb.fired)
-            .map((cb) => ({
-                id: cb.id,
-                message: cb.message,
-                fireAt: cb.fireAt,
-                createdAt: cb.createdAt,
-                source: cb.source,
-            }));
-
-        pi.appendEntry("callbacks-state", {
-            callbacks: pending,
-            nextId,
         });
+    } catch {
+        // watch() may fail on some platforms — degrade gracefully
     }
 
-    // ── External callback watcher ──────────────────────────────────
+    // Also process any files that already exist (from before pi started)
+    processExistingCallbacks(sid);
+}
 
-    function startExternalWatcher(sid: string): void {
-        const dir = callbacksDir(sid);
-        try {
-            mkdirSync(dir, { recursive: true });
-        } catch {
-            // Directory may already exist
-        }
+function stopExternalWatcher(): void {
+    if (_watcher) {
+        _watcher.close();
+        _watcher = null;
+    }
+}
 
-        try {
-            watcher = watch(dir, (eventType, filename) => {
-                if (!filename) return;
-                if (eventType !== "rename" && eventType !== "change") return;
-                if (!filename.endsWith(".json")) return;
+function processExistingCallbacks(sid: string): void {
+    const dir = callbacksDir(sid);
+    try {
+        const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+        for (const filename of files) {
+            const filepath = join(dir, filename);
+            try {
+                const raw = readFileSync(filepath, "utf-8");
+                const payload = JSON.parse(raw) as {
+                    message: string;
+                    source?: string;
+                };
 
-                const filepath = join(dir, filename);
-                try {
-                    const raw = readFileSync(filepath, "utf-8");
-                    const payload = JSON.parse(raw) as {
-                        message: string;
-                        source?: string;
+                if (payload.message) {
+                    const cb: ScheduledCallback = {
+                        id: generateId(),
+                        message: payload.message,
+                        fireAt: new Date().toISOString(),
+                        createdAt: new Date().toISOString(),
+                        source: "external",
+                        fired: false,
                     };
-
-                    if (payload.message) {
-                        const cb: ScheduledCallback = {
-                            id: generateId(),
-                            message: payload.message,
-                            fireAt: new Date().toISOString(),
-                            createdAt: new Date().toISOString(),
-                            source: "external",
-                            fired: false,
-                        };
-
-                        // Fire immediately for external callbacks
-                        callbacks.set(cb.id, cb);
-                        fireCallback(cb.id);
-                    }
-
-                    // Clean up the file
-                    try {
-                        rmSync(filepath);
-                    } catch {
-                        // Already removed
-                    }
-                } catch {
-                    // File might not be fully written yet — ignore
+                    callbacks.set(cb.id, cb);
+                    fireCallback(cb.id);
                 }
-            });
-        } catch {
-            // watch() may fail on some platforms — degrade gracefully
-        }
-
-        // Also process any files that already exist (from before pi started)
-        processExistingCallbacks(sid);
-    }
-
-    function stopExternalWatcher(): void {
-        if (watcher) {
-            watcher.close();
-            watcher = null;
-        }
-    }
-
-    function processExistingCallbacks(sid: string): void {
-        const dir = callbacksDir(sid);
-        try {
-            const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-            for (const filename of files) {
-                const filepath = join(dir, filename);
                 try {
-                    const raw = readFileSync(filepath, "utf-8");
-                    const payload = JSON.parse(raw) as {
-                        message: string;
-                        source?: string;
-                    };
-
-                    if (payload.message) {
-                        const cb: ScheduledCallback = {
-                            id: generateId(),
-                            message: payload.message,
-                            fireAt: new Date().toISOString(),
-                            createdAt: new Date().toISOString(),
-                            source: "external",
-                            fired: false,
-                        };
-                        callbacks.set(cb.id, cb);
-                        fireCallback(cb.id);
-                    }
-                    try {
-                        rmSync(filepath);
-                    } catch {
-                        // Already removed
-                    }
+                    rmSync(filepath);
                 } catch {
-                    // Skip unreadable files
+                    // Already removed
                 }
+            } catch {
+                // Skip unreadable files
             }
-        } catch {
-            // Directory doesn't exist yet — that's fine
         }
+    } catch {
+        // Directory doesn't exist yet — that's fine
     }
+}
+
+// ─── Feature registration ───────────────────────────────────────────
+
+export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
 
     // ── Session lifecycle ──────────────────────────────────────────
 
     pi.on("session_start", async (event, ctx) => {
-        sessionId = ctx.sessionManager.getSessionId();
-        nextId = 1;
+        _sessionId = ctx.sessionManager.getSessionId();
+        _pi = pi;
+        cbNextId = 1;
 
         // Restore pending callbacks from the latest session entry.
         // Iterate in reverse to find the most recent callbacks-state
@@ -315,6 +404,8 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
                         fireAt: string;
                         createdAt: string;
                         source: "agent" | "user" | "external";
+                        linkedJobId?: string;
+                        group?: string;
                     }>;
                     nextId?: number;
                 };
@@ -329,14 +420,14 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
                     }
                 }
                 if (typeof data.nextId === "number") {
-                    nextId = Math.max(nextId, data.nextId);
+                    cbNextId = Math.max(cbNextId, data.nextId);
                 }
                 break;
             }
         }
 
         // Start watching for external callbacks
-        startExternalWatcher(sessionId);
+        startExternalWatcher(_sessionId);
     });
 
     pi.on("session_shutdown", async () => {
@@ -354,35 +445,71 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             }
         }
         callbacks.clear();
+        _pi = null;
     });
 
     // ── Agent tool: remind ──────────────────────────────────────────
 
     pi.registerTool({
         name: "remind",
-        label: "Schedule Callback",
+        label: "Remind / Manage Callbacks",
         description:
-            "Schedule a future callback to check on a task. " +
+            "Schedule, list, or cancel callbacks. " +
             "Use when you say 'I'll check on it later' or 'let me come back to this'. " +
             "The callback delivers a message to you at the specified time, " +
             "prompting you to follow up. " +
-            "Examples: remind in 2m to check the deploy, remind in 30s to review test results",
-        promptSnippet: "Schedule a future callback to check on a task",
+            "Examples: remind in 2m to check the deploy, remind in 30s to review test results. " +
+            "Use remind action=list to see pending callbacks, " +
+            "remind action=cancel id=cb-3 to cancel one, " +
+            "remind action=cancel-all to cancel all. " +
+            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
+            "bash_bg remindIn/remindMessage is a shortcut that does this automatically.",
+        promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
             "Prefer shorter intervals (30s-5m) for monitoring tasks.",
             "The callback message should be specific about what to check.",
             "Do NOT use remind for things you can verify now.",
+            "Use remind action=list to see pending callbacks with their IDs.",
+            "Use remind action=cancel id=cb-3 to cancel a specific callback.",
+            "Use remind action=cancel-all to cancel all pending callbacks.",
+            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
+            "bash_bg remindIn/remindMessage is a shortcut that does this automatically.",
         ],
         parameters: Type.Object({
-            message: Type.String({
-                description:
-                    "What to follow up on when the callback fires. Be specific.",
-            }),
-            in: Type.String({
-                description:
-                    'How long until the callback fires. Formats: "30s", "5m", "1h", "2d".',
-            }),
+            action: Type.Optional(
+                StringEnum(
+                    ["schedule", "list", "cancel", "cancel-all"] as const,
+                    {
+                        description:
+                            "What to do: schedule (default), list pending, cancel one, or cancel all.",
+                    }
+                )
+            ),
+            message: Type.Optional(
+                Type.String({
+                    description:
+                        "What to follow up on when the callback fires. Be specific. Required when action=schedule.",
+                })
+            ),
+            in: Type.Optional(
+                Type.String({
+                    description:
+                        'How long until the callback fires. Required when action=schedule. Formats: "30s", "5m", "1h", "2d".',
+                })
+            ),
+            id: Type.Optional(
+                Type.String({
+                    description:
+                        "Callback ID to cancel (e.g. cb-3). Required when action=cancel.",
+                })
+            ),
+            jobId: Type.Optional(
+                Type.String({
+                    description:
+                        "Optional job ID to link this callback to. When set, the callback auto-cancels if the background job completes or is killed before the timer fires.",
+                })
+            ),
         }),
 
         async execute(
@@ -392,47 +519,154 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             _onUpdate,
             _ctx
         ): Promise<AgentToolResult<undefined>> {
-            const delayMs = parseDurationToMs(params.in);
-            if (delayMs === null) {
-                return {
-                    content: [
-                        {
-                            type: "text" as const,
-                            text: `Invalid duration "${params.in}". Use formats like "30s", "5m", "1h", "2d".`,
-                        },
-                    ],
-                    details: undefined,
-                };
+            const action = params.action ?? "schedule";
+
+            switch (action) {
+                case "list": {
+                    const pending = Array.from(callbacks.values()).filter(
+                        (cb) => !cb.fired
+                    );
+                    if (pending.length === 0) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: "No pending callbacks.",
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+                    const lines = pending.map((cb) => {
+                        const relative = formatRelative(cb.fireAt);
+                        const jobTag = cb.linkedJobId
+                            ? ` [linked to ${cb.linkedJobId}]`
+                            : "";
+                        return `  ${cb.id}: "${cb.message}" — ${relative} (${cb.source})${jobTag}`;
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text" as const,
+                                text: `Pending callbacks (${pending.length}):\n${lines.join("\n")}`,
+                            },
+                        ],
+                        details: undefined,
+                    };
+                }
+
+                case "cancel": {
+                    if (!params.id) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: "id parameter is required for action=cancel.",
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+                    if (cancelCallback(params.id)) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Callback ${params.id} cancelled.`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    } else {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Callback ${params.id} not found or already fired.`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+                }
+
+                case "cancel-all": {
+                    const count = cancelAll();
+                    return {
+                        content: [
+                            {
+                                type: "text" as const,
+                                text: `Cancelled ${count} pending callback(s).`,
+                            },
+                        ],
+                        details: undefined,
+                    };
+                }
+
+                default: {
+                    // action == "schedule"
+                    if (!params.message || !params.in) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: "message and 'in' parameters are required for action=schedule.",
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    const delayMs = parseDurationToMs(params.in);
+                    if (delayMs === null) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Invalid duration "${params.in}". Use formats like "30s", "5m", "1h", "2d".`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    const now = new Date();
+                    const fireAt = new Date(now.getTime() + delayMs);
+                    const id = generateId();
+
+                    const cb: ScheduledCallback = {
+                        id,
+                        message: params.message,
+                        fireAt: fireAt.toISOString(),
+                        createdAt: now.toISOString(),
+                        source: "agent",
+                        fired: false,
+                        linkedJobId: params.jobId || undefined,
+                    };
+
+                    scheduleCallback(cb);
+                    persistState();
+
+                    let result =
+                        `Callback ${id} scheduled.\n` +
+                        `Message: ${params.message}\n` +
+                        `Fires: ${fireAt.toISOString()} (${formatDuration(delayMs)} from now)`;
+
+                    if (params.jobId) {
+                        result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
+                    }
+
+                    return {
+                        content: [
+                            {
+                                type: "text" as const,
+                                text: result,
+                            },
+                        ],
+                        details: undefined,
+                    };
+                }
             }
-
-            const now = new Date();
-            const fireAt = new Date(now.getTime() + delayMs);
-            const id = generateId();
-
-            const cb: ScheduledCallback = {
-                id,
-                message: params.message,
-                fireAt: fireAt.toISOString(),
-                createdAt: now.toISOString(),
-                source: "agent",
-                fired: false,
-            };
-
-            scheduleCallback(cb);
-            persistState();
-
-            return {
-                content: [
-                    {
-                        type: "text" as const,
-                        text:
-                            `Callback ${id} scheduled.\n` +
-                            `Message: ${params.message}\n` +
-                            `Fires: ${fireAt.toISOString()} (${formatDuration(delayMs)} from now)`,
-                    },
-                ],
-                details: undefined,
-            };
         },
     });
 
