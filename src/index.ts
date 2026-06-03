@@ -67,11 +67,40 @@ import { registerSessionName } from "./features/session-name.ts";
 import { registerSummarize } from "./features/summarize.ts";
 import { registerContext } from "./features/context.ts";
 import { registerWebBrowse } from "./features/web-browse/index.ts";
+import { Text } from "@earendil-works/pi-tui";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
 
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
+
+    // ── Compact renderer for job-completion messages ──────────────────
+
+    pi.registerMessageRenderer("job-completion", (message, _options, theme) => {
+        const d = message.details as {
+            jobId?: string;
+            status?: string;
+            exitCode?: number;
+            duration?: string;
+            command?: string;
+            logPath?: string;
+            outstandingJobs?: number;
+        };
+        const emoji = d?.status === "completed" ? "✅" : "❌";
+        const suffix =
+            (d?.outstandingJobs ?? 0) > 0
+                ? ` (${d!.outstandingJobs} jobs outstanding)`
+                : "";
+        const lines = [
+            `${emoji} ${d?.jobId ?? ""} ${d?.status ?? ""} (${d?.duration ?? ""})${suffix}`,
+            `   Command: ${d?.command ?? ""}`,
+            `   Output: ${d?.logPath ?? ""}`,
+        ];
+        if (d?.exitCode !== undefined) {
+            lines.push(`   Exit code: ${d.exitCode}`);
+        }
+        return new Text(lines.join("\n"), 0, 0);
+    });
 
     // ── Register all features ─────────────────────────────────────────
 

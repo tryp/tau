@@ -356,6 +356,7 @@ export function startStallWatchdog(
     command: string,
     logPath: string,
     pi: ExtensionAPI,
+    state: TauState,
     onOversize?: () => void
 ): () => void {
     let lastSize = 0;
@@ -371,10 +372,11 @@ export function startStallWatchdog(
                 cancelled = true;
                 clearInterval(timer);
                 if (onOversize) onOversize();
+                const suffix = outstandingJobsSuffix(state, jobId);
                 pi.sendMessage(
                     {
                         customType: "bg-stall",
-                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.`,
+                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.${suffix}`,
                         display: true,
                         details: { jobId, logPath, command },
                     },
@@ -406,10 +408,11 @@ export function startStallWatchdog(
                 `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
                 `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
 
+            const suffix = outstandingJobsSuffix(state, jobId);
             pi.sendMessage(
                 {
                     customType: "bg-stall",
-                    content: `⚠️ ${summary}`,
+                    content: `⚠️ ${summary}${suffix}`,
                     display: true,
                     details: { jobId, logPath, command },
                 },
@@ -525,6 +528,24 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     }
 }
 
+/** Build a suffix like " (3 jobs outstanding)" or empty string if 0 */
+function outstandingJobsSuffix(
+    state: TauState,
+    excludeJobId: string
+): string {
+    const count = Array.from(state.backgroundJobs.values()).filter((j) => {
+        if (j.id === excludeJobId) return false;
+        if (j.status !== "running") return false;
+        try {
+            if (j.pid) process.kill(j.pid, 0);
+            return true;
+        } catch {
+            return false;
+        }
+    }).length;
+    return count > 0 ? ` (${count} jobs outstanding)` : "";
+}
+
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
     job: BackgroundJob,
@@ -535,25 +556,29 @@ export function notifyCompletion(
     // Auto-cancel any callbacks linked to this job
     cancelCallbacksForJob(job.id);
 
-    if (job.outputConsumed) {
-        removeJob(state, job);
-        return;
-    }
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
-    const statusText = `Background ${job.id} ${job.status} (${duration})`;
-    const exitCodeText =
-        job.exitCode !== undefined ? `\nExit code: ${job.exitCode}` : "";
+    const suffix = outstandingJobsSuffix(state, job.id);
+    // Extract the count number from the suffix string
+    const outstandingCount = (() => {
+        const m = suffix.match(/\d+/);
+        return m ? parseInt(m[0], 10) : 0;
+    })();
 
-    ctx.ui.notify(statusText, job.status === "completed" ? "success" : "error");
+    ctx.ui.notify(
+        `${emoji} ${job.id} ${job.status} (${duration})${suffix}`,
+        job.status === "completed" ? "success" : "error"
+    );
 
     pi.sendMessage(
         {
             customType: "job-completion",
             content:
-                `${emoji} ${statusText}\n` +
-                `Command: ${job.command}\n` +
-                `Output: ${job.logPath}${exitCodeText}`,
+                `${emoji} ${job.id} ${job.status} (${duration})${suffix}` +
+                (job.exitCode !== undefined
+                    ? `, exit ${job.exitCode}`
+                    : "") +
+                `\nCommand: ${job.command}\nOutput: ${job.logPath}`,
             display: true,
             details: {
                 jobId: job.id,
@@ -562,6 +587,7 @@ export function notifyCompletion(
                 duration,
                 command: job.command,
                 logPath: job.logPath,
+                outstandingJobs: outstandingCount,
             },
         },
         { deliverAs: "followUp", triggerTurn: true }
@@ -610,7 +636,7 @@ function registerBackgroundJob(
     }
     state.currentlyRunningToolCallId = null;
 
-    const cancelStall = startStallWatchdog(jobId, command, logPath, pi, () => {
+    const cancelStall = startStallWatchdog(jobId, command, logPath, pi, state, () => {
         if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
         silenceJobAfterKill(job);
     });
@@ -858,6 +884,13 @@ export function registerBackgroundJobs(
 
                 // Command completed quickly — return result
                 if (initialResult !== null) {
+                    // Clean up foreground job registration
+                    state.backgroundJobs.delete(jobId);
+                    state.runningProcesses.delete(toolCallId);
+                    if (state.currentlyRunningToolCallId === toolCallId) {
+                        state.currentlyRunningToolCallId = null;
+                    }
+
                     const output = await readFile(logPath, "utf-8").catch(
                         () => ""
                     );
@@ -911,11 +944,12 @@ export function registerBackgroundJobs(
                             ? params.backgroundAfter * 1_000
                             : DEFAULT_TIMEOUT_MS
                     );
+                    const bgSuffix = outstandingJobsSuffix(state, job.id);
                     pi.sendMessage(
                         {
                             customType: "bg-timeout",
                             content:
-                                `⏰ Command timed out after ${duration} and has been backgrounded as ${job.id}.\n` +
+                                `⏰ Command timed out after ${duration} and has been backgrounded as ${job.id}${bgSuffix}.\n` +
                                 `Command: ${command}\n` +
                                 `PID: ${job.pid}\n` +
                                 `Output so far: ${job.logPath}\n\n` +
@@ -1085,6 +1119,7 @@ export function registerBackgroundJobs(
                 params.command,
                 logPath,
                 pi,
+                state,
                 () => {
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                     silenceJobAfterKill(job);
