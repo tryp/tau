@@ -38,6 +38,68 @@ function sidecarDbPath(): string {
 }
 
 /**
+ * Look up a completed job's output from the context sidecar by job ID.
+ * Returns the concatenated chunk content, or null if not found.
+ */
+async function readJobOutputFromSidecar(
+    jobId: string
+): Promise<string | null> {
+    const dbPath = sidecarDbPath();
+    if (!existsSync(dbPath)) return null;
+
+    try {
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+        try {
+            // Check if the source table exists
+            const tableCheck = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'",
+                )
+                .get();
+            if (!tableCheck) {
+                db.close();
+                return null;
+            }
+
+            // Find source by jobId in input_summary
+            const source = db
+                .prepare(
+                    `SELECT id FROM context_sources
+                     WHERE tool_name = 'bash_bg'
+                       AND json_extract(input_summary, '$.jobId') = ?
+                     LIMIT 1`,
+                )
+                .get(jobId) as { id: string } | undefined;
+
+            if (!source) {
+                db.close();
+                return null;
+            }
+
+            // Read all chunks for this source, ordered by ordinal
+            const chunks = db
+                .prepare(
+                    `SELECT content FROM context_chunks
+                     WHERE source_id = ?
+                     ORDER BY ordinal ASC`,
+                )
+                .all(source.id) as { content: string }[];
+
+            db.close();
+
+            if (chunks.length === 0) return null;
+            return chunks.map((c) => c.content).join("\n\n");
+        } finally {
+            db.close();
+        }
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
  */
 function chunkText(
@@ -929,7 +991,8 @@ export function registerBackgroundJobs(
         name: "bash_bg",
         label: "Background Bash",
         description:
-            "Run a bash command in background immediately. Output is written to a per-session log file. " +
+            "Run a bash command in background immediately. Output streams to a log file in real-time " +
+            "and can be queried with the jobs tool (output, grep, head/tail) while the job is still running. " +
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
@@ -942,6 +1005,7 @@ export function registerBackgroundJobs(
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindIn to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
                 "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
@@ -1130,16 +1194,23 @@ export function registerBackgroundJobs(
             "List, inspect, kill, or attach to background jobs. Output is read from disk files. " +
             "Jobs(attach) is non-blocking — it polls the job periodically and streams progress " +
             "updates to the agent. The agent can abort at any time, and a configurable timeout " +
-            "(default 10 min) prevents indefinite blocking.",
+            "(default 10 min) prevents indefinite blocking. " +
+            "Output accumulates in the log file in real-time — you can query it while the job is running. " +
+            "For completed jobs not found in memory, output(action) falls back to the context sidecar. " +
+            "Use output(action) with grep/tail/head to search and filter accumulated output.",
         promptSnippet: "Manage background jobs (list/output/kill/attach)",
         promptGuidelines: [
             "Use jobs with action 'list' to see all background jobs.",
-            "Use jobs with action 'output' to read a job's output from its log file.",
+            "Use jobs with action 'output' to read a job's accumulated output (works while running).",
+            "Use jobs with action 'output' grep='pattern' to search for matching lines in the output.",
+            "Use jobs with action 'output' head=50 to show the first 50 lines (default: tail=10).",
+            "Use jobs with action 'output' tail=15 to show the last 15 matching lines, the default.",
             "Use jobs with action 'kill' to terminate a running background job (also cancels linked reminders).",
             "Use jobs with action 'attach' to monitor a running job with progress polling; " +
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
             "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
                 "default is 600 (10 minutes).",
+            "For searching across past or indexed job output, use context_search with tool_name='bash_bg'.",
         ],
         parameters: Type.Object({
             action: StringEnum(["list", "output", "kill", "attach"] as const, {
@@ -1148,6 +1219,31 @@ export function registerBackgroundJobs(
             jobId: Type.Optional(
                 Type.String({
                     description: "Job ID for output/kill/attach",
+                })
+            ),
+            grep: Type.Optional(
+                Type.String({
+                    description:
+                        "JavaScript regex pattern for action=output (case-insensitive). " +
+                        "Only lines matching the pattern are returned, with line numbers. " +
+                        "Examples: 'error|fail', '^\\d+', 'timeout.*exit'.",
+                })
+            ),
+            head: Type.Optional(
+                Type.Number({
+                    description:
+                        "Show at most this many matching lines (from the start). " +
+                        "Applied after grep filter.",
+                    minimum: 1,
+                })
+            ),
+            tail: Type.Optional(
+                Type.Number({
+                    description:
+                        "Show at most this many matching lines (from the end). " +
+                        "Default: 10 if neither head nor tail is given. " +
+                        "Applied after grep filter.",
+                    minimum: 1,
                 })
             ),
             wait: Type.Optional(
@@ -1197,21 +1293,146 @@ export function registerBackgroundJobs(
                 case "output": {
                     if (!params.jobId)
                         throw new Error("jobId is required for action=output");
+
+                    const grepPattern = params.grep;
+                    const headCount =
+                        params.head ?? (params.tail !== undefined ? undefined : undefined);
+                    const tailCount =
+                        params.tail ?? (params.head !== undefined ? undefined : 10);
+
+                    // Helper: return matching lines (or all lines if no grep),
+                    // each with a 1-based line number
+                    function filterLines(
+                        text: string
+                    ): { line: string; num: number }[] {
+                        const lines = text.split("\n");
+                        if (!grepPattern) {
+                            return lines.map((l, i) => ({
+                                line: l,
+                                num: i + 1,
+                            }));
+                        }
+                        let re: RegExp;
+                        try {
+                            re = new RegExp(grepPattern, "i");
+                        } catch {
+                            throw new Error(
+                                `Invalid grep regex: ${grepPattern}`
+                            );
+                        }
+                        return lines
+                            .map((l, i) => ({ line: l, num: i + 1 }))
+                            .filter(({ line }) => re!.test(line));
+                    }
+
+                    // Build the final text from filtered + head/tail
+                    function formatLines(
+                        matched: { line: string; num: number }[],
+                        originalCount?: number
+                    ): string {
+                        if (matched.length === 0) {
+                            return grepPattern
+                                ? `(no lines matching /${grepPattern}/i)`
+                                : "(no lines)";
+                        }
+                        const result = matched
+                            .map(
+                                ({ line, num }) =>
+                                    `${String(num).padStart(4, " ")}: ${line}`
+                            )
+                            .join("\n");
+                        if (
+                            originalCount !== undefined &&
+                            matched.length < originalCount
+                        ) {
+                            const hidden = originalCount - matched.length;
+                            return (
+                                result +
+                                `\n... (${hidden} more line${
+                                    hidden !== 1 ? "s" : ""
+                                }, use head=N or tail=N to see more)`
+                            );
+                        }
+                        return result;
+                    }
+
+                    // Try the in-memory job first
                     const job = lookupJob(state, params.jobId);
-                    if (!job) throw new Error(`Job not found: ${params.jobId}`);
-                    const output = await readOutputTail(
-                        job.logPath,
-                        MAX_OUTPUT_PREVIEW_CHARS
+                    if (job) {
+                        const output = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        let matched = filterLines(output);
+                        const total = matched.length;
+                        if (headCount !== undefined)
+                            matched = matched.slice(0, headCount);
+                        if (tailCount !== undefined)
+                            matched = matched.slice(-tailCount);
+                        const formatted = formatLines(matched, total);
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `Output for ${job.id} (${job.status})${
+                                            grepPattern
+                                                ? `, grep "${grepPattern}"`
+                                                : ""
+                                        }${
+                                            headCount !== undefined
+                                                ? `, head=${headCount}`
+                                                : ""
+                                        }${
+                                            tailCount !== undefined
+                                                ? `, tail=${tailCount}`
+                                                : ""
+                                        }\nLog: ${job.logPath}\n\n${formatted}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    // Fall back to sidecar for completed jobs (persists across sessions)
+                    const sidecarOutput = await readJobOutputFromSidecar(
+                        params.jobId
                     );
-                    return {
-                        content: [
-                            {
-                                type: "text" as const,
-                                text: `Output for ${job.id} (${job.status})\nLog: ${job.logPath}\n\n${output}`,
-                            },
-                        ],
-                        details: undefined,
-                    };
+                    if (sidecarOutput) {
+                        let matched = filterLines(sidecarOutput);
+                        const total = matched.length;
+                        if (headCount !== undefined)
+                            matched = matched.slice(0, headCount);
+                        if (tailCount !== undefined)
+                            matched = matched.slice(-tailCount);
+                        const formatted = formatLines(matched, total);
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `Output for ${params.jobId} (from sidecar)${
+                                            grepPattern
+                                                ? `, grep "${grepPattern}"`
+                                                : ""
+                                        }${
+                                            headCount !== undefined
+                                                ? `, head=${headCount}`
+                                                : ""
+                                        }${
+                                            tailCount !== undefined
+                                                ? `, tail=${tailCount}`
+                                                : ""
+                                        }\n\n${formatted}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    throw new Error(
+                        `Job not found: ${params.jobId}. It may have been cleaned up.`
+                    );
                 }
 
                 case "kill": {
