@@ -251,6 +251,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
+import { cancelCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
 import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
@@ -469,6 +470,9 @@ export function notifyCompletion(
     pi: ExtensionAPI,
     ctx: UiContext
 ): void {
+    // Auto-cancel any callbacks linked to this job
+    cancelCallbacksForJob(job.id);
+
     if (job.outputConsumed) {
         removeJob(state, job);
         return;
@@ -622,14 +626,28 @@ export function registerBackgroundJobs(
             "Execute bash commands with streaming output. Commands that run longer than 2 minutes " +
             "are automatically backgrounded and the agent is asked whether to kill or let them continue. " +
             "Use Ctrl+Shift+B to manually background a running process. " +
-            "Background job output is written to per-session log files.",
+            "Background job output is written to per-session log files. " +
+            "Set backgroundAfter to auto-background after a specific number of seconds.",
         promptSnippet:
             "Execute shell commands (backgroundable with Ctrl+Shift+B)",
         promptGuidelines: [
             "Use bash_bg when you know a command should run in background from the start.",
             "Use the jobs tool with action 'list' to check background job status.",
             "Use the jobs tool with action 'output' to read a background job's output file.",
+            "Use backgroundAfter to set a custom background-after timeout in seconds.",
         ],
+        parameters: Type.Object({
+            command: Type.String({
+                description: "Bash command to execute",
+            }),
+            backgroundAfter: Type.Optional(
+                Type.Number({
+                    description:
+                        "Background the command after this many seconds (default: auto, ~2 minutes). " +
+                        "The command continues running in the background; use jobs/attach to monitor it.",
+                })
+            ),
+        }),
 
         async execute(
             toolCallId,
@@ -724,14 +742,14 @@ export function registerBackgroundJobs(
                 });
             }
 
-            // Start timeout timer
+            // Start timeout timer (background-after timer, not a kill timeout)
             const timer = startTimeoutTimer(
                 triggerBackground,
                 command,
                 state,
                 toolCallId,
-                typeof params.timeout === "number"
-                    ? params.timeout * 1_000
+                typeof params.backgroundAfter === "number"
+                    ? params.backgroundAfter * 1_000
                     : undefined
             );
 
@@ -827,8 +845,8 @@ export function registerBackgroundJobs(
                     state.pendingDecisionJobId = job.id;
 
                     const duration = formatDuration(
-                        typeof params.timeout === "number"
-                            ? params.timeout * 1_000
+                        typeof params.backgroundAfter === "number"
+                            ? params.backgroundAfter * 1_000
                             : DEFAULT_TIMEOUT_MS
                     );
                     pi.sendMessage(
@@ -914,13 +932,16 @@ export function registerBackgroundJobs(
             "Run a bash command in background immediately. Output is written to a per-session log file. " +
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
-            "and is searchable via context_search, context_list, and context_get.",
+            "and is searchable via context_search, context_list, and context_get. " +
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindIn), or both.",
         promptSnippet:
-            "Run bash command in background without blocking conversation" +
-            " (large output indexed in context sidecar for later search)",
+            "Run bash command in background immediately" +
+            " (supports kill deadline and inline reminder)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
+            "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
+            "Use remindIn to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
                 "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
@@ -932,6 +953,27 @@ export function registerBackgroundJobs(
             notify: Type.Optional(
                 Type.Boolean({
                     description: "Notify when complete (default: true)",
+                })
+            ),
+            timeout: Type.Optional(
+                Type.Number({
+                    description:
+                        "Kill deadline in seconds. If the job runs longer than this, it is terminated. " +
+                        "Use when a command must finish within a time bound.",
+                })
+            ),
+            remindIn: Type.Optional(
+                Type.String({
+                    description:
+                        "Schedule a reminder callback after this duration (e.g. \"5m\", \"30s\", \"2h\"). " +
+                        "The reminder auto-cancels if the job completes before it fires.",
+                })
+            ),
+            remindMessage: Type.Optional(
+                Type.String({
+                    description:
+                        "Message for the reminder callback (default: \"check on <command>\"). " +
+                        "Only used when remindIn is set.",
                 })
             ),
         }),
@@ -985,8 +1027,33 @@ export function registerBackgroundJobs(
                 }
             );
 
+            // ── Kill deadline timeout ──────────────────────────────────
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            if (typeof params.timeout === "number" && params.timeout > 0) {
+                killTimer = setTimeout(() => {
+                    if (proc.pid && job.status === "running") {
+                        killProcessGroup(proc.pid, "SIGTERM");
+                        job.status = "killed";
+                        // Don't silence — let notifyCompletion send the notification
+                    }
+                }, params.timeout * 1_000);
+                killTimer.unref();
+            }
+
+            // ── Inline reminder ───────────────────────────────────────
+            let reminderId: string | undefined;
+            if (params.remindIn) {
+                const msg =
+                    params.remindMessage ??
+                    `check on: ${params.command.slice(0, 80)}`;
+                const rid = scheduleJobReminder(jobId, params.remindIn, msg);
+                if (rid) reminderId = rid;
+            }
+
             proc.on("close", (code) => {
                 cancelStall();
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",
@@ -1009,6 +1076,8 @@ export function registerBackgroundJobs(
 
             proc.on("error", () => {
                 cancelStall();
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(job, "failed");
                 void indexJobOutputInSidecar(
                     job,
@@ -1027,11 +1096,24 @@ export function registerBackgroundJobs(
 
             updateWidget(state, ctx);
 
+            // Build summary line for reminders / timeout
+            let extra = "";
+            if (killTimer) {
+                extra += `\nKill deadline: ${params.timeout}s`;
+            }
+            if (reminderId) {
+                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
+            }
+
             return {
                 content: [
                     {
                         type: "text" as const,
-                        text: `Started background job ${jobId}\nCommand: ${params.command}\nPID: ${proc.pid}\nOutput: ${logPath}`,
+                        text:
+                            `Started background job ${jobId}\n` +
+                            `Command: ${params.command}\n` +
+                            `PID: ${proc.pid}\n` +
+                            `Output: ${logPath}${extra}`,
                     },
                 ],
                 details: undefined,
@@ -1053,7 +1135,7 @@ export function registerBackgroundJobs(
         promptGuidelines: [
             "Use jobs with action 'list' to see all background jobs.",
             "Use jobs with action 'output' to read a job's output from its log file.",
-            "Use jobs with action 'kill' to terminate a running background job.",
+            "Use jobs with action 'kill' to terminate a running background job (also cancels linked reminders).",
             "Use jobs with action 'attach' to monitor a running job with progress polling; " +
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
             "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
@@ -1309,7 +1391,7 @@ export function registerBackgroundJobs(
         promptSnippet: "Decide on a timed-out background job",
         promptGuidelines: [
             "Use job_decide with decision 'keep' to let the job continue running in the background.",
-            "Use job_decide with decision 'kill' to terminate the job.",
+            "Use job_decide with decision 'kill' to terminate the job (also cancels linked reminders).",
             "Use job_decide with decision 'check' to see the job's current output before deciding.",
         ],
         parameters: Type.Object({
