@@ -6,9 +6,243 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+
+// ─── Context sidecar integration ────────────────────────────────────
+
+/**
+ * Minimum output size (bytes or lines) required before we bother indexing.
+ * Matches the sidecar's DEFAULT_CONTEXT_MAX_BYTES / MAX_LINES thresholds
+ * so we only store output that the sidecar considers worth indexing.
+ */
+const SIDECAR_MIN_BYTES = 24 * 1024;
+const SIDECAR_MIN_LINES = 300;
+
+/**
+ * Hard cap on stored output per job (bytes).
+ */
+const SIDECAR_MAX_BYTES = 512 * 1024;
+
+/**
+ * Build the path to the context sidecar's SQLite database.
+ */
+function sidecarDbPath(): string {
+    const agentDir =
+        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    return join(agentDir, "context.db");
+}
+
+/**
+ * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
+ */
+function chunkText(
+    text: string,
+    sourceId: string
+): {
+    id: string;
+    sourceId: string;
+    ordinal: number;
+    title: string;
+    content: string;
+    byteCount: number;
+}[] {
+    const paragraphs = text.split(/\n{2,}/);
+    const chunks: string[] = [];
+    let current = "";
+    const targetBytes = 4096;
+
+    for (const paragraph of paragraphs) {
+        if (Buffer.byteLength(paragraph, "utf8") > targetBytes) {
+            if (current) chunks.push(current);
+            // Split large paragraph by lines
+            for (const line of paragraph.split("\n")) {
+                const next = current ? `${current}\n${line}` : line;
+                if (Buffer.byteLength(next, "utf8") <= targetBytes) {
+                    current = next;
+                } else {
+                    if (current) chunks.push(current);
+                    current = line;
+                }
+            }
+            current = "";
+            continue;
+        }
+        const next = current ? `${current}\n\n${paragraph}` : paragraph;
+        if (Buffer.byteLength(next, "utf8") > targetBytes && current) {
+            chunks.push(current);
+            current = paragraph;
+        } else {
+            current = next;
+        }
+    }
+    if (current) chunks.push(current);
+    if (chunks.length === 0) chunks.push(text);
+
+    return chunks.map((content, index) => ({
+        id: `${sourceId}_${String(index + 1).padStart(4, "0")}`,
+        sourceId,
+        ordinal: index + 1,
+        title:
+            content
+                .split("\n")
+                .find((l) => l.trim())
+                ?.trim() ?? "(empty)",
+        content,
+        byteCount: Buffer.byteLength(content, "utf8"),
+    }));
+}
+
+/**
+ * Build a short preview from the first content lines.
+ */
+function makePreview(text: string): string {
+    const lines = text.split("\n");
+    const previewLines = lines.slice(0, 40);
+    let result = previewLines.join("\n");
+    if (Buffer.byteLength(result, "utf8") > 4096) {
+        result = Buffer.from(result, "utf8").subarray(0, 4096).toString("utf8");
+    }
+    if (lines.length > 40) result += "\n...";
+    return result;
+}
+
+/**
+ * Index a completed job's output into the context sidecar SQLite database.
+ *
+ * Writes directly to the sidecar's context.db using the same schema so that
+ * context_search / context_get / context_list can find the data.  Skips
+ * silently if the DB or the sidecar tables don't exist (sidecar not loaded).
+ *
+ * Only stores output exceeding ~24 KiB / 300 lines to avoid bloating the
+ * index with trivial results (matching the sidecar's own filtering).
+ */
+async function indexJobOutputInSidecar(
+    job: BackgroundJob,
+    ctx: {
+        cwd?: string;
+        sessionManager?: {
+            getSessionFile?: () => string | null;
+            getSessionId?: () => string | null;
+        };
+    }
+): Promise<void> {
+    try {
+        const text = await readFile(job.logPath, "utf-8").catch(() => "");
+        if (!text) return;
+
+        // Match the sidecar's should_index_text check: only store output that
+        // exceeds the minimum thresholds.
+        const bytes = Buffer.byteLength(text, "utf8");
+        const lines = text.split("\n").length;
+        if (bytes < SIDECAR_MIN_BYTES && lines < SIDECAR_MIN_LINES) return;
+        if (bytes > SIDECAR_MAX_BYTES) return;
+
+        const sessionId =
+            ctx?.sessionManager?.getSessionFile?.() ??
+            ctx?.sessionManager?.getSessionId?.() ??
+            null;
+        const projectPath = ctx?.cwd ?? process.cwd();
+
+        const dbPath = sidecarDbPath();
+        if (!existsSync(dbPath)) {
+            // Sidecar not installed or never initialized — skip
+            return;
+        }
+
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+
+        try {
+            // Check if the source table exists (sidecar schema applied)
+            const tableCheck = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
+                )
+                .get();
+            if (!tableCheck) {
+                db.close();
+                return;
+            }
+
+            // Dedup: skip if exact content hash already exists for this project
+            const contentHash = createHash("sha256").update(text).digest("hex");
+            const existing = db
+                .prepare(
+                    "SELECT id FROM context_sources WHERE content_hash = ? AND (project_path = ? OR project_path IS NULL) LIMIT 1"
+                )
+                .get(contentHash, projectPath);
+            if (existing) {
+                // Update returned byte count on the existing record
+                db.prepare(
+                    "UPDATE context_sources SET returned_byte_count = returned_byte_count + ? WHERE id = ?"
+                ).run(bytes, existing.id);
+                db.close();
+                return;
+            }
+
+            // Generate a unique source ID matching the sidecar's format
+            const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+            const createdAt = Date.now();
+            const preview = makePreview(text);
+            const previewBytes = Buffer.byteLength(preview, "utf8");
+            const inputSummary = JSON.stringify({
+                command: job.command,
+                jobId: job.id,
+                exitCode: job.exitCode,
+                status: job.status,
+            });
+
+            // Insert source record
+            db.prepare(
+                `INSERT INTO context_sources
+                 (id, session_id, project_path, tool_name, input_summary,
+                  created_at, byte_count, line_count, content_hash,
+                  preview_byte_count, returned_byte_count)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+            ).run(
+                sourceId,
+                sessionId,
+                projectPath,
+                "bash_bg",
+                inputSummary,
+                createdAt,
+                bytes,
+                lines,
+                contentHash,
+                previewBytes
+            );
+
+            // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
+            const chunks = chunkText(text, sourceId);
+            const insertChunk = db.prepare(
+                `INSERT INTO context_chunks
+                 (id, source_id, ordinal, title, content, byte_count)
+                 VALUES (?, ?, ?, ?, ?, ?)`
+            );
+
+            for (const chunk of chunks) {
+                insertChunk.run(
+                    chunk.id,
+                    chunk.sourceId,
+                    chunk.ordinal,
+                    chunk.title,
+                    chunk.content,
+                    chunk.byteCount
+                );
+            }
+        } finally {
+            db.close();
+        }
+    } catch {
+        // DB unavailable or schema mismatch — skip silently
+    }
+}
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -149,6 +383,12 @@ export function updateWidget(state: TauState, ctx: UiContext): void {
         return;
     }
 
+    if (state.jobsWidgetHidden) {
+        ctx.ui.setWidget("background-jobs", undefined);
+        ctx.ui.setStatus("background-jobs", undefined);
+        return;
+    }
+
     const pills: string[] = [];
     if (state.agentBackgrounded) {
         pills.push("◐ agent (backgrounded)");
@@ -186,7 +426,9 @@ export function lookupJob(
     return (
         state.backgroundJobs.get(jobId) ??
         state.backgroundJobs.get(`job-${jobId}`) ??
-        state.recentTerminalJobs.find((j) => j.id === jobId || j.id === `job-${jobId}`)
+        state.recentTerminalJobs.find(
+            (j) => j.id === jobId || j.id === `job-${jobId}`
+        )
     );
 }
 
@@ -307,8 +549,22 @@ function registerBackgroundJob(
         silenceJobAfterKill(job);
     });
 
-    proc.on("close", () => {
+    proc.on("close", (code) => {
         cancelStall();
+        // Update job status before indexing so the sidecar captures final state
+        job.exitCode = code ?? 0;
+        job.status = code === 0 || code === null ? "completed" : "failed";
+        // ctx is ExtensionContext at runtime but typed as UiContext here
+        void indexJobOutputInSidecar(
+            job,
+            ctx as {
+                cwd?: string;
+                sessionManager?: {
+                    getSessionFile?: () => string | null;
+                    getSessionId?: () => string | null;
+                };
+            }
+        );
     });
 
     ctx.ui.notify(`Process backgrounded as ${jobId}`, "info");
@@ -656,12 +912,18 @@ export function registerBackgroundJobs(
         label: "Background Bash",
         description:
             "Run a bash command in background immediately. Output is written to a per-session log file. " +
-            "Use the jobs tool to check status and read output.",
+            "Use the jobs tool to check status and read output. " +
+            "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
+            "and is searchable via context_search, context_list, and context_get.",
         promptSnippet:
-            "Run bash command in background without blocking conversation",
+            "Run bash command in background without blocking conversation" +
+            " (large output indexed in context sidecar for later search)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
+            "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
+                "Use context_search with tool_name='bash_bg' to find past job output, " +
+                "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
         ],
         parameters: Type.Object({
             command: Type.String({
@@ -730,6 +992,16 @@ export function registerBackgroundJobs(
                     code === 0 || code === null ? "completed" : "failed",
                     code ?? 0
                 );
+                void indexJobOutputInSidecar(
+                    job,
+                    ctx as {
+                        cwd?: string;
+                        sessionManager?: {
+                            getSessionFile?: () => string | null;
+                            getSessionId?: () => string | null;
+                        };
+                    }
+                );
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
@@ -738,6 +1010,16 @@ export function registerBackgroundJobs(
             proc.on("error", () => {
                 cancelStall();
                 markJobTerminal(job, "failed");
+                void indexJobOutputInSidecar(
+                    job,
+                    ctx as {
+                        cwd?: string;
+                        sessionManager?: {
+                            getSessionFile?: () => string | null;
+                            getSessionId?: () => string | null;
+                        };
+                    }
+                );
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
@@ -904,8 +1186,7 @@ export function registerBackgroundJobs(
                     if (!job.donePromise) createJobDonePromise(job);
 
                     const POLL_INTERVAL_MS = 5_000;
-                    const MAX_ATTACH_MS =
-                        (params.timeout ?? 600) * 1_000;
+                    const MAX_ATTACH_MS = (params.timeout ?? 600) * 1_000;
                     const deadline = Date.now() + MAX_ATTACH_MS;
 
                     // Non-blocking poll loop with progress updates.
