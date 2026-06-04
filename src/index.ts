@@ -170,7 +170,22 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_call", async (event): Promise<ToolCallEventResult> => {
         // Agent backgrounding
         if (state.agentBackgrounded) {
-            return { block: true, reason: "" };
+            // Auto-resume on bash: the agent trying to run a command is a clear signal
+            // it should be working. This breaks the deadlock where all tools are blocked
+            // and the agent can never recover on its own.
+            if (event.toolName === "bash") {
+                state.agentBackgrounded = false;
+                return {};
+            }
+            // Allow jobs for inspection; block everything else with a clear reason.
+            if (event.toolName === "jobs") {
+                return {};
+            }
+            return {
+                block: true,
+                reason: "Agent is backgrounded. Run any bash command to auto-resume, " +
+                    "or use Ctrl+B or /bg to resume.",
+            };
         }
 
         // Pending job decision: block unrelated tools
