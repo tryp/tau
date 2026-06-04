@@ -74,5 +74,8 @@
   "optionalDependencies": {
     "playwright-core": "1.60.0"
   },
-  "packageManager": "pnpm@10.33.1"
+  "packageManager": "pnpm@10.33.1",
+  "dependencies": {
+    "tsx": "4.22.4"
+  }
 }
