@@ -546,6 +546,112 @@ function outstandingJobsSuffix(
     return count > 0 ? ` (${count} jobs outstanding)` : "";
 }
 
+/**
+ * Batch state for job-completion notifications.
+ * Completions that fire close together are aggregated into one message
+ * so the agent doesn't get re-awoken for every individual job.
+ */
+const completionBatch: {
+    jobs: Array<{
+        job: BackgroundJob;
+        duration: string;
+        emoji: string;
+    }>;
+    timer?: NodeJS.Timeout;
+    pi?: ExtensionAPI;
+    state?: TauState;
+} = { jobs: [] };
+
+/** Count currently running background jobs (excluding any completed/failed/killed). */
+function countOutstandingJobs(state: TauState): number {
+    return Array.from(state.backgroundJobs.values()).filter(
+        (j) => j.status === "running"
+    ).length;
+}
+
+function flushCompletionBatch(): void {
+    const batch = completionBatch.jobs.splice(0);
+    const pi = completionBatch.pi!;
+    const state = completionBatch.state!;
+    completionBatch.timer = undefined;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+
+    if (batch.length === 0) return;
+
+    // Recompute outstanding count from current state (reflects only jobs
+    // NOT in this batch, since each notifyCompletion already called removeJob)
+    const outstandingCount = countOutstandingJobs(state);
+    const suffix =
+        outstandingCount > 0
+            ? ` (${outstandingCount} jobs outstanding)`
+            : "";
+
+    // Single job → send the usual individual format
+    if (batch.length === 1) {
+        const { job, duration, emoji } = batch[0];
+        const exitLine =
+            job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
+        pi.sendMessage(
+            {
+                customType: "job-completion",
+                content:
+                    `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
+                    `Command: ${job.command}\nOutput: ${job.logPath}`,
+                display: true,
+                details: {
+                    jobId: job.id,
+                    status: job.status,
+                    exitCode: job.exitCode,
+                    duration,
+                    command: job.command,
+                    logPath: job.logPath,
+                    outstandingJobs: outstandingCount,
+                },
+            },
+            { deliverAs: "followUp", triggerTurn: true }
+        );
+        return;
+    }
+
+    // Multiple jobs → aggregate into one summary
+    const completed = batch.filter((j) => j.job.status === "completed");
+    const failed = batch.filter((j) => j.job.status !== "completed");
+    const parts: string[] = [];
+    if (completed.length > 0)
+        parts.push(`${completed.length} completed`);
+    if (failed.length > 0) parts.push(`${failed.length} failed`);
+
+    const header = `🏁 ${parts.join(", ")}${suffix}`;
+    const lines = batch.map(
+        (j) =>
+            `  ${j.emoji} ${j.job.id} ${j.job.status} (${j.duration})${
+                j.job.exitCode !== undefined ? `, exit ${j.job.exitCode}` : ""
+            }`
+    );
+    const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
+
+    pi.sendMessage(
+        {
+            customType: "job-completion",
+            content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}`,
+            display: true,
+            details: {
+                batch: batch.map((b) => ({
+                    jobId: b.job.id,
+                    status: b.job.status,
+                    exitCode: b.job.exitCode,
+                    duration: b.duration,
+                    command: b.job.command,
+                    logPath: b.job.logPath,
+                })),
+                outstandingJobs: outstandingCount,
+            },
+        },
+        { deliverAs: "followUp", triggerTurn: true }
+    );
+}
+
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
     job: BackgroundJob,
@@ -553,45 +659,34 @@ export function notifyCompletion(
     pi: ExtensionAPI,
     ctx: UiContext
 ): void {
+    // If the job was already silenced (killed by watchdog, tool, etc.),
+    // skip notification entirely — the killing path already sent one.
+    if (job.outputConsumed) return;
+
     // Auto-cancel any callbacks linked to this job
     cancelCallbacksForJob(job.id);
 
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
-    const suffix = outstandingJobsSuffix(state, job.id);
-    // Extract the count number from the suffix string
-    const outstandingCount = (() => {
-        const m = suffix.match(/\d+/);
-        return m ? parseInt(m[0], 10) : 0;
-    })();
 
+    // Toast notification fires immediately for each job
     ctx.ui.notify(
-        `${emoji} ${job.id} ${job.status} (${duration})${suffix}`,
+        `${emoji} ${job.id} ${job.status} (${duration})`,
         job.status === "completed" ? "success" : "error"
     );
 
-    pi.sendMessage(
-        {
-            customType: "job-completion",
-            content:
-                `${emoji} ${job.id} ${job.status} (${duration})${suffix}` +
-                (job.exitCode !== undefined
-                    ? `, exit ${job.exitCode}`
-                    : "") +
-                `\nCommand: ${job.command}\nOutput: ${job.logPath}`,
-            display: true,
-            details: {
-                jobId: job.id,
-                status: job.status,
-                exitCode: job.exitCode,
-                duration,
-                command: job.command,
-                logPath: job.logPath,
-                outstandingJobs: outstandingCount,
-            },
-        },
-        { deliverAs: "followUp", triggerTurn: true }
-    );
+    // Defer the followUp message into a batch that flushes after a short debounce.
+    // Suffix and outstanding count are computed at flush time from current state,
+    // so they accurately reflect jobs still running outside this batch.
+    completionBatch.jobs.push({ job, duration, emoji });
+    completionBatch.pi = pi;
+    completionBatch.state = state;
+    if (!completionBatch.timer) {
+        completionBatch.timer = setTimeout(() => {
+            flushCompletionBatch();
+        }, 300);
+        completionBatch.timer.unref();
+    }
 
     removeJob(state, job);
 }
@@ -657,6 +752,24 @@ function registerBackgroundJob(
                 };
             }
         );
+        markJobTerminal(
+            job,
+            code === 0 || code === null ? "completed" : "failed",
+            code ?? 0
+        );
+        void indexJobOutputInSidecar(
+            job,
+            ctx as {
+                cwd?: string;
+                sessionManager?: {
+                    getSessionFile?: () => string | null;
+                    getSessionId?: () => string | null;
+                };
+            }
+        );
+        clearPendingDecision(state, job);
+        notifyCompletion(job, state, pi, ctx);
+        updateWidget(state, ctx);
     });
 
     ctx.ui.notify(`Process backgrounded as ${jobId}`, "info");

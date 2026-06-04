@@ -77,27 +77,60 @@ export default function (pi: ExtensionAPI) {
     // ── Compact renderer for job-completion messages ──────────────────
 
     pi.registerMessageRenderer("job-completion", (message, _options, theme) => {
-        const d = message.details as {
-            jobId?: string;
-            status?: string;
-            exitCode?: number;
-            duration?: string;
-            command?: string;
-            logPath?: string;
-            outstandingJobs?: number;
-        };
-        const emoji = d?.status === "completed" ? "✅" : "❌";
+        const d = message.details as Record<string, unknown>;
+        const batch = d?.batch as
+            | Array<{
+                  jobId: string;
+                  status: string;
+                  exitCode?: number;
+                  duration: string;
+                  command: string;
+                  logPath: string;
+              }>
+            | undefined;
+
+        if (batch && batch.length > 1) {
+            // Aggregated batch format
+            const completed = batch.filter((b) => b.status === "completed");
+            const failed = batch.filter((b) => b.status !== "completed");
+            const parts: string[] = [];
+            if (completed.length > 0) parts.push(`${completed.length} completed`);
+            if (failed.length > 0) parts.push(`${failed.length} failed`);
+            const suffix =
+                ((d?.outstandingJobs as number) ?? 0) > 0
+                    ? ` (${d!.outstandingJobs} jobs outstanding)`
+                    : "";
+            const header = `🏁 ${parts.join(", ")}${suffix}`;
+            const lines = batch.map(
+                (b) =>
+                    `  ${b.status === "completed" ? "✅" : "❌"} ${b.jobId} ${b.status} (${b.duration})${
+                        b.exitCode !== undefined ? `, exit ${b.exitCode}` : ""
+                    }`
+            );
+            return new Text(`${header}\n${lines.join("\n")}`, 0, 0);
+        }
+
+        // Individual format
+        const emoji = batch && batch.length === 1
+            ? (batch[0].status === "completed" ? "✅" : "❌")
+            : (d?.status === "completed" ? "✅" : "❌");
+        const jobId = batch?.[0]?.jobId ?? (d?.jobId as string) ?? "";
+        const status = batch?.[0]?.status ?? (d?.status as string) ?? "";
+        const duration = batch?.[0]?.duration ?? (d?.duration as string) ?? "";
+        const exitCode = batch?.[0]?.exitCode ?? (d?.exitCode as number | undefined);
+        const command = batch?.[0]?.command ?? (d?.command as string) ?? "";
+        const logPath = batch?.[0]?.logPath ?? (d?.logPath as string) ?? "";
         const suffix =
-            (d?.outstandingJobs ?? 0) > 0
+            ((d?.outstandingJobs as number) ?? 0) > 0
                 ? ` (${d!.outstandingJobs} jobs outstanding)`
                 : "";
-        const lines = [
-            `${emoji} ${d?.jobId ?? ""} ${d?.status ?? ""} (${d?.duration ?? ""})${suffix}`,
-            `   Command: ${d?.command ?? ""}`,
-            `   Output: ${d?.logPath ?? ""}`,
+        const lines: string[] = [
+            `${emoji} ${jobId} ${status} (${duration})${suffix}`,
+            `   Command: ${command}`,
+            `   Output: ${logPath}`,
         ];
-        if (d?.exitCode !== undefined) {
-            lines.push(`   Exit code: ${d.exitCode}`);
+        if (exitCode !== undefined) {
+            lines.push(`   Exit code: ${exitCode}`);
         }
         return new Text(lines.join("\n"), 0, 0);
     });
