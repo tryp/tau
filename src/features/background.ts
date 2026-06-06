@@ -41,9 +41,7 @@ function sidecarDbPath(): string {
  * Look up a completed job's output from the context sidecar by job ID.
  * Returns the concatenated chunk content, or null if not found.
  */
-async function readJobOutputFromSidecar(
-    jobId: string
-): Promise<string | null> {
+async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
     const dbPath = sidecarDbPath();
     if (!existsSync(dbPath)) return null;
 
@@ -55,7 +53,7 @@ async function readJobOutputFromSidecar(
             // Check if the source table exists
             const tableCheck = db
                 .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'",
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
                 )
                 .get();
             if (!tableCheck) {
@@ -69,7 +67,7 @@ async function readJobOutputFromSidecar(
                     `SELECT id FROM context_sources
                      WHERE tool_name = 'bash_bg'
                        AND json_extract(input_summary, '$.jobId') = ?
-                     LIMIT 1`,
+                     LIMIT 1`
                 )
                 .get(jobId) as { id: string } | undefined;
 
@@ -83,7 +81,7 @@ async function readJobOutputFromSidecar(
                 .prepare(
                     `SELECT content FROM context_chunks
                      WHERE source_id = ?
-                     ORDER BY ordinal ASC`,
+                     ORDER BY ordinal ASC`
                 )
                 .all(source.id) as { content: string }[];
 
@@ -529,10 +527,7 @@ function removeJob(state: TauState, job: BackgroundJob): void {
 }
 
 /** Build a suffix like " (3 jobs outstanding)" or empty string if 0 */
-function outstandingJobsSuffix(
-    state: TauState,
-    excludeJobId: string
-): string {
+function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
     const count = Array.from(state.backgroundJobs.values()).filter((j) => {
         if (j.id === excludeJobId) return false;
         if (j.status !== "running") return false;
@@ -583,9 +578,7 @@ function flushCompletionBatch(): void {
     // NOT in this batch, since each notifyCompletion already called removeJob)
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
-        outstandingCount > 0
-            ? ` (${outstandingCount} jobs outstanding)`
-            : "";
+        outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
 
     // Single job → send the usual individual format
     if (batch.length === 1) {
@@ -609,7 +602,7 @@ function flushCompletionBatch(): void {
                     outstandingJobs: outstandingCount,
                 },
             },
-            { deliverAs: "followUp", triggerTurn: true }
+            { deliverAs: "nextTurn" }
         );
         return;
     }
@@ -618,8 +611,7 @@ function flushCompletionBatch(): void {
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
     const parts: string[] = [];
-    if (completed.length > 0)
-        parts.push(`${completed.length} completed`);
+    if (completed.length > 0) parts.push(`${completed.length} completed`);
     if (failed.length > 0) parts.push(`${failed.length} failed`);
 
     const header = `🏁 ${parts.join(", ")}${suffix}`;
@@ -648,7 +640,7 @@ function flushCompletionBatch(): void {
                 outstandingJobs: outstandingCount,
             },
         },
-        { deliverAs: "followUp", triggerTurn: true }
+        { deliverAs: "nextTurn" }
     );
 }
 
@@ -731,10 +723,17 @@ function registerBackgroundJob(
     }
     state.currentlyRunningToolCallId = null;
 
-    const cancelStall = startStallWatchdog(jobId, command, logPath, pi, state, () => {
-        if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
-        silenceJobAfterKill(job);
-    });
+    const cancelStall = startStallWatchdog(
+        jobId,
+        command,
+        logPath,
+        pi,
+        state,
+        () => {
+            if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
+            silenceJobAfterKill(job);
+        }
+    );
 
     proc.on("close", (code) => {
         cancelStall();
@@ -1176,14 +1175,14 @@ export function registerBackgroundJobs(
             remindIn: Type.Optional(
                 Type.String({
                     description:
-                        "Schedule a reminder callback after this duration (e.g. \"5m\", \"30s\", \"2h\"). " +
+                        'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
                         "The reminder auto-cancels if the job completes before it fires.",
                 })
             ),
             remindMessage: Type.Optional(
                 Type.String({
                     description:
-                        "Message for the reminder callback (default: \"check on <command>\"). " +
+                        'Message for the reminder callback (default: "check on <command>"). ' +
                         "Only used when remindIn is set.",
                 })
             ),
@@ -1444,9 +1443,11 @@ export function registerBackgroundJobs(
 
                     const grepPattern = params.grep;
                     const headCount =
-                        params.head ?? (params.tail !== undefined ? undefined : undefined);
+                        params.head ??
+                        (params.tail !== undefined ? undefined : undefined);
                     const tailCount =
-                        params.tail ?? (params.head !== undefined ? undefined : 10);
+                        params.tail ??
+                        (params.head !== undefined ? undefined : 10);
 
                     // Helper: return matching lines (or all lines if no grep),
                     // each with a 1-based line number
@@ -1511,6 +1512,12 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        // Agent has seen this terminal job's output —
+                        // suppress completion notification and cancel reminds.
+                        if (job.status !== "running") {
+                            job.outputConsumed = true;
+                            cancelCallbacksForJob(job.id);
+                        }
                         let matched = filterLines(output);
                         const total = matched.length;
                         if (headCount !== undefined)
@@ -1522,20 +1529,19 @@ export function registerBackgroundJobs(
                             content: [
                                 {
                                     type: "text" as const,
-                                    text:
-                                        `Output for ${job.id} (${job.status})${
-                                            grepPattern
-                                                ? `, grep "${grepPattern}"`
-                                                : ""
-                                        }${
-                                            headCount !== undefined
-                                                ? `, head=${headCount}`
-                                                : ""
-                                        }${
-                                            tailCount !== undefined
-                                                ? `, tail=${tailCount}`
-                                                : ""
-                                        }\nLog: ${job.logPath}\n\n${formatted}`,
+                                    text: `Output for ${job.id} (${job.status})${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\nLog: ${job.logPath}\n\n${formatted}`,
                                 },
                             ],
                             details: undefined,
@@ -1558,20 +1564,19 @@ export function registerBackgroundJobs(
                             content: [
                                 {
                                     type: "text" as const,
-                                    text:
-                                        `Output for ${params.jobId} (from sidecar)${
-                                            grepPattern
-                                                ? `, grep "${grepPattern}"`
-                                                : ""
-                                        }${
-                                            headCount !== undefined
-                                                ? `, head=${headCount}`
-                                                : ""
-                                        }${
-                                            tailCount !== undefined
-                                                ? `, tail=${tailCount}`
-                                                : ""
-                                        }\n\n${formatted}`,
+                                    text: `Output for ${params.jobId} (from sidecar)${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\n\n${formatted}`,
                                 },
                             ],
                             details: undefined,
@@ -1823,6 +1828,12 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    // Agent has seen this terminal job's output —
+                    // suppress completion notification and cancel reminds.
+                    if (job.status !== "running") {
+                        job.outputConsumed = true;
+                        cancelCallbacksForJob(job.id);
+                    }
                     return {
                         content: [
                             {
