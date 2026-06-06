@@ -1357,6 +1357,8 @@ export function registerBackgroundJobs(
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
             "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
                 "default is 600 (10 minutes).",
+            "When jobs(output) hides lines or truncates, it will suggest grep='pattern' automatically — " +
+                "prefer grep over bash for searching large output.",
             "For searching across past or indexed job output, use context_search with tool_name='bash_bg'.",
         ],
         parameters: Type.Object({
@@ -1477,7 +1479,8 @@ export function registerBackgroundJobs(
                     // Build the final text from filtered + head/tail
                     function formatLines(
                         matched: { line: string; num: number }[],
-                        originalCount?: number
+                        originalCount?: number,
+                        truncated?: boolean
                     ): string {
                         if (matched.length === 0) {
                             return grepPattern
@@ -1490,16 +1493,27 @@ export function registerBackgroundJobs(
                                     `${String(num).padStart(4, " ")}: ${line}`
                             )
                             .join("\n");
+                        // Build hints footer
+                        const hints: string[] = [];
                         if (
                             originalCount !== undefined &&
                             matched.length < originalCount
                         ) {
                             const hidden = originalCount - matched.length;
+                            hints.push(
+                                `${hidden} more line${hidden !== 1 ? "s" : ""}`
+                            );
+                        }
+                        if (truncated) {
+                            hints.push("output was truncated");
+                        }
+                        if (hints.length > 0) {
+                            const suggestion = !grepPattern
+                                ? " or grep='pattern' to search"
+                                : "";
                             return (
                                 result +
-                                `\n... (${hidden} more line${
-                                    hidden !== 1 ? "s" : ""
-                                }, use head=N or tail=N to see more)`
+                                `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`
                             );
                         }
                         return result;
@@ -1524,7 +1538,12 @@ export function registerBackgroundJobs(
                             matched = matched.slice(0, headCount);
                         if (tailCount !== undefined)
                             matched = matched.slice(-tailCount);
-                        const formatted = formatLines(matched, total);
+                        const isTruncated = output.startsWith("...[truncated");
+                        const formatted = formatLines(
+                            matched,
+                            total,
+                            isTruncated
+                        );
                         return {
                             content: [
                                 {
@@ -1559,7 +1578,13 @@ export function registerBackgroundJobs(
                             matched = matched.slice(0, headCount);
                         if (tailCount !== undefined)
                             matched = matched.slice(-tailCount);
-                        const formatted = formatLines(matched, total);
+                        const isTruncated =
+                            sidecarOutput.startsWith("...[truncated");
+                        const formatted = formatLines(
+                            matched,
+                            total,
+                            isTruncated
+                        );
                         return {
                             content: [
                                 {
