@@ -22,6 +22,7 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import ms from "ms";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type {
     ExtensionAPI,
@@ -54,20 +55,66 @@ export interface ScheduledCallback {
 
 // ─── Duration parsing ───────────────────────────────────────────────
 
-const DURATION_RE = /^(\d+(?:\.\d+)?)(s|m|h|d)$/;
+const SINGLE_DURATION_RE = /^(\d+(?:\.\d+)?)(s|m|h|d)$/;
+const COMPOUND_DURATION_RE = /^(\d+[smhd])+$/;
+const PURE_NUMBER_RE = /^\d+(?:\.\d+)?$/;
 
+const unitMs: Record<string, number> = {
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+};
+
+/**
+ * Parse a human-readable duration string to milliseconds.
+ *
+ * Supported formats:
+ *   - Simple compact: "30s", "5m", "2h", "1d", "1.5m"
+ *   - Compound compact: "3m30s", "1h30m15s"
+ *   - Compound with spaces: "1h 30m", "3m 30s"
+ *   - Full words: "30 seconds", "5 minutes", "1 hour", "2 days", "1 week"
+ *   - Abbreviated words: "30sec", "5min", "2hrs", "2d"
+ *
+ * Ambiguous inputs like pure numbers ("90") or mm:ss ("1:30") are rejected.
+ */
 export function parseDurationToMs(input: string): number | null {
-    const match = input.match(DURATION_RE);
-    if (!match) return null;
-    const value = parseFloat(match[1]);
-    const unit = match[2];
-    const units: Record<string, number> = {
-        s: 1_000,
-        m: 60_000,
-        h: 3_600_000,
-        d: 86_400_000,
-    };
-    return value * units[unit];
+    input = input.trim();
+    if (!input) return null;
+
+    // Reject pure numbers — too ambiguous (90s? 90m?)
+    if (PURE_NUMBER_RE.test(input)) return null;
+
+    // 1) Single-unit compact with optional decimal (e.g. "1.5m", "30s")
+    const single = input.match(SINGLE_DURATION_RE);
+    if (single) {
+        return parseFloat(single[1]) * unitMs[single[2]];
+    }
+
+    // 2) Compound with or without spaces (e.g. "3m30s", "1h 30m")
+    const spaceless = input.replace(/\s+/g, "");
+    if (COMPOUND_DURATION_RE.test(spaceless)) {
+        let total = 0;
+        const parts = spaceless.match(/(\d+)([smhd])/g);
+        if (parts) {
+            for (const part of parts) {
+                const val = parseInt(part, 10);
+                const u = part[part.length - 1];
+                if (val < 0 || !unitMs[u]) return null;
+                total += val * unitMs[u];
+            }
+        }
+        return total;
+    }
+
+    // 3) Full words / shorthand via ms (e.g. "30 seconds", "5min", "2hrs", "1 week")
+    // ms treats lone numbers as milliseconds, but we already rejected those above.
+    const parsed = ms(input);
+    if (typeof parsed === "number" && parsed > 0) {
+        return parsed;
+    }
+
+    return null;
 }
 
 export function formatDuration(ms: number): string {
@@ -495,7 +542,7 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             in: Type.Optional(
                 Type.String({
                     description:
-                        'How long until the callback fires. Required when action=schedule. Formats: "30s", "5m", "1h", "2d".',
+                        'How long until the callback fires. Required when action=schedule. Formats: "30s", "5m", "1h", "2d", or compound like "3m30s".',
                 })
             ),
             id: Type.Optional(
@@ -623,7 +670,7 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Invalid duration "${params.in}". Use formats like "30s", "5m", "1h", "2d".`,
+                                    text: `Invalid duration "${params.in}". Use formats like "30s", "5m", "1h", "2d", or compound like "3m30s".`,
                                 },
                             ],
                             details: undefined,
@@ -726,7 +773,7 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             const delayMs = parseDurationToMs(parts[0]);
             if (delayMs === null) {
                 ctx.ui.notify(
-                    `Invalid duration "${parts[0]}". Use 30s, 5m, 1h, 2d.`,
+                    `Invalid duration "${parts[0]}". Use 30s, 5m, 1h, 2d, or compound like 3m30s.`,
                     "warning"
                 );
                 return;
