@@ -604,7 +604,7 @@ function flushCompletionBatch(): void {
                     outstandingJobs: outstandingCount,
                 },
             },
-            { deliverAs: "nextTurn" }
+            { deliverAs: "followUp", triggerTurn: true }
         );
         return;
     }
@@ -642,7 +642,7 @@ function flushCompletionBatch(): void {
                 outstandingJobs: outstandingCount,
             },
         },
-        { deliverAs: "nextTurn" }
+        { deliverAs: "followUp", triggerTurn: true }
     );
 }
 
