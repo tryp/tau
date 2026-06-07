@@ -342,9 +342,11 @@ import {
  * proc.on("close") from sending a spurious job-completion message
  * that re-enters the agent loop.
  */
-export function silenceJobAfterKill(job: BackgroundJob): void {
+export function silenceJobAfterKill(job: BackgroundJob): number {
     markJobTerminal(job, "killed");
     job.outputConsumed = true;
+    // Cancel any callbacks linked to this job so stale reminders don't fire.
+    return cancelCallbacksForJob(job.id);
 }
 
 // ─── Stall watchdog ─────────────────────────────────────────────────
@@ -1622,13 +1624,17 @@ export function registerBackgroundJobs(
                         throw new Error(`Job is not running: ${job.id}`);
                     }
                     killProcessGroup(job.proc.pid!, "SIGTERM");
-                    silenceJobAfterKill(job);
+                    const cancelledCallbacks = silenceJobAfterKill(job);
                     clearPendingDecision(state, job);
+                    let killMsg = `Sent SIGTERM to ${job.id} (process group)`;
+                    if (cancelledCallbacks > 0) {
+                        killMsg += `\n${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
+                    }
                     return {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Sent SIGTERM to ${job.id} (process group)`,
+                                text: killMsg,
                             },
                         ],
                         details: undefined,
@@ -1829,10 +1835,14 @@ export function registerBackgroundJobs(
                     if (job.proc && job.status === "running") {
                         killProcessGroup(job.proc.pid!, "SIGTERM");
                     }
-                    silenceJobAfterKill(job);
+                    const cancelledCallbacks = silenceJobAfterKill(job);
                     state.pendingDecisionJobId = undefined;
+                    let killMsg = `Killed ${job.id}.`;
+                    if (cancelledCallbacks > 0) {
+                        killMsg += ` ${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
+                    }
                     return {
-                        content: [{ type: "text", text: `Killed ${job.id}.` }],
+                        content: [{ type: "text", text: killMsg }],
                         details: undefined,
                     };
                 }
