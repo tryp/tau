@@ -105,6 +105,11 @@ export function filterIssues(
         .map(formatIssueItem);
 }
 
+/** Try to notify via ui, silently ignoring stale-context errors. */
+function safeNotifyCtx(ctx: any, msg: string, level: string) {
+    try { ctx.ui.notify(msg, level as any); } catch { /* ctx may be stale */ }
+}
+
 function createIssueAutocompleteProvider(
     current: AutocompleteProvider,
     getIssues: () => Promise<GitHubIssue[] | undefined>
@@ -180,7 +185,7 @@ export function registerGithubAutocomplete(pi: ExtensionAPI): void {
     pi.on("session_start", async (_event, ctx) => {
         const resolvedRepo = await resolveGitHubRepo(pi, ctx.cwd);
         if (!resolvedRepo.ok) {
-            ctx.ui.notify(resolvedRepo.error, "error");
+            safeNotifyCtx(ctx, resolvedRepo.error, "error");
             return;
         }
 
@@ -211,10 +216,7 @@ export function registerGithubAutocomplete(pi: ExtensionAPI): void {
                         loadErrorShown = true;
                         const details =
                             result.stderr.trim() || `exit code ${result.code}`;
-                        ctx.ui.notify(
-                            `github-issue-autocomplete: failed to load issues: ${details}`,
-                            "error"
-                        );
+                        safeNotifyCtx(ctx, `github-issue-autocomplete: failed to load issues: ${details}`, "error");
                     }
                     return undefined;
                 }
@@ -224,10 +226,7 @@ export function registerGithubAutocomplete(pi: ExtensionAPI): void {
                 } catch {
                     if (!loadErrorShown) {
                         loadErrorShown = true;
-                        ctx.ui.notify(
-                            "github-issue-autocomplete: failed to parse gh issue list output",
-                            "error"
-                        );
+                        safeNotifyCtx(ctx, "github-issue-autocomplete: failed to parse gh issue list output", "error");
                     }
                     return undefined;
                 }

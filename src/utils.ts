@@ -12,6 +12,8 @@ import {
     unlinkSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BackgroundJob, JobStatus } from "./types.ts";
 
 // ─── Configuration constants ────────────────────────────────────────
@@ -68,7 +70,8 @@ export function generateJobId(
 }
 
 export function logPathForJob(jobId: string): string {
-    return `/tmp/pi-bg-${jobId}.log`;
+    const baseDir = process.env.TMPDIR || tmpdir();
+    return join(baseDir, `pi-bg-${jobId}.log`);
 }
 
 export function createJobDonePromise(job: BackgroundJob): void {
@@ -181,15 +184,16 @@ export function looksLikePrompt(tail: string): boolean {
 
 // ─── Log file cleanup ──────────────────────────────────────────────
 
-/** Remove stale /tmp/pi-bg-* log files older than 24 hours. */
+/** Remove stale pi-bg-* log files older than 24 hours from the tmp directory. */
 export function cleanupStaleLogs(): void {
     const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    const baseDir = process.env.TMPDIR || tmpdir();
     try {
-        const entries = readdirSync("/tmp");
+        const entries = readdirSync(baseDir);
         const now = Date.now();
         for (const entry of entries) {
             if (!entry.startsWith("pi-bg-")) continue;
-            const filePath = `/tmp/${entry}`;
+            const filePath = join(baseDir, entry);
             try {
                 const { mtimeMs } = statSync(filePath);
                 if (now - mtimeMs > MAX_AGE_MS) {
@@ -200,7 +204,7 @@ export function cleanupStaleLogs(): void {
             }
         }
     } catch {
-        /* /tmp not accessible */
+        /* tmp dir not accessible */
     }
 }
 

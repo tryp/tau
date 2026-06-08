@@ -147,6 +147,7 @@ let cbNextId = 1;
 let _pi: ExtensionAPI | null = null;
 let _sessionId = "";
 let _watcher: ReturnType<typeof watch> | null = null;
+let _tauState: TauState | null = null;
 
 /**
  * Cancel all pending callbacks linked to a given job ID.
@@ -249,6 +250,23 @@ function fireCallback(id: string): void {
     const cb = callbacks.get(id);
     if (!cb || cb.fired) return;
 
+    // If linked to a background job, skip delivery if the job is no longer
+    // running. The job may have completed between when the timer was set and
+    // when it fired, making this callback stale.
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (job && job.status !== "running") {
+            // Job is done — cancel this callback silently
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            persistState();
+            return;
+        }
+    }
+
     cb.fired = true;
     if (cb.timer) {
         clearTimeout(cb.timer);
@@ -259,9 +277,33 @@ function fireCallback(id: string): void {
         Date.now() - new Date(cb.createdAt).getTime()
     );
 
+    // Collect other pending callbacks and append as structured XML so the
+    // model can extract IDs and cancel all stale callbacks in one turn.
+    const others = Array.from(callbacks.values())
+        .filter((other) => other.id !== cb.id && !other.fired);
+
+    let message = cb.message;
+    if (others.length > 0) {
+        const items = others.map((other) => {
+            const remainingMs = Date.parse(other.fireAt) - Date.now();
+            const fireIn =
+                remainingMs > 0 ? formatDuration(remainingMs) : "overdue";
+            const linkedAttr = other.linkedJobId
+                ? ` linkedTo="${other.linkedJobId}"`
+                : "";
+            const itemElapsed = formatDuration(
+                Date.now() - Date.parse(other.createdAt)
+            );
+            return `  <item id="${other.id}" source="${other.source}" elapsed="${itemElapsed}" fireIn="${fireIn}"${linkedAttr}>${other.message}</item>`;
+        });
+        message += `\n\n<other_callbacks_pending count="${others.length}">\n`;
+        message += items.join("\n");
+        message += "\n</other_callbacks_pending>";
+    }
+
     if (_pi) {
         _pi.sendUserMessage(
-            `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${cb.message}\n</callback>`,
+            `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`,
             { deliverAs: "followUp" }
         );
     }
@@ -271,6 +313,12 @@ function fireCallback(id: string): void {
 
     // Update persisted state
     persistState();
+    // Note: we do NOT auto-cancel other pending callbacks here, even if
+    // they share the same linkedJobId. Staggered reminders for the same
+    // job may have different intents (start-check vs progress vs
+    // completion) and the first firing does not invalidate the rest.
+    // The appended <other_callbacks_pending> block gives the model
+    // visibility to decide which (if any) to cancel.
 }
 
 function cancelCallback(id: string): boolean {
@@ -425,7 +473,8 @@ function processExistingCallbacks(sid: string): void {
 
 // ─── Feature registration ───────────────────────────────────────────
 
-export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
+export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
+    _tauState = state;
 
     // ── Session lifecycle ──────────────────────────────────────────
 
@@ -510,7 +559,7 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             "remind action=cancel id=cb-3 to cancel one, " +
             "remind action=cancel-all to cancel all. " +
             "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
-            "bash_bg remindIn/remindMessage is a shortcut that does this automatically.",
+            "bash_bg remindDelay/remindMessage is a shortcut that does this automatically.",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -520,8 +569,9 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
             "Use remind action=list to see pending callbacks with their IDs.",
             "Use remind action=cancel id=cb-3 to cancel a specific callback.",
             "Use remind action=cancel-all to cancel all pending callbacks.",
+            "When a callback fires, other pending callbacks are listed in the message so the model can cancel them all in one turn.",
             "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
-            "bash_bg remindIn/remindMessage is a shortcut that does this automatically.",
+            "bash_bg remindDelay/remindMessage is a shortcut that does this automatically.",
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -539,7 +589,7 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
                         "What to follow up on when the callback fires. Be specific. Required when action=schedule.",
                 })
             ),
-            in: Type.Optional(
+            delay: Type.Optional(
                 Type.String({
                     description:
                         'How long until the callback fires. Required when action=schedule. Formats: "30s", "5m", "1h", "2d", or compound like "3m30s".',
@@ -652,25 +702,25 @@ export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
 
                 default: {
                     // action == "schedule"
-                    if (!params.message || !params.in) {
+                    if (!params.message || !params.delay) {
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: "message and 'in' parameters are required for action=schedule.",
+                                    text: "message and delay parameters are required for action=schedule.",
                                 },
                             ],
                             details: undefined,
                         };
                     }
 
-                    const delayMs = parseDurationToMs(params.in);
+                    const delayMs = parseDurationToMs(params.delay);
                     if (delayMs === null) {
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Invalid duration "${params.in}". Use formats like "30s", "5m", "1h", "2d", or compound like "3m30s".`,
+                                    text: `Invalid delay "${params.delay}". Use formats like "30s", "5m", "1h", "2d", or compound like "3m30s".`,
                                 },
                             ],
                             details: undefined,
