@@ -1138,7 +1138,7 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindIn), or both.",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindIn), or both. ",
         promptSnippet:
             "Run bash command in background immediately" +
             " (supports kill deadline and inline reminder)",
@@ -1304,12 +1304,12 @@ export function registerBackgroundJobs(
             updateWidget(state, ctx);
 
             // Build summary line for reminders / timeout
-            let extra = "";
+            let extra = "\n You will recieve an async event on completion";
             if (killTimer) {
-                extra += `\nKill deadline: ${params.timeout}s`;
+                extra += ` or timeout within ${params.timeout}s`;
             }
             if (reminderId) {
-                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
+                extra += ` or reminder event ${reminderId} in ${params.remindIn}`;
             }
 
             return {

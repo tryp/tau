@@ -147,6 +147,7 @@ let cbNextId = 1;
 let _pi: ExtensionAPI | null = null;
 let _sessionId = "";
 let _watcher: ReturnType<typeof watch> | null = null;
+let _tauState: TauState | null = null;
 
 /**
  * Cancel all pending callbacks linked to a given job ID.
@@ -248,6 +249,23 @@ function scheduleCallback(cb: ScheduledCallback): void {
 function fireCallback(id: string): void {
     const cb = callbacks.get(id);
     if (!cb || cb.fired) return;
+
+    // If linked to a background job, skip delivery if the job is no longer
+    // running. The job may have completed between when the timer was set and
+    // when it fired, making this callback stale.
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (job && job.status !== "running") {
+            // Job is done — cancel this callback silently
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            persistState();
+            return;
+        }
+    }
 
     cb.fired = true;
     if (cb.timer) {
@@ -425,7 +443,8 @@ function processExistingCallbacks(sid: string): void {
 
 // ─── Feature registration ───────────────────────────────────────────
 
-export function registerCallbacks(pi: ExtensionAPI, _state: TauState): void {
+export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
+    _tauState = state;
 
     // ── Session lifecycle ──────────────────────────────────────────
 
