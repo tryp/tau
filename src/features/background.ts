@@ -758,16 +758,6 @@ function registerBackgroundJob(
             code === 0 || code === null ? "completed" : "failed",
             code ?? 0
         );
-        void indexJobOutputInSidecar(
-            job,
-            ctx as {
-                cwd?: string;
-                sessionManager?: {
-                    getSessionFile?: () => string | null;
-                    getSessionId?: () => string | null;
-                };
-            }
-        );
         clearPendingDecision(state, job);
         notifyCompletion(job, state, pi, ctx);
         updateWidget(state, ctx);
@@ -1050,6 +1040,10 @@ export function registerBackgroundJobs(
                         pi,
                         ctx
                     );
+
+                    // Remove stale foreground entry created earlier — same process,
+                    // separate job ID that would otherwise stay in state forever.
+                    state.backgroundJobs.delete(jobId);
 
                     state.pendingDecisionJobId = job.id;
 
