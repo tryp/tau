@@ -1138,7 +1138,7 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindIn), or both. ",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. ",
         promptSnippet:
             "Run bash command in background immediately" +
             " (supports kill deadline and inline reminder)",
@@ -1146,7 +1146,7 @@ export function registerBackgroundJobs(
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
-            "Use remindIn to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
@@ -1168,7 +1168,7 @@ export function registerBackgroundJobs(
                         "Use when a command must finish within a time bound.",
                 })
             ),
-            remindIn: Type.Optional(
+            remindDelay: Type.Optional(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
@@ -1179,7 +1179,7 @@ export function registerBackgroundJobs(
                 Type.String({
                     description:
                         'Message for the reminder callback (default: "check on <command>"). ' +
-                        "Only used when remindIn is set.",
+                        "Only used when remindDelay is set.",
                 })
             ),
         }),
@@ -1249,11 +1249,11 @@ export function registerBackgroundJobs(
 
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
-            if (params.remindIn) {
+            if (params.remindDelay) {
                 const msg =
                     params.remindMessage ??
                     `check on: ${params.command.slice(0, 80)}`;
-                const rid = scheduleJobReminder(jobId, params.remindIn, msg);
+                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
                 if (rid) reminderId = rid;
             }
 
