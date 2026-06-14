@@ -38,7 +38,11 @@ void describe("generateJobId", () => {
 
 void describe("logPathForJob", () => {
     void it("returns the correct temp path", () => {
-        assert.equal(logPathForJob("job-1234-5"), "/tmp/pi-bg-job-1234-5.log");
+        const TMPDIR = process.env.TMPDIR || "/tmp";
+        assert.equal(
+            logPathForJob("job-1234-5"),
+            `${TMPDIR}/pi-bg-job-1234-5.log`
+        );
     });
 });
 
