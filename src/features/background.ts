@@ -1147,6 +1147,9 @@ export function registerBackgroundJobs(
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — " +
+                "the callback auto-cancels if the job completes before the timer fires.",
+            "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
