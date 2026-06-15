@@ -1149,6 +1149,7 @@ export function registerBackgroundJobs(
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — " +
                 "the callback auto-cancels if the job completes before the timer fires.",
+            "When timeout is set without remindDelay, a reminder is auto-scheduled at 90% of the timeout.",
             "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
@@ -1175,7 +1176,9 @@ export function registerBackgroundJobs(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
-                        "The reminder auto-cancels if the job completes before it fires.",
+                        "The reminder auto-cancels if the job completes before it fires. " +
+                        "When timeout is set and remindDelay is omitted, a reminder is auto-scheduled " +
+                        'at 90% of the timeout duration.',
                 })
             ),
             remindMessage: Type.Optional(
@@ -1252,11 +1255,22 @@ export function registerBackgroundJobs(
 
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
-            if (params.remindDelay) {
+            // Auto-schedule a reminder just before the kill deadline when
+            // a timeout is set but no explicit remindDelay was given.
+            // This eliminates the need for manual remind() calls which
+            // create persistent custom_message entries.
+            const effectiveRemindDelay =
+                params.remindDelay ||
+                (typeof params.timeout === "number" && params.timeout > 10
+                    ? `${Math.floor(params.timeout * 0.9)}s`
+                    : undefined);
+            if (effectiveRemindDelay) {
                 const msg =
                     params.remindMessage ??
-                    `check on: ${params.command.slice(0, 80)}`;
-                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
+                    (params.remindDelay
+                        ? `check on: ${params.command.slice(0, 80)}`
+                        : `check on ${params.command.slice(0, 60)} before ${params.timeout}s timeout`);
+                const rid = scheduleJobReminder(jobId, effectiveRemindDelay, msg);
                 if (rid) reminderId = rid;
             }
 
