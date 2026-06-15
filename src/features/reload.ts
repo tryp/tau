@@ -3,40 +3,19 @@
  * extensions, skills, prompts, and themes.
  *
  * The model cannot invoke slash commands, so this exposes reload as a tool.
- * The reload function is captured from ExtensionCommandContext (available
- * only in command handlers) and bridged into the tool via TauState.
  */
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type {
-    ExtensionAPI,
-    ExtensionCommandContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
-import type { TauState } from "../state.ts";
-
-/**
- * Capture the reload function from a command context.
- * Call this from every command handler so it's available on first invocation.
- */
-export function captureReload(
-    state: TauState,
-    ctx: ExtensionCommandContext
-): void {
-    if (!state.commandContextReload && typeof ctx.reload === "function") {
-        state.commandContextReload = ctx.reload.bind(ctx);
-    }
-}
 
 /**
  * Register the reload tool.
  *
- * The tool requires that at least one command has been invoked (e.g. /bg,
- * /jobs, /tasks) so the reload function has been captured. If no command
- * has been invoked yet, the tool returns an error message asking the user
- * to run /reload manually.
+ * ctx.reload() is available directly on ExtensionContext (tools, event
+ * handlers, and command handlers), so no command-handler bridge is needed.
  */
-export function registerReloadTool(pi: ExtensionAPI, state: TauState): void {
+export function registerReloadTool(pi: ExtensionAPI): void {
     pi.registerTool({
         name: "reload",
         label: "Reload Configuration",
@@ -59,47 +38,58 @@ export function registerReloadTool(pi: ExtensionAPI, state: TauState): void {
             _params,
             _signal,
             _onUpdate,
-            _ctx
+            ctx
         ): Promise<AgentToolResult<undefined>> {
-            if (!state.commandContextReload) {
+            // ctx.reload() is available on ExtensionContext since
+            // pi v0.78.1. If the running core predates this, warn.
+            if (typeof ctx.reload !== "function") {
                 return {
                     content: [
                         {
                             type: "text" as const,
                             text:
-                                "Reload is not yet available in this session. " +
-                                "Please run /reload manually in the terminal to reload " +
-                                "extensions, skills, prompts, and themes.",
+                                "Reload requires pi v0.78.1+. " +
+                                "Please run /reload manually in the terminal.",
                         },
                     ],
                     details: undefined,
                 };
             }
 
-            // Defer the reload until the agent is truly idle.
-            // ctx.reload() shows a warning but resolves when the agent is
-            // busy. We must wait for ctx.isIdle() before calling reload.
-            const doReload = state.commandContextReload;
-            const pollIdleAndReload = async () => {
-                // Wait up to 30s for the agent to go idle
-                for (let i = 0; i < 150; i++) {
-                    await new Promise((r) => setTimeout(r, 200));
-                    if (_ctx.isIdle()) {
-                        await doReload();
-                        return;
+            // In non-interactive modes (print, json, rpc) the process
+            // exits after the turn, so there's no point deferring. In
+            // interactive (TUI) mode, wait for idle then reload.
+            if (ctx.mode === "tui") {
+                // Wait up to 30s for the agent to go idle.
+                // After reload the runner invalidates this context, so
+                // any subsequent ctx access would throw — catch silently.
+                const executeReload = async () => {
+                    for (let i = 0; i < 150; i++) {
+                        try {
+                            await new Promise<void>((r) => {
+                                const t = setTimeout(r, 200);
+                                t.unref();
+                            });
+                            if (ctx.isIdle()) {
+                                await ctx.reload();
+                                return;
+                            }
+                        } catch {
+                            return;
+                        }
                     }
-                }
-            };
-            pollIdleAndReload();
+                };
+                executeReload();
+            }
 
             return {
                 content: [
                     {
                         type: "text" as const,
                         text:
-                            "Reload scheduled — will fire after the current response " +
-                            "completes. All configuration changes will be active once " +
-                            "the reload finishes.",
+                            "Reload scheduled — will fire after the current " +
+                            "response completes. All configuration changes " +
+                            "will be active once the reload finishes.",
                     },
                 ],
                 details: undefined,

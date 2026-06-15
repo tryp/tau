@@ -156,7 +156,7 @@ export default function (pi: ExtensionAPI) {
     registerSummarize(pi);
     registerContext(pi);
     registerWebBrowse(pi);
-    registerReloadTool(pi, state);
+    registerReloadTool(pi);
     registerCallbacks(pi, state);
 
     // ── Agent events (cross-cutting) ──────────────────────────────────

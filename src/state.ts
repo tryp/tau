@@ -42,15 +42,6 @@ export class TauState {
     /** When true, the pill-bar jobs widget above the editor is hidden. */
     jobsWidgetHidden = true;
 
-    // ── Reload bridge ──────────────────────────────────────────────────
-
-    /**
-     * Captured reload function from ExtensionCommandContext.
-     * Tools only receive ExtensionContext (no reload), so we capture it
-     * from the first command handler invocation and store it here.
-     */
-    commandContextReload?: () => Promise<void>;
-
     // ── Plan mode ────────────────────────────────────────────────────
 
     planModeEnabled = false;
