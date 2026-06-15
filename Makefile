@@ -1,6 +1,26 @@
-.PHONY: deploy verify verify-deploy
+.PHONY: deploy verify verify-deploy test test-unit test-interface test-all
 
 RUNTIME_DIR := /home/dev/.pi/agent/local/pi-tau
+
+# ─── Test ───────────────────────────────────────────────────────────
+
+NODE_TEST = node --experimental-strip-types --test
+
+test-unit:
+	$(NODE_TEST) src/__tests__/utils.test.ts
+
+test-interface:
+	$(NODE_TEST) src/__tests__/interface.unit.test.ts
+
+test-background:
+	$(NODE_TEST) src/__tests__/background.unit.test.ts
+
+test: test-unit test-interface
+
+test-all: test-unit test-interface test-background
+	@echo "All tests passed."
+
+# ─── Deployment ─────────────────────────────────────────────────────
 
 # Deploy fork to runtime by syncing src/ and key root files
 deploy:
