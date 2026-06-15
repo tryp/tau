@@ -558,8 +558,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=list to see pending callbacks, " +
             "remind action=cancel id=cb-3 to cancel one, " +
             "remind action=cancel-all to cancel all. " +
-            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
-            "bash_bg remindDelay/remindMessage is a shortcut that does this automatically.",
+            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -571,7 +570,6 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=cancel-all to cancel all pending callbacks.",
             "When a callback fires, other pending callbacks are listed in the message so the model can cancel them all in one turn.",
             "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
-            "bash_bg remindDelay/remindMessage is a shortcut that does this automatically.",
         ],
         parameters: Type.Object({
             action: Type.Optional(
