@@ -50,6 +50,7 @@ function captureJobDecide(state: TauState) {
             if (tool.name === "job_decide") captured = tool as typeof captured;
         },
         registerCommand: () => {},
+        registerToolPromptGuidelines: () => {},
         createBashTool: () => ({ execute: () => ({ content: [] }) }),
     } as never;
 
@@ -79,6 +80,7 @@ function captureJobsTool(state: TauState) {
             if (tool.name === "jobs") captured = tool as typeof captured;
         },
         registerCommand: () => {},
+        registerToolPromptGuidelines: () => {},
         createBashTool: () => ({ execute: () => ({ content: [] }) }),
     } as never;
 
