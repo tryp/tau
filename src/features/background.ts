@@ -548,6 +548,9 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
  * Completions that fire close together are aggregated into one message
  * so the agent doesn't get re-awoken for every individual job.
  */
+const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
+const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
+
 const completionBatch: {
     jobs: Array<{
         job: BackgroundJob;
@@ -555,9 +558,10 @@ const completionBatch: {
         emoji: string;
     }>;
     timer?: NodeJS.Timeout;
+    startTime: number;   // timestamp of the first job in the current batch
     pi?: ExtensionAPI;
     state?: TauState;
-} = { jobs: [] };
+} = { jobs: [], startTime: 0 };
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -571,6 +575,7 @@ function flushCompletionBatch(): void {
     const pi = completionBatch.pi!;
     const state = completionBatch.state!;
     completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
 
@@ -675,12 +680,22 @@ export function notifyCompletion(
     completionBatch.jobs.push({ job, duration, emoji });
     completionBatch.pi = pi;
     completionBatch.state = state;
-    if (!completionBatch.timer) {
-        completionBatch.timer = setTimeout(() => {
-            flushCompletionBatch();
-        }, 300);
-        completionBatch.timer.unref();
+
+    // Sliding-window debounce: each new completion resets the timer, extending
+    // the window to collect near-simultaneous completions into one message.
+    // Cap total delay so the agent never waits longer than BATCH_MAX_DELAY_MS
+    // from the first job in the batch.
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+    } else {
+        completionBatch.startTime = Date.now();
     }
+    const elapsed = Date.now() - completionBatch.startTime;
+    const delay = Math.min(BATCH_DEBOUNCE_MS, BATCH_MAX_DELAY_MS - elapsed);
+    completionBatch.timer = setTimeout(() => {
+        flushCompletionBatch();
+    }, Math.max(delay, 0));
+    completionBatch.timer.unref();
 
     removeJob(state, job);
 }
