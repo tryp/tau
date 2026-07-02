@@ -551,17 +551,28 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
 const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
 
+type CompletionBatchItem = {
+    job: BackgroundJob;
+    duration: string;
+    emoji: string;
+};
+
+type PendingCompletionDelivery = {
+    jobs: CompletionBatchItem[];
+    pi: ExtensionAPI;
+    state: TauState;
+};
+
 const completionBatch: {
-    jobs: Array<{
-        job: BackgroundJob;
-        duration: string;
-        emoji: string;
-    }>;
+    jobs: CompletionBatchItem[];
     timer?: NodeJS.Timeout;
     startTime: number;   // timestamp of the first job in the current batch
     pi?: ExtensionAPI;
     state?: TauState;
 } = { jobs: [], startTime: 0 };
+
+const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
+let completionAgentBusy = false;
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -570,28 +581,36 @@ function countOutstandingJobs(state: TauState): number {
     ).length;
 }
 
-function flushCompletionBatch(): void {
-    const batch = completionBatch.jobs.splice(0);
-    const pi = completionBatch.pi!;
-    const state = completionBatch.state!;
-    completionBatch.timer = undefined;
-    completionBatch.startTime = 0;
-    completionBatch.pi = undefined;
-    completionBatch.state = undefined;
+function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
+    return jobs.some((j) => j.job.status !== "completed");
+}
 
+function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchItem[] {
+    const unconsumedFailed = jobs.filter(
+        (j) => j.job.status !== "completed" && !j.job.outputConsumed
+    );
+    if (unconsumedFailed.length === 0) return [];
+
+    const failedIds = new Set(unconsumedFailed.map((j) => j.job.id));
+    return jobs.filter(
+        (j) => j.job.status === "completed" || failedIds.has(j.job.id)
+    );
+}
+
+function deliverCompletionNotification(delivery: PendingCompletionDelivery): void {
+    const batch = pruneConsumedCompletions(delivery.jobs);
     if (batch.length === 0) return;
 
-    // Recompute outstanding count from current state (reflects only jobs
-    // NOT in this batch, since each notifyCompletion already called removeJob)
+    const { pi, state } = delivery;
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
 
-    // Single job → send the usual individual format
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
+
         pi.sendMessage(
             {
                 customType: "job-completion",
@@ -614,7 +633,6 @@ function flushCompletionBatch(): void {
         return;
     }
 
-    // Multiple jobs → aggregate into one summary
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
     const parts: string[] = [];
@@ -651,6 +669,47 @@ function flushCompletionBatch(): void {
     );
 }
 
+function flushPendingCompletionDeliveries(): void {
+    if (completionAgentBusy) return;
+    while (pendingCompletionDeliveries.length > 0) {
+        const delivery = pendingCompletionDeliveries.shift();
+        if (delivery) deliverCompletionNotification(delivery);
+    }
+}
+
+function queueCompletionDelivery(
+    jobs: CompletionBatchItem[],
+    pi: ExtensionAPI,
+    state: TauState
+): void {
+    const jobsToDeliver = pruneConsumedCompletions(jobs);
+    if (jobsToDeliver.length === 0) return;
+
+    for (const { job } of jobsToDeliver) {
+        if (job.status !== "completed") cancelCallbacksForJob(job.id);
+    }
+    pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
+    flushPendingCompletionDeliveries();
+}
+
+function flushCompletionBatch(): void {
+    const batch = completionBatch.jobs.splice(0);
+    const pi = completionBatch.pi!;
+    const state = completionBatch.state!;
+    completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+
+    if (batch.length === 0) return;
+
+    // Successful completions are silent to avoid wasted LLM turns. Failed
+    // completions are queued until the agent is idle, then rechecked so a
+    // jobs(output)/attach that consumed the failure can suppress stale followups.
+    if (!hasFailedCompletion(batch)) return;
+    queueCompletionDelivery(batch, pi, state);
+}
+
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
     job: BackgroundJob,
@@ -662,8 +721,10 @@ export function notifyCompletion(
     // skip notification entirely — the killing path already sent one.
     if (job.outputConsumed) return;
 
-    // Auto-cancel any callbacks linked to this job
-    cancelCallbacksForJob(job.id);
+    // Linked callbacks (remindDelay) are NOT cancelled here — they
+    // are cancelled in flushCompletionBatch only for failed/mixed
+    // batches. Successful completions suppress the notification, so
+    // linked callbacks stay active and wake the agent naturally.
 
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
@@ -698,6 +759,53 @@ export function notifyCompletion(
     completionBatch.timer.unref();
 
     removeJob(state, job);
+}
+
+/**
+ * Remove a job's pending completion notification from the debounced batch.
+ * If the batch becomes empty, the pending timer is cancelled so the agent
+ * doesn't receive a stale "job completed" message after already cancelling
+ * the associated callbacks.
+ */
+export function clearJobFromCompletionBatch(jobId: string): void {
+    const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
+    if (idx !== -1) {
+        completionBatch.jobs.splice(idx, 1);
+        if (completionBatch.jobs.length === 0) {
+            if (completionBatch.timer) {
+                clearTimeout(completionBatch.timer);
+                completionBatch.timer = undefined;
+            }
+            completionBatch.startTime = 0;
+            completionBatch.pi = undefined;
+            completionBatch.state = undefined;
+        }
+    }
+
+    for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
+        const delivery = pendingCompletionDeliveries[i];
+        delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
+        if (!hasFailedCompletion(delivery.jobs)) {
+            pendingCompletionDeliveries.splice(i, 1);
+        }
+    }
+}
+
+/**
+ * Clear all pending completion notifications from the debounced batch.
+ * Called when the agent cancels all callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearAllCompletionBatches(): void {
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+        completionBatch.timer = undefined;
+    }
+    completionBatch.jobs.length = 0;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+    pendingCompletionDeliveries.length = 0;
 }
 
 // ── Background a running foreground process (signal-based) ─────────
@@ -822,6 +930,22 @@ export function registerBackgroundJobs(
     pi: ExtensionAPI,
     state: TauState
 ): void {
+    const eventPi = pi as ExtensionAPI & {
+        on?: (event: string, handler: (...args: unknown[]) => unknown) => void;
+    };
+    eventPi.on?.("agent_start", () => {
+        completionAgentBusy = true;
+    });
+    eventPi.on?.("agent_end", () => {
+        completionAgentBusy = false;
+        flushPendingCompletionDeliveries();
+    });
+    eventPi.on?.("session_shutdown", () => {
+        completionAgentBusy = false;
+        pendingCompletionDeliveries.length = 0;
+        clearAllCompletionBatches();
+    });
+
     // ── Override bash tool ─────────────────────────────────────────────
 
     const originalBashTool = createBashTool(process.cwd());
@@ -1153,7 +1277,11 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. ",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. " +
+            "Unlike manual remind(), remindDelay auto-links the reminder to this job, " +
+            "so it is auto-cancelled when the job finishes. " +
+            "Manual remind() without a jobId creates a standalone callback that persists until it fires " +
+            "or is explicitly cancelled.",
         promptSnippet:
             "Run bash command in background immediately" +
             " (supports kill deadline and inline reminder)",
@@ -1162,8 +1290,10 @@ export function registerBackgroundJobs(
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
-            "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — " +
-                "the callback auto-cancels if the job completes before the timer fires.",
+            "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
+                "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
+                "Manual remind() without a jobId creates a standalone callback that will fire even after " +
+                "the job has finished — you must cancel it explicitly.",
             "When timeout is set without remindDelay, a reminder is auto-scheduled at 90% of the timeout.",
             "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
@@ -1191,7 +1321,8 @@ export function registerBackgroundJobs(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
-                        "The reminder auto-cancels if the job completes before it fires. " +
+                        "The reminder is auto-linked to this job and auto-cancels if the job completes " +
+                        "before it fires. Unlike manual remind(), no explicit cancel is needed. " +
                         "When timeout is set and remindDelay is omitted, a reminder is auto-scheduled " +
                         'at 90% of the timeout duration.',
                 })
@@ -1341,7 +1472,7 @@ export function registerBackgroundJobs(
                 extra += ` or timeout within ${params.timeout}s`;
             }
             if (reminderId) {
-                extra += ` or reminder event ${reminderId} in ${params.remindIn}`;
+                extra += ` or reminder event ${reminderId} in ${params.remindDelay}`;
             }
 
             return {
@@ -1647,7 +1778,25 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
                     if (job.status !== "running" || !job.proc) {
-                        throw new Error(`Job is not running: ${job.id}`);
+                        // Job already completed/failed/killed — cancel linked
+                        // callbacks and suppress any pending completion
+                        // notification so the agent doesn't see stale events.
+                        const cancelledCallbacks = cancelCallbacksForJob(job.id);
+                        job.outputConsumed = true;
+                        state.cancelCompletionBatchForJob?.(job.id);
+                        let msg = `Job ${job.id} is not running (status: ${job.status})`;
+                        if (cancelledCallbacks > 0) {
+                            msg += `. ${cancelledCallbacks} pending reminder${cancelledCallbacks > 1 ? "s" : ""} cancelled.`;
+                        }
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: msg,
+                                },
+                            ],
+                            details: undefined,
+                        };
                     }
                     killProcessGroup(job.proc.pid!, "SIGTERM");
                     const cancelledCallbacks = silenceJobAfterKill(job);
@@ -1909,12 +2058,21 @@ export function registerBackgroundJobs(
         },
     });
 
+    // Wire completion-batch cancellation into state so the callbacks module
+    // can suppress stale job-completion notifications when cancelling reminders.
+    state.cancelCompletionBatchForJob = clearJobFromCompletionBatch;
+    state.cancelAllCompletionBatches = clearAllCompletionBatches;
+
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts
     // because it's guidance about bg workflow, cross-cutting two tools.
-    pi.registerToolPromptGuidelines("remind", [
+    (pi as ExtensionAPI & {
+        registerToolPromptGuidelines: (toolName: string, guidelines: string[]) => void;
+    }).registerToolPromptGuidelines("remind", [
         "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
             "the callback auto-cancels when the job completes.",
+        "When you do use manual remind() to check on a running job, pass the jobId parameter " +
+            "so the callback auto-cancels when the job completes or is killed.",
         "Use manual remind() only for standalone reminders that aren't linked to a job.",
     ]);
 }

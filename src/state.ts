@@ -88,4 +88,12 @@ export class TauState {
 
     /** Ordered list of file paths accessed by read/edit/write tools, newest last. */
     accessedFilePaths: string[] = [];
+
+    // ── Completion batch hooks (set by background.ts) ────────────────
+
+    /** Remove a single job's pending-completion notification from the debounced batch. */
+    cancelCompletionBatchForJob?: (jobId: string) => void;
+
+    /** Clear all pending-completion notifications from the debounced batch. */
+    cancelAllCompletionBatches?: () => void;
 }

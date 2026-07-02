@@ -5,6 +5,8 @@ import {
     clearPendingDecision,
     lookupJob,
     startTimeoutTimer,
+    notifyCompletion,
+    clearAllCompletionBatches,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
 import { TauState } from "../state.ts";
@@ -646,6 +648,74 @@ void describe("lookupJob with recentTerminalJobs", () => {
 });
 
 // ─── job cleanup lifecycle ──────────────────────────────────────────
+
+function completionHarness(state: TauState) {
+    const sent: Array<{ message: unknown; options: unknown }> = [];
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const pi = {
+        registerTool: () => {},
+        registerCommand: () => {},
+        registerToolPromptGuidelines: () => {},
+        sendMessage: (message: unknown, options: unknown) => {
+            sent.push({ message, options });
+        },
+        on: (event: string, handler: (...args: unknown[]) => unknown) => {
+            handlers.set(event, handler);
+        },
+    } as never;
+    const ctx = {
+        ui: {
+            notify: () => {},
+            setStatus: () => {},
+            setWidget: () => {},
+            theme: { fg: (text: string) => text },
+        },
+    } as never;
+    registerBackgroundJobs(pi, state);
+    return { sent, handlers, ctx, pi };
+}
+
+async function waitForCompletionDebounce() {
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+}
+
+void describe("job completion notifications", () => {
+    void it("waits until the agent is idle before delivering failed job followups", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({ id: "job-1-1", status: "failed", exitCode: 1 });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        await waitForCompletionDebounce();
+
+        assert.equal(sent.length, 0);
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 1);
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("suppresses pending failed job followups after terminal output is consumed", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({ id: "job-1-2", status: "failed", exitCode: 1 });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        await waitForCompletionDebounce();
+
+        job.outputConsumed = true;
+        state.cancelCompletionBatchForJob?.(job.id);
+        handlers.get("agent_end")?.();
+
+        assert.equal(sent.length, 0);
+        handlers.get("session_shutdown")?.();
+    });
+});
 
 void describe("job cleanup after completion", () => {
     void it("removes completed jobs from backgroundJobs map", () => {

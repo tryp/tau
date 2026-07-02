@@ -10,7 +10,9 @@ import {
     parseDurationToMs,
     formatDuration,
     formatRelative,
+    registerCallbacks,
 } from "../features/callbacks.ts";
+import { TauState } from "../state.ts";
 
 // ─── Duration parsing ────────────────────────────────────────────────
 
@@ -99,5 +101,105 @@ void describe("callback formatRelative", () => {
         const result = formatRelative(future);
         assert.ok(result.startsWith("in "));
         assert.ok(result.endsWith("h"));
+    });
+});
+
+function createCallbackHarness() {
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const sentUserMessages: Array<{ content: unknown; options: unknown }> = [];
+    const appendedEntries: Array<{ customType: string; data: unknown }> = [];
+    let remindTool:
+        | {
+              execute: (
+                  toolCallId: string,
+                  params: Record<string, unknown>,
+                  signal: unknown,
+                  onUpdate: unknown,
+                  ctx: unknown
+              ) => Promise<{ content: { type: string; text: string }[]; details: unknown }>;
+          }
+        | null = null;
+
+    const pi = {
+        on(eventName: string, handler: (event: any, ctx: any) => unknown) {
+            handlers.set(eventName, handler);
+        },
+        registerTool(tool: { name: string; execute: unknown }) {
+            if (tool.name === "remind") {
+                remindTool = tool as typeof remindTool;
+            }
+        },
+        registerCommand() {},
+        sendUserMessage(content: unknown, options: unknown) {
+            sentUserMessages.push({ content, options });
+        },
+        appendEntry(customType: string, data: unknown) {
+            appendedEntries.push({ customType, data });
+        },
+    } as never;
+
+    const ctx = {
+        sessionManager: {
+            getSessionId: () => "sess-1",
+            getEntries: () => [],
+        },
+    };
+
+    return {
+        pi,
+        ctx,
+        sentUserMessages,
+        appendedEntries,
+        getRemindTool: () => {
+            assert.ok(remindTool, "remind tool was not registered");
+            return remindTool;
+        },
+        async invoke(eventName: string, event: unknown = {}) {
+            const handler = handlers.get(eventName);
+            assert.ok(handler, `missing handler for ${eventName}`);
+            return await handler(event, ctx);
+        },
+    };
+}
+
+void describe("callback delivery while agent is busy", () => {
+    void it("delivers a fired callback after agent_end when not cancelled", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const remind = h.getRemindTool();
+        await remind.execute("tc-1", { message: "check test", delay: "0.001s" }, null, null, null);
+        await h.invoke("agent_start", { type: "agent_start" });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.equal(h.sentUserMessages.length, 0, "callback should not deliver while agent is busy");
+
+        await h.invoke("agent_end", { type: "agent_end", messages: [] });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.equal(h.sentUserMessages.length, 1);
+        assert.match(String(h.sentUserMessages[0].content), /<callback id="cb-1"/);
+    });
+
+    void it("cancel-all suppresses a fired callback that has not been delivered yet", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const remind = h.getRemindTool();
+        await remind.execute("tc-1", { message: "stale callback", delay: "0.001s" }, null, null, null);
+        await h.invoke("agent_start", { type: "agent_start" });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        const result = await remind.execute("tc-2", { action: "cancel-all" }, null, null, null);
+        assert.equal(result.content[0]?.text, "Cancelled 1 pending callback(s).");
+
+        await h.invoke("agent_end", { type: "agent_end", messages: [] });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.equal(h.sentUserMessages.length, 0, "cancel-all should suppress queued stale callback delivery");
     });
 });
