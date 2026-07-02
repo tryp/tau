@@ -166,6 +166,8 @@ export function cancelCallbacksForJob(jobId: string): number {
         }
     }
     if (count > 0) persistState();
+    // Also clear any pending completion notification for this job
+    _tauState?.cancelCompletionBatchForJob?.(jobId);
     return count;
 }
 
@@ -280,7 +282,17 @@ function fireCallback(id: string): void {
     // Collect other pending callbacks and append as structured XML so the
     // model can extract IDs and cancel all stale callbacks in one turn.
     const others = Array.from(callbacks.values())
-        .filter((other) => other.id !== cb.id && !other.fired);
+        .filter((other) => other.id !== cb.id && !other.fired)
+        .filter((other) => {
+            // Skip callbacks linked to jobs that are no longer running.
+            // The linked job may have completed between when the callback
+            // was scheduled and when this timer fires, making it stale.
+            if (other.linkedJobId && _tauState) {
+                const job = _tauState.backgroundJobs.get(other.linkedJobId);
+                if (job && job.status !== "running") return false;
+            }
+            return true;
+        });
 
     let message = cb.message;
     if (others.length > 0) {
@@ -325,12 +337,17 @@ function cancelCallback(id: string): boolean {
     const cb = callbacks.get(id);
     if (!cb || cb.fired) return false;
 
+    const linkedJobId = cb.linkedJobId;
     if (cb.timer) {
         clearTimeout(cb.timer);
         cb.timer = undefined;
     }
     callbacks.delete(id);
     persistState();
+    // Also clear any pending completion notification for the linked job
+    if (linkedJobId) {
+        _tauState?.cancelCompletionBatchForJob?.(linkedJobId);
+    }
     return true;
 }
 
@@ -345,6 +362,8 @@ function cancelAll(): number {
     }
     callbacks.clear();
     persistState();
+    // Also clear all pending completion notifications
+    _tauState?.cancelAllCompletionBatches?.();
     return count;
 }
 
@@ -522,6 +541,23 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             }
         }
 
+        // Clean up restored callbacks whose linked jobs no longer exist
+        // (orphaned from a previous process that tracked the job).
+        let orphanCount = 0;
+        for (const [id, cb] of callbacks) {
+            if (cb.linkedJobId && !_tauState.backgroundJobs.has(cb.linkedJobId)) {
+                if (cb.timer) {
+                    clearTimeout(cb.timer);
+                    cb.timer = undefined;
+                }
+                callbacks.delete(id);
+                orphanCount++;
+            }
+        }
+        if (orphanCount > 0) {
+            persistState();
+        }
+
         // Start watching for external callbacks
         startExternalWatcher(_sessionId);
     });
@@ -558,7 +594,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=list to see pending callbacks, " +
             "remind action=cancel id=cb-3 to cancel one, " +
             "remind action=cancel-all to cancel all. " +
-            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
+            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
+            "WARNING: manual remind() without jobId creates a standalone callback that persists " +
+            "until it fires or is explicitly cancelled. It will NOT auto-cancel when a job completes. " +
+            "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback.",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -569,7 +608,12 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=cancel id=cb-3 to cancel a specific callback.",
             "Use remind action=cancel-all to cancel all pending callbacks.",
             "When a callback fires, other pending callbacks are listed in the message so the model can cancel them all in one turn.",
-            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
+            "For job monitoring, ALWAYS use bash_bg with remindDelay instead of manual remind(). " +
+                "remindDelay auto-links to the jobId, so the callback is cancelled on job completion. " +
+                "Manual remind() without jobId creates a standalone callback that fires even after " +
+                "the job finishes — you must cancel it explicitly.",
+            "Pass jobId when you must use manual remind() for a job-related check — " +
+                "this links the callback to the job so it auto-cancels on completion.",
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -602,7 +646,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             jobId: Type.Optional(
                 Type.String({
                     description:
-                        "Optional job ID to link this callback to. When set, the callback auto-cancels if the background job completes or is killed before the timer fires.",
+                        "Optional job ID to link this callback to. When set, the callback auto-cancels if the background job completes or is killed before the timer fires. " +
+                        "Without a jobId, this is a standalone callback that persists until it fires " +
+                        "or is explicitly cancelled — it will NOT auto-cancel when a job finishes. " +
+                        "For job monitoring, prefer bash_bg with remindDelay which auto-links.",
                 })
             ),
         }),

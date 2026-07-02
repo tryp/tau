@@ -700,6 +700,43 @@ export function notifyCompletion(
     removeJob(state, job);
 }
 
+/**
+ * Remove a job's pending completion notification from the debounced batch.
+ * If the batch becomes empty, the pending timer is cancelled so the agent
+ * doesn't receive a stale "job completed" message after already cancelling
+ * the associated callbacks.
+ */
+export function clearJobFromCompletionBatch(jobId: string): void {
+    const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
+    if (idx === -1) return;
+    completionBatch.jobs.splice(idx, 1);
+    if (completionBatch.jobs.length === 0) {
+        if (completionBatch.timer) {
+            clearTimeout(completionBatch.timer);
+            completionBatch.timer = undefined;
+        }
+        completionBatch.startTime = 0;
+        completionBatch.pi = undefined;
+        completionBatch.state = undefined;
+    }
+}
+
+/**
+ * Clear all pending completion notifications from the debounced batch.
+ * Called when the agent cancels all callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearAllCompletionBatches(): void {
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+        completionBatch.timer = undefined;
+    }
+    completionBatch.jobs.length = 0;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+}
+
 // ── Background a running foreground process (signal-based) ─────────
 
 /**
@@ -1153,7 +1190,11 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. ",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. " +
+            "Unlike manual remind(), remindDelay auto-links the reminder to this job, " +
+            "so it is auto-cancelled when the job finishes. " +
+            "Manual remind() without a jobId creates a standalone callback that persists until it fires " +
+            "or is explicitly cancelled.",
         promptSnippet:
             "Run bash command in background immediately" +
             " (supports kill deadline and inline reminder)",
@@ -1162,8 +1203,10 @@ export function registerBackgroundJobs(
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
-            "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — " +
-                "the callback auto-cancels if the job completes before the timer fires.",
+            "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
+                "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
+                "Manual remind() without a jobId creates a standalone callback that will fire even after " +
+                "the job has finished — you must cancel it explicitly.",
             "When timeout is set without remindDelay, a reminder is auto-scheduled at 90% of the timeout.",
             "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
@@ -1191,7 +1234,8 @@ export function registerBackgroundJobs(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
-                        "The reminder auto-cancels if the job completes before it fires. " +
+                        "The reminder is auto-linked to this job and auto-cancels if the job completes " +
+                        "before it fires. Unlike manual remind(), no explicit cancel is needed. " +
                         "When timeout is set and remindDelay is omitted, a reminder is auto-scheduled " +
                         'at 90% of the timeout duration.',
                 })
@@ -1909,12 +1953,19 @@ export function registerBackgroundJobs(
         },
     });
 
+    // Wire completion-batch cancellation into state so the callbacks module
+    // can suppress stale job-completion notifications when cancelling reminders.
+    state.cancelCompletionBatchForJob = clearJobFromCompletionBatch;
+    state.cancelAllCompletionBatches = clearAllCompletionBatches;
+
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts
     // because it's guidance about bg workflow, cross-cutting two tools.
     pi.registerToolPromptGuidelines("remind", [
         "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
             "the callback auto-cancels when the job completes.",
+        "When you do use manual remind() to check on a running job, pass the jobId parameter " +
+            "so the callback auto-cancels when the job completes or is killed.",
         "Use manual remind() only for standalone reminders that aren't linked to a job.",
     ]);
 }
