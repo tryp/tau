@@ -1691,7 +1691,25 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
                     if (job.status !== "running" || !job.proc) {
-                        throw new Error(`Job is not running: ${job.id}`);
+                        // Job already completed/failed/killed — cancel linked
+                        // callbacks and suppress any pending completion
+                        // notification so the agent doesn't see stale events.
+                        const cancelledCallbacks = cancelCallbacksForJob(job.id);
+                        job.outputConsumed = true;
+                        state.cancelCompletionBatchForJob?.(job.id);
+                        let msg = `Job ${job.id} is not running (status: ${job.status})`;
+                        if (cancelledCallbacks > 0) {
+                            msg += `. ${cancelledCallbacks} pending reminder${cancelledCallbacks > 1 ? "s" : ""} cancelled.`;
+                        }
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: msg,
+                                },
+                            ],
+                            details: undefined,
+                        };
                     }
                     killProcessGroup(job.proc.pid!, "SIGTERM");
                     const cancelledCallbacks = silenceJobAfterKill(job);

@@ -257,8 +257,8 @@ function fireCallback(id: string): void {
     // when it fired, making this callback stale.
     if (cb.linkedJobId && _tauState) {
         const job = _tauState.backgroundJobs.get(cb.linkedJobId);
-        if (job && job.status !== "running") {
-            // Job is done — cancel this callback silently
+        if (!job || job.status !== "running") {
+            // Job is gone or done — cancel this callback silently
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -289,7 +289,7 @@ function fireCallback(id: string): void {
             // was scheduled and when this timer fires, making it stale.
             if (other.linkedJobId && _tauState) {
                 const job = _tauState.backgroundJobs.get(other.linkedJobId);
-                if (job && job.status !== "running") return false;
+                if (!job || job.status !== "running") return false;
             }
             return true;
         });
