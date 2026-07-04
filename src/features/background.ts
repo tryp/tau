@@ -588,10 +588,19 @@ function flushCompletionBatch(): void {
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
 
     // Single job → send the usual individual format
+    // Only trigger a turn for failed jobs — successful completions are
+    // silent to avoid wasted LLM turns (the agent can check via jobs list).
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
+
+        if (job.status === "completed") {
+            // Silent: job succeeded, no need to wake the agent.
+            // The job is already removed from state by notifyCompletion.
+            return;
+        }
+
         pi.sendMessage(
             {
                 customType: "job-completion",
@@ -617,6 +626,12 @@ function flushCompletionBatch(): void {
     // Multiple jobs → aggregate into one summary
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
+
+    // All succeeded → silent (no wasted turns on successful completions)
+    if (failed.length === 0) {
+        return;
+    }
+
     const parts: string[] = [];
     if (completed.length > 0) parts.push(`${completed.length} completed`);
     if (failed.length > 0) parts.push(`${failed.length} failed`);
