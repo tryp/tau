@@ -597,9 +597,15 @@ function flushCompletionBatch(): void {
 
         if (job.status === "completed") {
             // Silent: job succeeded, no need to wake the agent.
-            // The job is already removed from state by notifyCompletion.
+            // Linked callbacks (e.g. remindDelay) are NOT cancelled here —
+            // they fire naturally and wake the agent when it's time to
+            // check on progress.
             return;
         }
+
+        // Failed job: cancel linked callbacks so the agent only gets one
+        // notification (this one), then wake the agent immediately.
+        cancelCallbacksForJob(job.id);
 
         pi.sendMessage(
             {
@@ -627,9 +633,17 @@ function flushCompletionBatch(): void {
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
 
-    // All succeeded → silent (no wasted turns on successful completions)
+    // All succeeded → silent (no wasted turns on successful completions).
+    // Linked callbacks stay active so the agent wakes naturally when they fire.
     if (failed.length === 0) {
         return;
+    }
+
+    // At least one job failed: cancel linked callbacks for ALL jobs in this
+    // batch so the agent gets one consolidated notification instead of a
+    // mix of immediate wake-up and delayed callback-triggered wake-ups.
+    for (const { job } of batch) {
+        cancelCallbacksForJob(job.id);
     }
 
     const parts: string[] = [];
@@ -677,8 +691,10 @@ export function notifyCompletion(
     // skip notification entirely — the killing path already sent one.
     if (job.outputConsumed) return;
 
-    // Auto-cancel any callbacks linked to this job
-    cancelCallbacksForJob(job.id);
+    // Linked callbacks (remindDelay) are NOT cancelled here — they
+    // are cancelled in flushCompletionBatch only for failed/mixed
+    // batches. Successful completions suppress the notification, so
+    // linked callbacks stay active and wake the agent naturally.
 
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
