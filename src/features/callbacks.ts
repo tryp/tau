@@ -148,6 +148,8 @@ let _pi: ExtensionAPI | null = null;
 let _sessionId = "";
 let _watcher: ReturnType<typeof watch> | null = null;
 let _tauState: TauState | null = null;
+let _agentBusy = false;
+let _readyFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Cancel all pending callbacks linked to a given job ID.
@@ -156,7 +158,7 @@ let _tauState: TauState | null = null;
 export function cancelCallbacksForJob(jobId: string): number {
     let count = 0;
     for (const [id, cb] of callbacks) {
-        if (cb.linkedJobId === jobId && !cb.fired) {
+        if (cb.linkedJobId === jobId) {
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -177,7 +179,7 @@ export function cancelCallbacksForJob(jobId: string): number {
 export function cancelCallbacksForGroup(group: string): number {
     let count = 0;
     for (const [id, cb] of callbacks) {
-        if (cb.group === group && !cb.fired) {
+        if (cb.group === group) {
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -248,33 +250,7 @@ function scheduleCallback(cb: ScheduledCallback): void {
         }
     }
 
-function fireCallback(id: string): void {
-    const cb = callbacks.get(id);
-    if (!cb || cb.fired) return;
-
-    // If linked to a background job, skip delivery if the job is no longer
-    // running. The job may have completed between when the timer was set and
-    // when it fired, making this callback stale.
-    if (cb.linkedJobId && _tauState) {
-        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
-        if (!job || job.status !== "running") {
-            // Job is gone or done — cancel this callback silently
-            if (cb.timer) {
-                clearTimeout(cb.timer);
-                cb.timer = undefined;
-            }
-            callbacks.delete(id);
-            persistState();
-            return;
-        }
-    }
-
-    cb.fired = true;
-    if (cb.timer) {
-        clearTimeout(cb.timer);
-        cb.timer = undefined;
-    }
-
+function buildCallbackMessage(cb: ScheduledCallback): string {
     const elapsed = formatDuration(
         Date.now() - new Date(cb.createdAt).getTime()
     );
@@ -313,29 +289,74 @@ function fireCallback(id: string): void {
         message += "\n</other_callbacks_pending>";
     }
 
-    if (_pi) {
-        _pi.sendUserMessage(
-            `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`,
-            { deliverAs: "followUp" }
-        );
+    return `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`;
+}
+
+function flushReadyCallbacks(): void {
+    if (_agentBusy || !_pi) return;
+
+    const ready = Array.from(callbacks.values())
+        .filter((cb) => cb.fired)
+        .sort((a, b) => Date.parse(a.fireAt) - Date.parse(b.fireAt));
+    const cb = ready[0];
+    if (!cb) return;
+
+    _pi.sendUserMessage(buildCallbackMessage(cb), {
+        deliverAs: "followUp",
+    });
+    callbacks.delete(cb.id);
+    persistState();
+}
+
+function scheduleReadyCallbackFlush(): void {
+    if (_readyFlushTimer) return;
+    _readyFlushTimer = setTimeout(() => {
+        _readyFlushTimer = null;
+        flushReadyCallbacks();
+    }, 0);
+    if (_readyFlushTimer && typeof _readyFlushTimer === "object") {
+        _readyFlushTimer.unref?.();
+    }
+}
+
+function fireCallback(id: string): void {
+    const cb = callbacks.get(id);
+    if (!cb || cb.fired) return;
+
+    // If linked to a background job, skip delivery if the job is no longer
+    // running. The job may have completed between when the timer was set and
+    // when it fired, making this callback stale.
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (!job || job.status !== "running") {
+            // Job is gone or done — cancel this callback silently
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            persistState();
+            return;
+        }
     }
 
-    // Remove from map after firing
-    callbacks.delete(id);
+    cb.fired = true;
+    if (cb.timer) {
+        clearTimeout(cb.timer);
+        cb.timer = undefined;
+    }
 
-    // Update persisted state
+    // Keep fired callbacks in-memory until they are actually delivered so
+    // cancel/cancel-all can still suppress them if the agent stays busy.
+    // Persisted state omits fired callbacks, so they will not be restored
+    // across sessions.
     persistState();
-    // Note: we do NOT auto-cancel other pending callbacks here, even if
-    // they share the same linkedJobId. Staggered reminders for the same
-    // job may have different intents (start-check vs progress vs
-    // completion) and the first firing does not invalidate the rest.
-    // The appended <other_callbacks_pending> block gives the model
-    // visibility to decide which (if any) to cancel.
+    scheduleReadyCallbackFlush();
 }
 
 function cancelCallback(id: string): boolean {
     const cb = callbacks.get(id);
-    if (!cb || cb.fired) return false;
+    if (!cb) return false;
 
     const linkedJobId = cb.linkedJobId;
     if (cb.timer) {
@@ -500,6 +521,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
     pi.on("session_start", async (event, ctx) => {
         _sessionId = ctx.sessionManager.getSessionId();
         _pi = pi;
+        _agentBusy = false;
         cbNextId = 1;
 
         // Restore pending callbacks from the latest session entry.
@@ -544,14 +566,17 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
         // Clean up restored callbacks whose linked jobs no longer exist
         // (orphaned from a previous process that tracked the job).
         let orphanCount = 0;
-        for (const [id, cb] of callbacks) {
-            if (cb.linkedJobId && !_tauState.backgroundJobs.has(cb.linkedJobId)) {
-                if (cb.timer) {
-                    clearTimeout(cb.timer);
-                    cb.timer = undefined;
+        const tauState = _tauState;
+        if (tauState) {
+            for (const [id, cb] of callbacks) {
+                if (cb.linkedJobId && !tauState.backgroundJobs.has(cb.linkedJobId)) {
+                    if (cb.timer) {
+                        clearTimeout(cb.timer);
+                        cb.timer = undefined;
+                    }
+                    callbacks.delete(id);
+                    orphanCount++;
                 }
-                callbacks.delete(id);
-                orphanCount++;
             }
         }
         if (orphanCount > 0) {
@@ -562,12 +587,26 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
         startExternalWatcher(_sessionId);
     });
 
+    pi.on("agent_start", async () => {
+        _agentBusy = true;
+    });
+
+    pi.on("agent_end", async () => {
+        _agentBusy = false;
+        scheduleReadyCallbackFlush();
+    });
+
     pi.on("session_shutdown", async () => {
         // Persist any pending callbacks
         persistState();
 
         // Stop watcher
         stopExternalWatcher();
+
+        if (_readyFlushTimer) {
+            clearTimeout(_readyFlushTimer);
+            _readyFlushTimer = null;
+        }
 
         // Cancel all in-memory timers
         for (const cb of callbacks.values()) {
@@ -577,6 +616,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             }
         }
         callbacks.clear();
+        _agentBusy = false;
         _pi = null;
     });
 
