@@ -551,17 +551,28 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
 const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
 
+type CompletionBatchItem = {
+    job: BackgroundJob;
+    duration: string;
+    emoji: string;
+};
+
+type PendingCompletionDelivery = {
+    jobs: CompletionBatchItem[];
+    pi: ExtensionAPI;
+    state: TauState;
+};
+
 const completionBatch: {
-    jobs: Array<{
-        job: BackgroundJob;
-        duration: string;
-        emoji: string;
-    }>;
+    jobs: CompletionBatchItem[];
     timer?: NodeJS.Timeout;
     startTime: number;   // timestamp of the first job in the current batch
     pi?: ExtensionAPI;
     state?: TauState;
 } = { jobs: [], startTime: 0 };
+
+const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
+let completionAgentBusy = false;
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -570,42 +581,35 @@ function countOutstandingJobs(state: TauState): number {
     ).length;
 }
 
-function flushCompletionBatch(): void {
-    const batch = completionBatch.jobs.splice(0);
-    const pi = completionBatch.pi!;
-    const state = completionBatch.state!;
-    completionBatch.timer = undefined;
-    completionBatch.startTime = 0;
-    completionBatch.pi = undefined;
-    completionBatch.state = undefined;
+function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
+    return jobs.some((j) => j.job.status !== "completed");
+}
 
+function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchItem[] {
+    const unconsumedFailed = jobs.filter(
+        (j) => j.job.status !== "completed" && !j.job.outputConsumed
+    );
+    if (unconsumedFailed.length === 0) return [];
+
+    const failedIds = new Set(unconsumedFailed.map((j) => j.job.id));
+    return jobs.filter(
+        (j) => j.job.status === "completed" || failedIds.has(j.job.id)
+    );
+}
+
+function deliverCompletionNotification(delivery: PendingCompletionDelivery): void {
+    const batch = pruneConsumedCompletions(delivery.jobs);
     if (batch.length === 0) return;
 
-    // Recompute outstanding count from current state (reflects only jobs
-    // NOT in this batch, since each notifyCompletion already called removeJob)
+    const { pi, state } = delivery;
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
 
-    // Single job → send the usual individual format
-    // Only trigger a turn for failed jobs — successful completions are
-    // silent to avoid wasted LLM turns (the agent can check via jobs list).
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
-
-        if (job.status === "completed") {
-            // Silent: job succeeded, no need to wake the agent.
-            // Linked callbacks (e.g. remindDelay) are NOT cancelled here —
-            // they fire naturally and wake the agent when it's time to
-            // check on progress.
-            return;
-        }
-
-        // Failed job: cancel linked callbacks so the agent only gets one
-        // notification (this one), then wake the agent immediately.
-        cancelCallbacksForJob(job.id);
 
         pi.sendMessage(
             {
@@ -629,23 +633,8 @@ function flushCompletionBatch(): void {
         return;
     }
 
-    // Multiple jobs → aggregate into one summary
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
-
-    // All succeeded → silent (no wasted turns on successful completions).
-    // Linked callbacks stay active so the agent wakes naturally when they fire.
-    if (failed.length === 0) {
-        return;
-    }
-
-    // At least one job failed: cancel linked callbacks for ALL jobs in this
-    // batch so the agent gets one consolidated notification instead of a
-    // mix of immediate wake-up and delayed callback-triggered wake-ups.
-    for (const { job } of batch) {
-        cancelCallbacksForJob(job.id);
-    }
-
     const parts: string[] = [];
     if (completed.length > 0) parts.push(`${completed.length} completed`);
     if (failed.length > 0) parts.push(`${failed.length} failed`);
@@ -678,6 +667,47 @@ function flushCompletionBatch(): void {
         },
         { deliverAs: "followUp", triggerTurn: true }
     );
+}
+
+function flushPendingCompletionDeliveries(): void {
+    if (completionAgentBusy) return;
+    while (pendingCompletionDeliveries.length > 0) {
+        const delivery = pendingCompletionDeliveries.shift();
+        if (delivery) deliverCompletionNotification(delivery);
+    }
+}
+
+function queueCompletionDelivery(
+    jobs: CompletionBatchItem[],
+    pi: ExtensionAPI,
+    state: TauState
+): void {
+    const jobsToDeliver = pruneConsumedCompletions(jobs);
+    if (jobsToDeliver.length === 0) return;
+
+    for (const { job } of jobsToDeliver) {
+        if (job.status !== "completed") cancelCallbacksForJob(job.id);
+    }
+    pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
+    flushPendingCompletionDeliveries();
+}
+
+function flushCompletionBatch(): void {
+    const batch = completionBatch.jobs.splice(0);
+    const pi = completionBatch.pi!;
+    const state = completionBatch.state!;
+    completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+
+    if (batch.length === 0) return;
+
+    // Successful completions are silent to avoid wasted LLM turns. Failed
+    // completions are queued until the agent is idle, then rechecked so a
+    // jobs(output)/attach that consumed the failure can suppress stale followups.
+    if (!hasFailedCompletion(batch)) return;
+    queueCompletionDelivery(batch, pi, state);
 }
 
 /** Send a structured completion notification to the agent. */
@@ -739,16 +769,25 @@ export function notifyCompletion(
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
     const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
-    if (idx === -1) return;
-    completionBatch.jobs.splice(idx, 1);
-    if (completionBatch.jobs.length === 0) {
-        if (completionBatch.timer) {
-            clearTimeout(completionBatch.timer);
-            completionBatch.timer = undefined;
+    if (idx !== -1) {
+        completionBatch.jobs.splice(idx, 1);
+        if (completionBatch.jobs.length === 0) {
+            if (completionBatch.timer) {
+                clearTimeout(completionBatch.timer);
+                completionBatch.timer = undefined;
+            }
+            completionBatch.startTime = 0;
+            completionBatch.pi = undefined;
+            completionBatch.state = undefined;
         }
-        completionBatch.startTime = 0;
-        completionBatch.pi = undefined;
-        completionBatch.state = undefined;
+    }
+
+    for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
+        const delivery = pendingCompletionDeliveries[i];
+        delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
+        if (!hasFailedCompletion(delivery.jobs)) {
+            pendingCompletionDeliveries.splice(i, 1);
+        }
     }
 }
 
@@ -766,6 +805,7 @@ export function clearAllCompletionBatches(): void {
     completionBatch.startTime = 0;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
+    pendingCompletionDeliveries.length = 0;
 }
 
 // ── Background a running foreground process (signal-based) ─────────
@@ -890,6 +930,22 @@ export function registerBackgroundJobs(
     pi: ExtensionAPI,
     state: TauState
 ): void {
+    const eventPi = pi as ExtensionAPI & {
+        on?: (event: string, handler: (...args: unknown[]) => unknown) => void;
+    };
+    eventPi.on?.("agent_start", () => {
+        completionAgentBusy = true;
+    });
+    eventPi.on?.("agent_end", () => {
+        completionAgentBusy = false;
+        flushPendingCompletionDeliveries();
+    });
+    eventPi.on?.("session_shutdown", () => {
+        completionAgentBusy = false;
+        pendingCompletionDeliveries.length = 0;
+        clearAllCompletionBatches();
+    });
+
     // ── Override bash tool ─────────────────────────────────────────────
 
     const originalBashTool = createBashTool(process.cwd());
@@ -1416,7 +1472,7 @@ export function registerBackgroundJobs(
                 extra += ` or timeout within ${params.timeout}s`;
             }
             if (reminderId) {
-                extra += ` or reminder event ${reminderId} in ${params.remindIn}`;
+                extra += ` or reminder event ${reminderId} in ${params.remindDelay}`;
             }
 
             return {
@@ -2010,7 +2066,9 @@ export function registerBackgroundJobs(
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts
     // because it's guidance about bg workflow, cross-cutting two tools.
-    pi.registerToolPromptGuidelines("remind", [
+    (pi as ExtensionAPI & {
+        registerToolPromptGuidelines: (toolName: string, guidelines: string[]) => void;
+    }).registerToolPromptGuidelines("remind", [
         "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
             "the callback auto-cancels when the job completes.",
         "When you do use manual remind() to check on a running job, pass the jobId parameter " +
