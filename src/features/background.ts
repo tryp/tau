@@ -436,17 +436,15 @@ export function startStallWatchdog(
  * fires a `bg-trigger` custom event when a condition is met.
  * Triggers are one-shot: after firing they are removed from the job.
  */
+ */
+
 export function startTriggerMonitor(
     job: BackgroundJob,
     pi: ExtensionAPI,
     state: TauState
 ): () => void {
-    if (!job.triggers || job.triggers.length === 0) return () => {};
-
     let cancelled = false;
-    let prevSize = 0;
-    let prevLines = 0;
-    let ioBlockStartMs: number | undefined;
+    const acc = makeTriggerAccum();
 
     const timer = setInterval(() => {
         if (cancelled || job.status !== "running") {
@@ -457,7 +455,28 @@ export function startTriggerMonitor(
         const remaining: JobTrigger[] = [];
         for (const t of job.triggers ?? []) {
             try {
-                if (pollTrigger(t)) continue;
+                const result = evaluateTrigger(t, job.pid, job.logPath, acc);
+                if (result.met) {
+                    const label = t.label ?? `${t.type}=${t.value}`;
+                    const suffix = outstandingJobsSuffix(state, job.id);
+                    pi.sendMessage(
+                        {
+                            customType: "bg-trigger",
+                            content:
+                                `\u26a1 ${job.id} trigger: ${label} (current: ${result.current})${suffix}\n` +
+                                `Command: ${job.command}\nLog: ${job.logPath}`,
+                            display: true,
+                            details: {
+                                jobId: job.id,
+                                triggerType: t.type,
+                                threshold: t.value,
+                                current: result.current,
+                            },
+                        },
+                        { deliverAs: "followUp", triggerTurn: true }
+                    );
+                    continue; // remove fired trigger
+                }
             } catch {}
             remaining.push(t);
         }
@@ -473,86 +492,6 @@ export function startTriggerMonitor(
         cancelled = true;
         clearInterval(timer);
     };
-
-    function pollTrigger(trigger: JobTrigger): boolean {
-        const pid = job.pid;
-        let met = false;
-        let current = 0;
-
-        switch (trigger.type) {
-            case "outputLines": {
-                const size = statSync(job.logPath).size;
-                if (size === 0) { prevSize = 0; prevLines = 0; break; }
-                if (size < prevSize) { prevSize = 0; prevLines = 0; }
-                prevSize = size;
-
-                const readLen = Math.min(size, 65536);
-                const buf = Buffer.alloc(readLen);
-                const fd = openSync(job.logPath, "r");
-                let bytes = 0;
-                try {
-                    bytes = readSync(fd, buf, 0, readLen, Math.max(0, size - readLen));
-                } finally {
-                    closeSync(fd);
-                }
-                const tailStr = buf.toString("utf-8", 0, bytes);
-                const newlines = (tailStr.match(/\n/g) || []).length;
-                prevLines += Math.max(0, newlines);
-                current = prevLines;
-                if (current >= trigger.value) met = true;
-                break;
-            }
-            case "rssKb": {
-                const status = readFileSync(`/proc/${pid}/status`, "utf-8");
-                const m = status.match(/^VmRSS:\s+(\d+)/m);
-                if (m) {
-                    current = parseInt(m[1], 10);
-                    if (current >= trigger.value) met = true;
-                }
-                break;
-            }
-            case "ioBlockMs": {
-                const statData = readFileSync(`/proc/${pid}/stat`, "utf-8");
-                const closeParen = statData.lastIndexOf(")");
-                if (closeParen === -1) break;
-                const parts = statData.slice(closeParen + 2).split(" ");
-                if (parts.length === 0) break;
-                const state = parts[0];
-                if (state === "D" || state === "Dl") {
-                    const now = Date.now();
-                    if (ioBlockStartMs === undefined) ioBlockStartMs = now;
-                    current = now - ioBlockStartMs;
-                    if (current >= trigger.value) met = true;
-                } else {
-                    ioBlockStartMs = undefined;
-                }
-                break;
-            }
-        }
-
-        if (met) {
-            const label = trigger.label ?? `${trigger.type}=${trigger.value}`;
-            const suffix = outstandingJobsSuffix(state, job.id);
-            pi.sendMessage(
-                {
-                    customType: "bg-trigger",
-                    content:
-                        `⚡ ${job.id} trigger: ${label} (current: ${current})${suffix}\n` +
-                        `Command: ${job.command}\nLog: ${job.logPath}`,
-                    display: true,
-                    details: {
-                        jobId: job.id,
-                        triggerType: trigger.type,
-                        threshold: trigger.value,
-                        current,
-                    },
-                },
-                { deliverAs: "followUp", triggerTurn: true }
-            );
-            return true;
-        }
-        return false;
-    }
 }
 
 export function hasForegroundTasks(state: TauState): boolean {
@@ -1512,10 +1451,15 @@ export function registerBackgroundJobs(
                     Type.Object({
                         type: Type.String({
                             description:
-                                'Trigger type: "outputLines", "rssKb", or "ioBlockMs". ' +
+                                'Trigger type: "outputLines", "rssKb", "ioReadBytes", "ioWriteBytes", ' +
+                                '"cpuTime", "ioBlock", or "wallTime". ' +
                                 '"outputLines": fire when the log file has N+ lines. ' +
                                 '"rssKb": fire when RSS exceeds N KB. ' +
-                                '"ioBlockMs": fire when cumulative time in D (I/O wait) state exceeds N ms.',
+                                '"ioReadBytes": fire when /proc/pid/io read_bytes exceeds N. ' +
+                                '"ioWriteBytes": fire when /proc/pid/io write_bytes exceeds N. ' +
+                                '"cpuTime": fire after N seconds of CPU usage (utime+stime+cutime+cstime). ' +
+                                '"ioBlock": fire after N seconds cumulative in D (I/O wait) state. ' +
+                                '"wallTime": fire after N seconds of wall-clock time.',
                         }),
                         value: Type.Number({
                             description: "Threshold value.",
@@ -1623,10 +1567,7 @@ export function registerBackgroundJobs(
             }
 
             // ── Trigger monitor ───────────────────────────────────────
-            let cancelTriggers: (() => void) | undefined;
-            if (params.triggers && Array.isArray(params.triggers) && params.triggers.length > 0) {
-                cancelTriggers = startTriggerMonitor(job, pi, state);
-            }
+            let cancelTriggers = startTriggerMonitor(job, pi, state);
 
             proc.on("close", (code) => {
                 cancelStall();
