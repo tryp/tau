@@ -35,9 +35,10 @@ export interface BackgroundJob {
  * A condition to monitor on a running background job.
  * When the condition is met, a `bg-trigger` custom event is sent to
  * the agent and the trigger is deactivated (one-shot).
+ * Time-based values are in seconds (wallTime, cpuTime, ioBlock).
  */
 export interface JobTrigger {
-    type: "outputLines" | "rssKb" | "ioBlockMs";
+    type: "outputLines" | "rssKb" | "ioReadBytes" | "ioWriteBytes" | "cpuTime" | "ioBlock" | "wallTime";
     value: number;
     /** Optional label for the agent's callback message. */
     label?: string;
