@@ -1412,6 +1412,8 @@ export function registerBackgroundJobs(
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "After starting a background job with remindDelay, stop polling. " +
+                "The callback will wake you when it fires or the job completes.",
             "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
                 "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
                 "Manual remind() without a jobId creates a standalone callback that will fire even after " +
@@ -1847,11 +1849,25 @@ export function registerBackgroundJobs(
                             total,
                             isTruncated
                         );
+
+                        // Build hint about pending callbacks for running jobs
+                        let suffix = "";
+                        if (job.status === "running" && hasLinkedCallbacksForJob(job.id)) {
+                            suffix =
+                                "\n\nJob still running. A remind callback is pending \u2014 " +
+                                "wait for it to fire instead of polling. " +
+                                "Use remind with jobId to subscribe outputLines/rssKb/cpuTime triggers.";
+                        } else if (job.status === "running") {
+                            suffix =
+                                "\n\nJob still running. Use remind with jobId " +
+                                "to schedule a callback instead of polling.";
+                        }
+
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Output for ${job.id} (${job.status})${
+                                    text: `Output for ${job.id} (${job.status})${suffix}${
                                         grepPattern
                                             ? `, grep "${grepPattern}"`
                                             : ""
