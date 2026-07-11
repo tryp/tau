@@ -6,7 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -312,7 +312,7 @@ import {
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
-import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
+import type { BackgroundJob, JobTrigger, RunningProcess, UiContext } from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
     MAX_LOG_BYTES,
@@ -430,7 +430,130 @@ export function startStallWatchdog(
     };
 }
 
-/** Check if there are any foreground tasks that can be backgrounded. */
+/**
+ * Start a periodic poller that watches a background job's triggers and
+ * fires a `bg-trigger` custom event when a condition is met.
+ * Triggers are one-shot: after firing they are removed from the job.
+ */
+export function startTriggerMonitor(
+    job: BackgroundJob,
+    pi: ExtensionAPI,
+    state: TauState
+): () => void {
+    if (!job.triggers || job.triggers.length === 0) return () => {};
+
+    let cancelled = false;
+    let prevSize = 0;
+    let prevLines = 0;
+    let ioBlockStartMs: number | undefined;
+
+    const timer = setInterval(() => {
+        if (cancelled || job.status !== "running") {
+            cancelled = true;
+            return;
+        }
+
+        const remaining: JobTrigger[] = [];
+        for (const t of job.triggers ?? []) {
+            try {
+                if (pollTrigger(t)) continue;
+            } catch {}
+            remaining.push(t);
+        }
+        job.triggers = remaining.length > 0 ? remaining : undefined;
+        if (job.triggers === undefined) {
+            cancelled = true;
+            clearInterval(timer);
+        }
+    }, 2000);
+    timer.unref();
+
+    return () => {
+        cancelled = true;
+        clearInterval(timer);
+    };
+
+    function pollTrigger(trigger: JobTrigger): boolean {
+        const pid = job.pid;
+        let met = false;
+        let current = 0;
+
+        switch (trigger.type) {
+            case "outputLines": {
+                const size = statSync(job.logPath).size;
+                if (size === 0) { prevSize = 0; prevLines = 0; break; }
+                if (size < prevSize) { prevSize = 0; prevLines = 0; }
+                prevSize = size;
+
+                const readLen = Math.min(size, 65536);
+                const buf = Buffer.alloc(readLen);
+                const fd = openSync(job.logPath, "r");
+                let bytes = 0;
+                try {
+                    bytes = readSync(fd, buf, 0, readLen, Math.max(0, size - readLen));
+                } finally {
+                    closeSync(fd);
+                }
+                const tailStr = buf.toString("utf-8", 0, bytes);
+                const newlines = (tailStr.match(/\n/g) || []).length;
+                prevLines += Math.max(0, newlines);
+                current = prevLines;
+                if (current >= trigger.value) met = true;
+                break;
+            }
+            case "rssKb": {
+                const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+                const m = status.match(/^VmRSS:\s+(\d+)/m);
+                if (m) {
+                    current = parseInt(m[1], 10);
+                    if (current >= trigger.value) met = true;
+                }
+                break;
+            }
+            case "ioBlockMs": {
+                const statData = readFileSync(`/proc/${pid}/stat`, "utf-8");
+                const closeParen = statData.lastIndexOf(")");
+                if (closeParen === -1) break;
+                const parts = statData.slice(closeParen + 2).split(" ");
+                if (parts.length === 0) break;
+                const state = parts[0];
+                if (state === "D" || state === "Dl") {
+                    const now = Date.now();
+                    if (ioBlockStartMs === undefined) ioBlockStartMs = now;
+                    current = now - ioBlockStartMs;
+                    if (current >= trigger.value) met = true;
+                } else {
+                    ioBlockStartMs = undefined;
+                }
+                break;
+            }
+        }
+
+        if (met) {
+            const label = trigger.label ?? `${trigger.type}=${trigger.value}`;
+            const suffix = outstandingJobsSuffix(state, job.id);
+            pi.sendMessage(
+                {
+                    customType: "bg-trigger",
+                    content:
+                        `⚡ ${job.id} trigger: ${label} (current: ${current})${suffix}\n` +
+                        `Command: ${job.command}\nLog: ${job.logPath}`,
+                    display: true,
+                    details: {
+                        jobId: job.id,
+                        triggerType: trigger.type,
+                        threshold: trigger.value,
+                        current,
+                    },
+                },
+                { deliverAs: "followUp", triggerTurn: true }
+            );
+            return true;
+        }
+        return false;
+    }
+}
+
 export function hasForegroundTasks(state: TauState): boolean {
     return Array.from(state.backgroundJobs.values()).some(
         (job) => job.status === "running" && !job.isBackgrounded && job.proc
@@ -1339,10 +1462,11 @@ export function registerBackgroundJobs(
             "Unlike manual remind(), remindDelay auto-links the reminder to this job, " +
             "so it is auto-cancelled when the job finishes. " +
             "Manual remind() without a jobId creates a standalone callback that persists until it fires " +
-            "or is explicitly cancelled.",
+            "or is explicitly cancelled. " +
+            "Optionally set triggers (outputLines, rssKb, ioBlockMs) to fire async events when conditions are met.",
         promptSnippet:
             "Run bash command in background immediately" +
-            " (supports kill deadline and inline reminder)",
+            " (supports kill deadline, inline reminder, and triggers)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
@@ -1392,6 +1516,32 @@ export function registerBackgroundJobs(
                         "Only used when remindDelay is set.",
                 })
             ),
+            triggers: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        type: Type.String({
+                            description:
+                                'Trigger type: "outputLines", "rssKb", or "ioBlockMs". ' +
+                                '"outputLines": fire when the log file has N+ lines. ' +
+                                '"rssKb": fire when RSS exceeds N KB. ' +
+                                '"ioBlockMs": fire when cumulative time in D (I/O wait) state exceeds N ms.',
+                        }),
+                        value: Type.Number({
+                            description: "Threshold value.",
+                        }),
+                        label: Type.Optional(
+                            Type.String({
+                                description: "Optional label for the callback message.",
+                            })
+                        ),
+                    }),
+                    {
+                        description:
+                            "Triggers that fire async events when conditions are met. " +
+                            'Example: [{type:"outputLines",value:100}] notifies when the log has 100+ lines.',
+                    }
+                )
+            ),
         }),
 
         async execute(
@@ -1428,6 +1578,7 @@ export function registerBackgroundJobs(
                 proc,
                 toolCallId,
                 isBackgrounded: true,
+                triggers: params.triggers as JobTrigger[] | undefined,
             };
             createJobDonePromise(job);
             state.backgroundJobs.set(jobId, job);
@@ -1478,8 +1629,15 @@ export function registerBackgroundJobs(
                 if (rid) reminderId = rid;
             }
 
+            // ── Trigger monitor ───────────────────────────────────────
+            let cancelTriggers: (() => void) | undefined;
+            if (params.triggers && Array.isArray(params.triggers) && params.triggers.length > 0) {
+                cancelTriggers = startTriggerMonitor(job, pi, state);
+            }
+
             proc.on("close", (code) => {
                 cancelStall();
+                if (cancelTriggers) cancelTriggers();
                 if (killTimer) clearTimeout(killTimer);
                 killTimer = undefined;
                 markJobTerminal(

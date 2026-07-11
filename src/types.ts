@@ -25,6 +25,22 @@ export interface BackgroundJob {
     outputConsumed?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
     isBackgrounded: boolean;
+    /** Optional triggers that fire async events when conditions are met. */
+    triggers?: JobTrigger[];
+}
+
+// ─── Job triggers ───────────────────────────────────────────────────
+
+/**
+ * A condition to monitor on a running background job.
+ * When the condition is met, a `bg-trigger` custom event is sent to
+ * the agent and the trigger is deactivated (one-shot).
+ */
+export interface JobTrigger {
+    type: "outputLines" | "rssKb" | "ioBlockMs";
+    value: number;
+    /** Optional label for the agent's callback message. */
+    label?: string;
 }
 
 export interface RunningProcess {
