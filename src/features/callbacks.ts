@@ -971,8 +971,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                     if (params.jobId) {
                         result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
 
-                        // Guide agent to stop polling
-                        result += "\nNo need to poll — the callback will notify you when it fires.";
+                        // Make it clear the agent can stop — the system wakes it on callback fire or job completion
+                        result += "\n\nYou can stop here. The callback will wake you when it fires or the job completes — no further action needed.";
 
                         // Subscribe triggers on the existing job
                         const triggersRaw = params.triggers;
