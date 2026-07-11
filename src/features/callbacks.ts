@@ -30,6 +30,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
+import type { JobTrigger } from "../types.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -739,7 +740,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
             "WARNING: manual remind() without jobId creates a standalone callback that persists " +
             "until it fires or is explicitly cancelled. It will NOT auto-cancel when a job completes. " +
-            "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback.",
+            "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback. " +
+            "When used with jobId, triggers can be subscribed on the running job to fire async events " +
+            'when conditions like outputLines, rssKb, cpuTime, or wallTime are met.',
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -756,6 +759,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                 "the job finishes — you must cancel it explicitly.",
             "Pass jobId when you must use manual remind() for a job-related check — " +
                 "this links the callback to the job so it auto-cancels on completion.",
+            "Use triggers on remind to subscribe conditions on a running job — " +
+                "e.g., triggers: [{type:\"outputLines\", value: 200}] fires when the log has 200+ lines.",
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -793,6 +798,31 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                         "or is explicitly cancelled — it will NOT auto-cancel when a job finishes. " +
                         "For job monitoring, prefer bash_bg with remindDelay which auto-links.",
                 })
+            ),
+            triggers: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        type: Type.String({
+                            description:
+                                'Trigger type: "outputLines", "rssKb", "ioReadBytes", "ioWriteBytes", ' +
+                                '"cpuTime", "ioBlock", or "wallTime".',
+                        }),
+                        value: Type.Number({
+                            description: "Threshold value.",
+                        }),
+                        label: Type.Optional(
+                            Type.String({
+                                description: "Optional label for the callback message.",
+                            })
+                        ),
+                    }),
+                    {
+                        description:
+                            "Optional triggers to subscribe on the linked job. " +
+                            "Requires jobId. Monitored alongside any triggers already set on the job. " +
+                            'Example: [{type:"outputLines",value:200}] notifies when log has 200+ lines.',
+                    }
+                )
             ),
         }),
 
@@ -938,6 +968,20 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
 
                     if (params.jobId) {
                         result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
+
+                        // Subscribe triggers on the existing job
+                        const triggersRaw = params.triggers;
+                        if (triggersRaw && Array.isArray(triggersRaw) && triggersRaw.length > 0) {
+                            const job = state.backgroundJobs.get(params.jobId);
+                            if (job && job.status === "running") {
+                                const newTriggers = triggersRaw as JobTrigger[];
+                                job.triggers = [...(job.triggers ?? []), ...newTriggers];
+                                result += `\nSubscribed ${newTriggers.length} trigger(s): ` +
+                                    newTriggers.map((t) => `${t.type}=${t.value}`).join(", ");
+                            } else {
+                                result += `\nWarning: job ${params.jobId} not found or not running — triggers not subscribed`;
+                            }
+                        }
                     }
 
                     return {
