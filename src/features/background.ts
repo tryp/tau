@@ -6,7 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -311,7 +311,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
-import { cancelCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
+import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
 import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
@@ -597,6 +597,41 @@ function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchI
     );
 }
 
+/** Best-effort GPU utilization snapshot at the time a job completes. */
+function readGpuSnapshot(): string | null {
+	try {
+		const entries = readdirSync("/sys/class/drm");
+		const lines: string[] = [];
+		for (const entry of entries) {
+			if (!entry.startsWith("card") || entry.includes("-")) continue;
+			try {
+				const busy = parseInt(
+					readFileSync(`/sys/class/drm/${entry}/device/gpu_busy_percent`, "utf-8").trim(),
+					10
+				);
+				let temp = "";
+				try {
+					const hwmons = readdirSync("/sys/class/hwmon");
+					for (const hw of hwmons) {
+						try {
+							const name = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
+							if (name === "amdgpu" || name === "i915") {
+								const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
+								temp = ` ${(t / 1000).toFixed(0)}C`;
+								break;
+							}
+						} catch {}
+					}
+				} catch {}
+				lines.push(`${entry}: ${busy}%${temp}`);
+			} catch {}
+		}
+		return lines.length > 0 ? lines.join(", ") : null;
+	} catch {
+		return null;
+	}
+}
+
 function deliverCompletionNotification(delivery: PendingCompletionDelivery): void {
     const batch = pruneConsumedCompletions(delivery.jobs);
     if (batch.length === 0) return;
@@ -611,12 +646,18 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
 
+        // Best-effort GPU snapshot at completion time
+        const gpuLine = readGpuSnapshot();
+        const resourceInfo = gpuLine
+            ? `\nGPU: ${gpuLine}`
+            : "";
+
         pi.sendMessage(
             {
                 customType: "job-completion",
                 content:
                     `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
-                    `Command: ${job.command}\nOutput: ${job.logPath}`,
+                    `Command: ${job.command}\nOutput: ${job.logPath}${resourceInfo}`,
                 display: true,
                 details: {
                     jobId: job.id,
@@ -648,10 +689,15 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
     );
     const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
 
+    const gpuLine = readGpuSnapshot();
+    const resourceInfo = gpuLine
+        ? `\nGPU: ${gpuLine}`
+        : "";
+
     pi.sendMessage(
         {
             customType: "job-completion",
-            content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}`,
+            content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}${resourceInfo}`,
             display: true,
             details: {
                 batch: batch.map((b) => ({
@@ -685,8 +731,10 @@ function queueCompletionDelivery(
     const jobsToDeliver = pruneConsumedCompletions(jobs);
     if (jobsToDeliver.length === 0) return;
 
+    // Cancel linked callbacks for all delivered jobs — we're about to
+    // send the result to the agent, so remind callbacks are now stale.
     for (const { job } of jobsToDeliver) {
-        if (job.status !== "completed") cancelCallbacksForJob(job.id);
+        cancelCallbacksForJob(job.id);
     }
     pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
     flushPendingCompletionDeliveries();
@@ -703,12 +751,20 @@ function flushCompletionBatch(): void {
 
     if (batch.length === 0) return;
 
-    // Successful completions are silent to avoid wasted LLM turns. Failed
-    // completions are queued until the agent is idle, then rechecked so a
-    // jobs(output)/attach that consumed the failure can suppress stale followups.
-    if (!hasFailedCompletion(batch)) return;
+    // Suppress successful completions to avoid wasted LLM turns — UNLESS
+    // one of the jobs has linked callbacks, meaning the agent explicitly
+    // asked to be reminded about it. In that case, deliver the notification
+    // (which cancels the linked callbacks).
+    // Failed completions are always delivered.
+    if (!hasFailedCompletion(batch)) {
+        const hasLinked = batch.some((j) => hasLinkedCallbacksForJob(j.job.id));
+        if (!hasLinked) return;
+    }
+
     queueCompletionDelivery(batch, pi, state);
 }
+
+
 
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
@@ -721,10 +777,10 @@ export function notifyCompletion(
     // skip notification entirely — the killing path already sent one.
     if (job.outputConsumed) return;
 
-    // Linked callbacks (remindDelay) are NOT cancelled here — they
-    // are cancelled in flushCompletionBatch only for failed/mixed
-    // batches. Successful completions suppress the notification, so
-    // linked callbacks stay active and wake the agent naturally.
+    // Linked callbacks (remindDelay) are NOT cancelled here — delivery
+    // is deferred to flushCompletionBatch which decides whether to
+    // suppress (no linked callbacks) or deliver (linked callbacks
+    // present for any job in the batch).
 
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
@@ -993,7 +1049,9 @@ export function registerBackgroundJobs(
             const sleepMatch = detectBlockedSleep(command);
             if (sleepMatch) {
                 throw new Error(
-                    `Blocked: ${sleepMatch}. Use bash_bg for long waits. ` +
+                    `Blocked: ${sleepMatch}. ` +
+                        `Use bash_bg (with remindDelay) for long-running commands. ` +
+                        `Use remind with jobId to register callbacks on existing background jobs. ` +
                         "For pacing < 2s, sleep is fine."
                 );
             }
@@ -1422,8 +1480,7 @@ export function registerBackgroundJobs(
 
             proc.on("close", (code) => {
                 cancelStall();
-                if (killTimer) clearTimeout(killTimer);
-                killTimer = undefined;
+                if (cancelTriggers) cancelTriggers();
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",

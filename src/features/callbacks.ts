@@ -174,6 +174,16 @@ export function cancelCallbacksForJob(jobId: string): number {
 }
 
 /**
+ * Check whether any non-fired callbacks are linked to the given job.
+ */
+export function hasLinkedCallbacksForJob(jobId: string): boolean {
+    for (const cb of callbacks.values()) {
+        if (cb.linkedJobId === jobId && !cb.fired) return true;
+    }
+    return false;
+}
+
+/**
  * Cancel all pending callbacks in a given group.
  */
 export function cancelCallbacksForGroup(group: string): number {
@@ -250,10 +260,98 @@ function scheduleCallback(cb: ScheduledCallback): void {
         }
     }
 
+/**
+ * Read /proc/<pid>/stat and return a one-line resource snapshot.
+ * Returns null if /proc is unavailable or the process has exited.
+ */
+function readProcSnapshot(pid: number): string | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+		const closeParen = stat.lastIndexOf(")");
+		if (closeParen === -1) return null;
+		const parts = stat.slice(closeParen + 2).split(" ");
+		if (parts.length < 22) return null;
+
+		const utime = parseInt(parts[11], 10) || 0;
+		const stime = parseInt(parts[12], 10) || 0;
+		const cutime = parseInt(parts[13], 10) || 0;
+		const cstime = parseInt(parts[14], 10) || 0;
+		const cpuSec = ((utime + stime + cutime + cstime) / 100) * 1000;
+		const rssKb = (parseInt(parts[21], 10) || 0) * 4;
+
+		// Prefer VmRSS from /proc/status
+		try {
+			const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+			const vmRss = status.match(/^VmRSS:\s+(\d+)/m);
+			if (vmRss) {
+				const vmRssKb = parseInt(vmRss[1], 10);
+				return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round((vmRssKb || rssKb) / 1024)}MB state=${parts[0]}`;
+			}
+		} catch {}
+		return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round(rssKb / 1024)}MB state=${parts[0]}`;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Read GPU utilization from sysfs (one line per GPU).
+ * Returns null if no GPU data is available.
+ */
+function readGpuSnapshot(): string | null {
+	try {
+		const entries = readdirSync("/sys/class/drm");
+		const lines: string[] = [];
+		for (const entry of entries) {
+			if (!entry.startsWith("card") || entry.includes("-")) continue;
+			const deviceDir = `/sys/class/drm/${entry}/device`;
+			try {
+				const busy = parseInt(
+					readFileSync(`${deviceDir}/gpu_busy_percent`, "utf-8").trim(),
+					10
+				);
+				// Try temp
+				let temp = "";
+				try {
+					const hwmons = readdirSync("/sys/class/hwmon");
+					for (const hw of hwmons) {
+						const hwmonDevice = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
+						if (hwmonDevice === "amdgpu" || hwmonDevice === "i915") {
+							const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
+							temp = ` ${(t / 1000).toFixed(0)}C`;
+							break;
+						}
+					}
+				} catch {}
+				lines.push(`${entry}: ${busy}%${temp}`);
+			} catch {}
+		}
+		return lines.length > 0 ? lines.join(", ") : null;
+	} catch {
+		return null;
+	}
+}
+
 function buildCallbackMessage(cb: ScheduledCallback): string {
     const elapsed = formatDuration(
         Date.now() - new Date(cb.createdAt).getTime()
     );
+
+    // If linked to a running job, include a resource snapshot
+    let resourceLine = "";
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (job && job.status === "running" && job.pid) {
+            const procInfo = readProcSnapshot(job.pid);
+            if (procInfo) {
+                resourceLine = `\nJob resource data: ${procInfo}`;
+            }
+            const gpuInfo = readGpuSnapshot();
+            if (gpuInfo) {
+                resourceLine += `\nGPU data: ${gpuInfo}`;
+            }
+        }
+    }
 
     // Collect other pending callbacks and append as structured XML so the
     // model can extract IDs and cancel all stale callbacks in one turn.
@@ -287,6 +385,10 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
         message += `\n\n<other_callbacks_pending count="${others.length}">\n`;
         message += items.join("\n");
         message += "\n</other_callbacks_pending>";
+    }
+
+    if (resourceLine) {
+        message += resourceLine;
     }
 
     return `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`;
