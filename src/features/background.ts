@@ -1049,7 +1049,9 @@ export function registerBackgroundJobs(
             const sleepMatch = detectBlockedSleep(command);
             if (sleepMatch) {
                 throw new Error(
-                    `Blocked: ${sleepMatch}. Use bash_bg for long waits. ` +
+                    `Blocked: ${sleepMatch}. ` +
+                        `Use bash_bg (with remindDelay) for long-running commands. ` +
+                        `Use remind with jobId to register callbacks on existing background jobs. ` +
                         "For pacing < 2s, sleep is fine."
                 );
             }
