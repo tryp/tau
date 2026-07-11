@@ -1572,8 +1572,6 @@ export function registerBackgroundJobs(
             proc.on("close", (code) => {
                 cancelStall();
                 if (cancelTriggers) cancelTriggers();
-                if (killTimer) clearTimeout(killTimer);
-                killTimer = undefined;
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",
