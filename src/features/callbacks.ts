@@ -749,6 +749,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Prefer shorter intervals (30s-5m) for monitoring tasks.",
             "The callback message should be specific about what to check.",
             "Do NOT use remind for things you can verify now.",
+            "When you set a remind callback with jobId, you can work on other things. " +
+                "The callback will fire when the time comes or the job completes — no need to poll.",
             "Use remind action=list to see pending callbacks with their IDs.",
             "Use remind action=cancel id=cb-3 to cancel a specific callback.",
             "Use remind action=cancel-all to cancel all pending callbacks.",
@@ -968,6 +970,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
 
                     if (params.jobId) {
                         result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
+
+                        // Let the agent know it can work on other things — the system delivers the callback
+                        result += "\n\nA callback has been registered on this job. You will be notified when it fires or the job completes — no need to poll. In the meantime, you can work on other things.";
 
                         // Subscribe triggers on the existing job
                         const triggersRaw = params.triggers;
