@@ -1412,7 +1412,7 @@ export function registerBackgroundJobs(
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
-            "After starting a background job with remindDelay, stop making tool calls. " +
+            "After starting a background job with remindDelay, you can work on other things. " +
                 "The callback will wake you when it fires or the job completes.",
             "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
                 "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
@@ -1855,8 +1855,8 @@ export function registerBackgroundJobs(
                         if (job.status === "running" && hasLinkedCallbacksForJob(job.id)) {
                             suffix =
                                 "\n\nJob still running. A remind callback is already pending — " +
-                                "stop making tool calls — the callback will wake you " +
-                                "when it fires or the job completes.";
+                                "you'll be notified when it fires or the job completes. " +
+                                "No need to check here — you can work on other things.";
                         } else if (job.status === "running") {
                             suffix =
                                 "\n\nJob still running. Use remind with jobId " +
@@ -2234,7 +2234,7 @@ export function registerBackgroundJobs(
         "When you do use manual remind() to check on a running job, pass the jobId parameter " +
             "so the callback auto-cancels when the job completes or is killed.",
         "Use manual remind() only for standalone reminders that aren't linked to a job.",
-        "After setting a remind callback with jobId, stop making tool calls. " +
-            "The system will wake you when the callback fires or the job completes.",
+        "After setting a remind callback with jobId, you can work on other things. " +
+            "The callback will deliver the notification when it fires or the job completes.",
     ]);
 }
