@@ -436,7 +436,6 @@ export function startStallWatchdog(
  * fires a `bg-trigger` custom event when a condition is met.
  * Triggers are one-shot: after firing they are removed from the job.
  */
- */
 
 export function startTriggerMonitor(
     job: BackgroundJob,
