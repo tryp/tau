@@ -12,7 +12,7 @@ import {
     unlinkSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BackgroundJob, JobStatus } from "./types.ts";
 
@@ -70,7 +70,7 @@ export function generateJobId(
 }
 
 export function logPathForJob(jobId: string): string {
-    const baseDir = process.env.TMPDIR || tmpdir();
+    const baseDir = join(homedir(), "tmp");
     return join(baseDir, `pi-bg-${jobId}.log`);
 }
 
@@ -187,7 +187,7 @@ export function looksLikePrompt(tail: string): boolean {
 /** Remove stale pi-bg-* log files older than 24 hours from the tmp directory. */
 export function cleanupStaleLogs(): void {
     const MAX_AGE_MS = 24 * 60 * 60 * 1000;
-    const baseDir = process.env.TMPDIR || tmpdir();
+    const baseDir = join(homedir(), "tmp");
     try {
         const entries = readdirSync(baseDir);
         const now = Date.now();

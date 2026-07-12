@@ -6,7 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -16,17 +16,12 @@ import { DatabaseSync } from "node:sqlite";
 // ─── Context sidecar integration ────────────────────────────────────
 
 /**
- * Minimum output size (bytes or lines) required before we bother indexing.
- * Matches the sidecar's DEFAULT_CONTEXT_MAX_BYTES / MAX_LINES thresholds
- * so we only store output that the sidecar considers worth indexing.
- */
-const SIDECAR_MIN_BYTES = 24 * 1024;
-const SIDECAR_MIN_LINES = 300;
-
-/**
  * Hard cap on stored output per job (bytes).
  */
 const SIDECAR_MAX_BYTES = 512 * 1024;
+
+/** Default age (days) for purging sidecar entries at startup. */
+const SIDECAR_PURGE_AGE_DAYS = 10;
 
 /**
  * Build the path to the context sidecar's SQLite database.
@@ -35,6 +30,71 @@ function sidecarDbPath(): string {
     const agentDir =
         process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
     return join(agentDir, "context.db");
+}
+
+/**
+ * Purge sidecar entries older than `ageDays` days. Runs at startup to
+ * prevent unbounded growth. Scoped to bash_bg entries since that's what
+ * pi-tau owns.
+ */
+export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
+    const dbPath = sidecarDbPath();
+    if (!existsSync(dbPath)) return;
+
+    const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
+
+    try {
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+        try {
+            // Select IDs to delete so we can log the count
+            const toDelete = db
+                .prepare(
+                    `SELECT id FROM context_sources
+                     WHERE tool_name = 'bash_bg'
+                       AND created_at < ?`
+                )
+                .all(cutoff) as { id: string }[];
+
+            if (toDelete.length === 0) {
+                db.close();
+                return;
+            }
+
+            // Delete chunks first (FTS triggers fire properly), then sources.
+            // Use chunked batches to keep the WAL manageable.
+            const ids = toDelete.map((r) => r.id);
+            const batchSize = 100;
+            for (let i = 0; i < ids.length; i += batchSize) {
+                const batch = ids.slice(i, i + batchSize);
+                const placeholders = batch.map(() => "?").join(",");
+
+                db.prepare(
+                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
+                ).run(...batch);
+
+                db.prepare(
+                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
+                ).run(...batch);
+            }
+
+            // VACUUM to reclaim free pages (fast at startup — no concurrent readers)
+            db.prepare("VACUUM").run();
+
+            // Minimal logging — visible in pi startup output
+            console.error(
+                `[tau] purged ${toDelete.length} sidecar entries older than ${ageDays} days, ` +
+                `VACUUM reclaimed freed space`
+            );
+        } finally {
+            db.close();
+        }
+    } catch (err) {
+        console.error(
+            `[tau] sidecar purge failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+    }
 }
 
 /**
@@ -61,19 +121,31 @@ async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
                 return null;
             }
 
-            // Find source by jobId in input_summary
+            // Find source by jobId in input_summary, also get input_summary
+            // for the log path reference.
             const source = db
                 .prepare(
-                    `SELECT id FROM context_sources
+                    `SELECT id, input_summary FROM context_sources
                      WHERE tool_name = 'bash_bg'
                        AND json_extract(input_summary, '$.jobId') = ?
                      LIMIT 1`
                 )
-                .get(jobId) as { id: string } | undefined;
+                .get(jobId) as { id: string; input_summary: string } | undefined;
 
             if (!source) {
                 db.close();
                 return null;
+            }
+
+            // Extract logPath from input_summary for the reference line
+            let logPathRef = "";
+            try {
+                const summary = JSON.parse(source.input_summary);
+                if (summary.logPath) {
+                    logPathRef = `Log: ${summary.logPath}\n\n`;
+                }
+            } catch {
+                // old records may lack logPath; skip
             }
 
             // Read all chunks for this source, ordered by ordinal
@@ -88,7 +160,7 @@ async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
             db.close();
 
             if (chunks.length === 0) return null;
-            return chunks.map((c) => c.content).join("\n\n");
+            return logPathRef + chunks.map((c) => c.content).join("\n\n");
         } finally {
             db.close();
         }
@@ -195,11 +267,9 @@ async function indexJobOutputInSidecar(
         const text = await readFile(job.logPath, "utf-8").catch(() => "");
         if (!text) return;
 
-        // Match the sidecar's should_index_text check: only store output that
-        // exceeds the minimum thresholds.
+        // Check output size before indexing
         const bytes = Buffer.byteLength(text, "utf8");
         const lines = text.split("\n").length;
-        if (bytes < SIDECAR_MIN_BYTES && lines < SIDECAR_MIN_LINES) return;
         if (bytes > SIDECAR_MAX_BYTES) return;
 
         const sessionId =
@@ -256,6 +326,7 @@ async function indexJobOutputInSidecar(
                 jobId: job.id,
                 exitCode: job.exitCode,
                 status: job.status,
+                logPath: job.logPath,
             });
 
             // Insert source record
@@ -312,8 +383,7 @@ import {
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
-import type { BackgroundJob, JobTrigger, RunningProcess, UiContext } from "../types.ts";
-import { evaluateTrigger, makeTriggerAccum, type TriggerAccum } from "./trigger-check.ts";
+import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
     MAX_LOG_BYTES,
@@ -343,11 +413,9 @@ import {
  * proc.on("close") from sending a spurious job-completion message
  * that re-enters the agent loop.
  */
-export function silenceJobAfterKill(job: BackgroundJob): number {
+export function silenceJobAfterKill(job: BackgroundJob): void {
     markJobTerminal(job, "killed");
     job.outputConsumed = true;
-    // Cancel any callbacks linked to this job so stale reminders don't fire.
-    return cancelCallbacksForJob(job.id);
 }
 
 // ─── Stall watchdog ─────────────────────────────────────────────────
@@ -431,68 +499,7 @@ export function startStallWatchdog(
     };
 }
 
-/**
- * Start a periodic poller that watches a background job's triggers and
- * fires a `bg-trigger` custom event when a condition is met.
- * Triggers are one-shot: after firing they are removed from the job.
- */
-
-export function startTriggerMonitor(
-    job: BackgroundJob,
-    pi: ExtensionAPI,
-    state: TauState
-): () => void {
-    let cancelled = false;
-    const acc = makeTriggerAccum();
-
-    const timer = setInterval(() => {
-        if (cancelled || job.status !== "running") {
-            cancelled = true;
-            return;
-        }
-
-        const remaining: JobTrigger[] = [];
-        for (const t of job.triggers ?? []) {
-            try {
-                const result = evaluateTrigger(t, job.pid, job.logPath, acc);
-                if (result.met) {
-                    const label = t.label ?? `${t.type}=${t.value}`;
-                    const suffix = outstandingJobsSuffix(state, job.id);
-                    pi.sendMessage(
-                        {
-                            customType: "bg-trigger",
-                            content:
-                                `\u26a1 ${job.id} trigger: ${label} (current: ${result.current})${suffix}\n` +
-                                `Command: ${job.command}\nLog: ${job.logPath}`,
-                            display: true,
-                            details: {
-                                jobId: job.id,
-                                triggerType: t.type,
-                                threshold: t.value,
-                                current: result.current,
-                            },
-                        },
-                        { deliverAs: "followUp", triggerTurn: true }
-                    );
-                    continue; // remove fired trigger
-                }
-            } catch {}
-            remaining.push(t);
-        }
-        job.triggers = remaining.length > 0 ? remaining : undefined;
-        if (job.triggers === undefined) {
-            cancelled = true;
-            clearInterval(timer);
-        }
-    }, 2000);
-    timer.unref();
-
-    return () => {
-        cancelled = true;
-        clearInterval(timer);
-    };
-}
-
+/** Check if there are any foreground tasks that can be backgrounded. */
 export function hasForegroundTasks(state: TauState): boolean {
     return Array.from(state.backgroundJobs.values()).some(
         (job) => job.status === "running" && !job.isBackgrounded && job.proc
@@ -574,7 +581,7 @@ export function clearPendingDecision(
 }
 
 /** Maximum number of recent terminal jobs kept for output lookups. */
-const MAX_RECENT_TERMINAL = 20;
+const MAX_RECENT_TERMINAL = 100;
 
 /** Remove a terminal job from the background jobs map and update counters. */
 function removeJob(state: TauState, job: BackgroundJob): void {
@@ -606,10 +613,12 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
 }
 
 /**
+/**
  * Batch state for job-completion notifications.
  * Completions that fire close together are aggregated into one message
  * so the agent doesn't get re-awoken for every individual job.
  */
+
 const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
 
@@ -617,12 +626,6 @@ type CompletionBatchItem = {
     job: BackgroundJob;
     duration: string;
     emoji: string;
-};
-
-type PendingCompletionDelivery = {
-    jobs: CompletionBatchItem[];
-    pi: ExtensionAPI;
-    state: TauState;
 };
 
 const completionBatch: {
@@ -633,6 +636,12 @@ const completionBatch: {
     state?: TauState;
 } = { jobs: [], startTime: 0 };
 
+type PendingCompletionDelivery = {
+    jobs: CompletionBatchItem[];
+    pi: ExtensionAPI;
+    state: TauState;
+};
+
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 let completionAgentBusy = false;
 
@@ -641,6 +650,30 @@ function countOutstandingJobs(state: TauState): number {
     return Array.from(state.backgroundJobs.values()).filter(
         (j) => j.status === "running"
     ).length;
+}
+
+function flushCompletionBatch(): void {
+    const batch = completionBatch.jobs.splice(0);
+    const pi = completionBatch.pi!;
+    const state = completionBatch.state!;
+    completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+
+    if (batch.length === 0) return;
+
+    // Suppress successful completions to avoid wasted LLM turns — UNLESS
+    // one of the jobs has linked callbacks, meaning the agent explicitly
+    // asked to be reminded about it. In that case, deliver the notification
+    // (which cancels the linked callbacks).
+    // Failed completions are always delivered.
+    if (!hasFailedCompletion(batch)) {
+        const hasLinked = batch.some((j) => hasLinkedCallbacksForJob(j.job.id));
+        if (!hasLinked) return;
+    }
+
+    queueCompletionDelivery(batch, pi, state);
 }
 
 function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
@@ -802,31 +835,50 @@ function queueCompletionDelivery(
     flushPendingCompletionDeliveries();
 }
 
-function flushCompletionBatch(): void {
-    const batch = completionBatch.jobs.splice(0);
-    const pi = completionBatch.pi!;
-    const state = completionBatch.state!;
-    completionBatch.timer = undefined;
+/**
+ * Remove a job's pending completion notification from the debounced batch.
+ * Called when the agent cancels callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearJobFromCompletionBatch(jobId: string): void {
+    const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
+    if (idx !== -1) {
+        completionBatch.jobs.splice(idx, 1);
+        if (completionBatch.jobs.length === 0) {
+            if (completionBatch.timer) {
+                clearTimeout(completionBatch.timer);
+                completionBatch.timer = undefined;
+            }
+            completionBatch.pi = undefined;
+            completionBatch.state = undefined;
+        }
+    }
+
+    for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
+        const delivery = pendingCompletionDeliveries[i];
+        delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
+        if (!hasFailedCompletion(delivery.jobs)) {
+            pendingCompletionDeliveries.splice(i, 1);
+        }
+    }
+}
+
+/**
+ * Clear all pending completion notifications from the debounced batch.
+ * Called when the agent cancels all callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearAllCompletionBatches(): void {
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+        completionBatch.timer = undefined;
+    }
+    completionBatch.jobs.length = 0;
     completionBatch.startTime = 0;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
-
-    if (batch.length === 0) return;
-
-    // Suppress successful completions to avoid wasted LLM turns — UNLESS
-    // one of the jobs has linked callbacks, meaning the agent explicitly
-    // asked to be reminded about it. In that case, deliver the notification
-    // (which cancels the linked callbacks).
-    // Failed completions are always delivered.
-    if (!hasFailedCompletion(batch)) {
-        const hasLinked = batch.some((j) => hasLinkedCallbacksForJob(j.job.id));
-        if (!hasLinked) return;
-    }
-
-    queueCompletionDelivery(batch, pi, state);
+    pendingCompletionDeliveries.length = 0;
 }
-
-
 
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
@@ -879,52 +931,6 @@ export function notifyCompletion(
     removeJob(state, job);
 }
 
-/**
- * Remove a job's pending completion notification from the debounced batch.
- * If the batch becomes empty, the pending timer is cancelled so the agent
- * doesn't receive a stale "job completed" message after already cancelling
- * the associated callbacks.
- */
-export function clearJobFromCompletionBatch(jobId: string): void {
-    const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
-    if (idx !== -1) {
-        completionBatch.jobs.splice(idx, 1);
-        if (completionBatch.jobs.length === 0) {
-            if (completionBatch.timer) {
-                clearTimeout(completionBatch.timer);
-                completionBatch.timer = undefined;
-            }
-            completionBatch.startTime = 0;
-            completionBatch.pi = undefined;
-            completionBatch.state = undefined;
-        }
-    }
-
-    for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
-        const delivery = pendingCompletionDeliveries[i];
-        delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
-        if (!hasFailedCompletion(delivery.jobs)) {
-            pendingCompletionDeliveries.splice(i, 1);
-        }
-    }
-}
-
-/**
- * Clear all pending completion notifications from the debounced batch.
- * Called when the agent cancels all callbacks — no point sending stale
- * notifications for jobs the agent has already acknowledged.
- */
-export function clearAllCompletionBatches(): void {
-    if (completionBatch.timer) {
-        clearTimeout(completionBatch.timer);
-        completionBatch.timer = undefined;
-    }
-    completionBatch.jobs.length = 0;
-    completionBatch.startTime = 0;
-    completionBatch.pi = undefined;
-    completionBatch.state = undefined;
-    pendingCompletionDeliveries.length = 0;
-}
 
 // ── Background a running foreground process (signal-based) ─────────
 
@@ -1111,9 +1117,7 @@ export function registerBackgroundJobs(
             const sleepMatch = detectBlockedSleep(command);
             if (sleepMatch) {
                 throw new Error(
-                    `Blocked: ${sleepMatch}. ` +
-                        `Use bash_bg (with remindDelay) for long-running commands. ` +
-                        `Use remind with jobId to register callbacks on existing background jobs. ` +
+                    `Blocked: ${sleepMatch}. Use bash_bg for long waits. ` +
                         "For pacing < 2s, sleep is fine."
                 );
             }
@@ -1397,27 +1401,15 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Schedule an inline reminder with remindDelay. " +
-            "Unlike manual remind(), remindDelay auto-links the reminder to this job, " +
-            "so it is auto-cancelled when the job finishes. " +
-            "Manual remind() without a jobId creates a standalone callback that persists until it fires " +
-            "or is explicitly cancelled. " +
-            "Optionally set triggers (outputLines, rssKb, ioReadBytes, ioWriteBytes, cpuTime, ioBlock, wallTime) " +
-            "to fire async events when conditions are met.",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both.",
         promptSnippet:
             "Run bash command in background immediately" +
-            " (supports inline reminder and triggers)",
+            " (supports kill deadline and inline reminder)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
+            "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
-            "After starting a background job with remindDelay, you can work on other things. " +
-                "The callback will wake you when it fires or the job completes.",
-            "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
-                "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
-                "Manual remind() without a jobId creates a standalone callback that will fire even after " +
-                "the job has finished — you must cancel it explicitly.",
-            "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
@@ -1432,12 +1424,18 @@ export function registerBackgroundJobs(
                     description: "Notify when complete (default: true)",
                 })
             ),
+            timeout: Type.Optional(
+                Type.Number({
+                    description:
+                        "Kill deadline in seconds. If the job runs longer than this, it is terminated. " +
+                        "Use when a command must finish within a time bound.",
+                })
+            ),
             remindDelay: Type.Optional(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
-                        "The reminder is auto-linked to this job and auto-cancels if the job completes " +
-                        "before it fires. Unlike manual remind(), no explicit cancel is needed.",
+                        "The reminder auto-cancels if the job completes before it fires.",
                 })
             ),
             remindMessage: Type.Optional(
@@ -1446,37 +1444,6 @@ export function registerBackgroundJobs(
                         'Message for the reminder callback (default: "check on <command>"). ' +
                         "Only used when remindDelay is set.",
                 })
-            ),
-            triggers: Type.Optional(
-                Type.Array(
-                    Type.Object({
-                        type: Type.String({
-                            description:
-                                'Trigger type: "outputLines", "rssKb", "ioReadBytes", "ioWriteBytes", ' +
-                                '"cpuTime", "ioBlock", or "wallTime". ' +
-                                '"outputLines": fire when the log file has N+ lines. ' +
-                                '"rssKb": fire when RSS exceeds N KB. ' +
-                                '"ioReadBytes": fire when /proc/pid/io read_bytes exceeds N. ' +
-                                '"ioWriteBytes": fire when /proc/pid/io write_bytes exceeds N. ' +
-                                '"cpuTime": fire after N seconds of CPU usage (utime+stime+cutime+cstime). ' +
-                                '"ioBlock": fire after N seconds cumulative in D (I/O wait) state. ' +
-                                '"wallTime": fire after N seconds of wall-clock time.',
-                        }),
-                        value: Type.Number({
-                            description: "Threshold value.",
-                        }),
-                        label: Type.Optional(
-                            Type.String({
-                                description: "Optional label for the callback message.",
-                            })
-                        ),
-                    }),
-                    {
-                        description:
-                            "Triggers that fire async events when conditions are met. " +
-                            'Example: [{type:"outputLines",value:100}] notifies when the log has 100+ lines.',
-                    }
-                )
             ),
         }),
 
@@ -1490,32 +1457,6 @@ export function registerBackgroundJobs(
             const jobId = generateJobId(++state.jobCounter);
             const logPath = logPathForJob(jobId);
             const shouldNotify = params.notify !== false;
-
-            // Detect `timeout N command` prefix — guide agent to use remindDelay instead
-            if (/^timeout\s+\d+/.test(params.command)) {
-                const timeoutArg = params.command.match(/^timeout\s+(\d+)/)?.[1] ?? "30";
-                throw new Error(
-                    `Command starts with \`timeout\` which is not supported in bash_bg. ` +
-                    `Use remindDelay to schedule a time-based callback instead, ` +
-                    `e.g. remindDelay: "${timeoutArg}s". ` +
-                    `Or add a wallTime trigger, e.g. triggers: [{type:"wallTime", value: ${timeoutArg}}]. ` +
-                    `To kill a running job, use jobs action="kill" or job_decide. ` +
-                    `Call bash_bg with the plain command (no timeout prefix) so the job runs in the background.`
-                );
-            }
-
-            // Detect `timeout N command` prefix — guide agent to use remindDelay instead
-            if (/^timeout\s+\d+/.test(params.command)) {
-                const timeoutArg = params.command.match(/^timeout\s+(\d+)/)?.[1] ?? "30";
-                throw new Error(
-                    `Command starts with \`timeout\` which is not supported in bash_bg. ` +
-                    `Use remindDelay to schedule a time-based callback instead, ` +
-                    `e.g. remindDelay: "${timeoutArg}s". ` +
-                    `Or add a wallTime trigger, e.g. triggers: [{type:"wallTime", value: ${timeoutArg}}]. ` +
-                    `To kill a running job, use jobs action="kill" or job_decide. ` +
-                    `Call bash_bg with the plain command (no timeout prefix) so the job runs in the background.`
-                );
-            }
 
             const logFd = openSync(logPath, "w");
             const proc = spawn("bash", ["-c", params.command], {
@@ -1540,7 +1481,6 @@ export function registerBackgroundJobs(
                 proc,
                 toolCallId,
                 isBackgrounded: true,
-                triggers: params.triggers as JobTrigger[] | undefined,
             };
             createJobDonePromise(job);
             state.backgroundJobs.set(jobId, job);
@@ -1557,6 +1497,19 @@ export function registerBackgroundJobs(
                 }
             );
 
+            // ── Kill deadline timeout ──────────────────────────────────
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            if (typeof params.timeout === "number" && params.timeout > 0) {
+                killTimer = setTimeout(() => {
+                    if (proc.pid && job.status === "running") {
+                        killProcessGroup(proc.pid, "SIGTERM");
+                        job.status = "killed";
+                        // Don't silence — let notifyCompletion send the notification
+                    }
+                }, params.timeout * 1_000);
+                killTimer.unref();
+            }
+
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
             if (params.remindDelay) {
@@ -1567,13 +1520,10 @@ export function registerBackgroundJobs(
                 if (rid) reminderId = rid;
             }
 
-            // ── Trigger monitor ───────────────────────────────────────
-            let cancelTriggers = startTriggerMonitor(job, pi, state);
-
             proc.on("close", (code) => {
                 cancelStall();
-                if (cancelTriggers) cancelTriggers();
-
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",
@@ -1596,7 +1546,8 @@ export function registerBackgroundJobs(
 
             proc.on("error", () => {
                 cancelStall();
-                if (cancelTriggers) cancelTriggers();
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(job, "failed");
                 void indexJobOutputInSidecar(
                     job,
@@ -1615,10 +1566,13 @@ export function registerBackgroundJobs(
 
             updateWidget(state, ctx);
 
-            // Build summary line for async events
-            let extra = "\n You will recieve an async event on completion";
+            // Build summary line for reminders / timeout
+            let extra = "";
+            if (killTimer) {
+                extra += `\nKill deadline: ${params.timeout}s`;
+            }
             if (reminderId) {
-                extra += ` or reminder event ${reminderId} in ${params.remindDelay}`;
+                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
             }
 
             return {
@@ -1849,25 +1803,11 @@ export function registerBackgroundJobs(
                             total,
                             isTruncated
                         );
-
-                        // Build hint about pending callbacks for running jobs
-                        let suffix = "";
-                        if (job.status === "running" && hasLinkedCallbacksForJob(job.id)) {
-                            suffix =
-                                "\n\nJob still running. A remind callback is already pending — " +
-                                "you'll be notified when it fires or the job completes. " +
-                                "No need to check here — you can work on other things.";
-                        } else if (job.status === "running") {
-                            suffix =
-                                "\n\nJob still running. Use remind with jobId " +
-                                "to schedule a callback, then stop and wait.";
-                        }
-
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Output for ${job.id} (${job.status})${suffix}${
+                                    text: `Output for ${job.id} (${job.status})${
                                         grepPattern
                                             ? `, grep "${grepPattern}"`
                                             : ""
@@ -1938,38 +1878,16 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
                     if (job.status !== "running" || !job.proc) {
-                        // Job already completed/failed/killed — cancel linked
-                        // callbacks and suppress any pending completion
-                        // notification so the agent doesn't see stale events.
-                        const cancelledCallbacks = cancelCallbacksForJob(job.id);
-                        job.outputConsumed = true;
-                        state.cancelCompletionBatchForJob?.(job.id);
-                        let msg = `Job ${job.id} is not running (status: ${job.status})`;
-                        if (cancelledCallbacks > 0) {
-                            msg += `. ${cancelledCallbacks} pending reminder${cancelledCallbacks > 1 ? "s" : ""} cancelled.`;
-                        }
-                        return {
-                            content: [
-                                {
-                                    type: "text" as const,
-                                    text: msg,
-                                },
-                            ],
-                            details: undefined,
-                        };
+                        throw new Error(`Job is not running: ${job.id}`);
                     }
                     killProcessGroup(job.proc.pid!, "SIGTERM");
-                    const cancelledCallbacks = silenceJobAfterKill(job);
+                    silenceJobAfterKill(job);
                     clearPendingDecision(state, job);
-                    let killMsg = `Sent SIGTERM to ${job.id} (process group)`;
-                    if (cancelledCallbacks > 0) {
-                        killMsg += `\n${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
-                    }
                     return {
                         content: [
                             {
                                 type: "text" as const,
-                                text: killMsg,
+                                text: `Sent SIGTERM to ${job.id} (process group)`,
                             },
                         ],
                         details: undefined,
@@ -2170,14 +2088,10 @@ export function registerBackgroundJobs(
                     if (job.proc && job.status === "running") {
                         killProcessGroup(job.proc.pid!, "SIGTERM");
                     }
-                    const cancelledCallbacks = silenceJobAfterKill(job);
+                    silenceJobAfterKill(job);
                     state.pendingDecisionJobId = undefined;
-                    let killMsg = `Killed ${job.id}.`;
-                    if (cancelledCallbacks > 0) {
-                        killMsg += ` ${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
-                    }
                     return {
-                        content: [{ type: "text", text: killMsg }],
+                        content: [{ type: "text", text: `Killed ${job.id}.` }],
                         details: undefined,
                     };
                 }
@@ -2234,7 +2148,5 @@ export function registerBackgroundJobs(
         "When you do use manual remind() to check on a running job, pass the jobId parameter " +
             "so the callback auto-cancels when the job completes or is killed.",
         "Use manual remind() only for standalone reminders that aren't linked to a job.",
-        "After setting a remind callback with jobId, you can work on other things. " +
-            "The callback will deliver the notification when it fires or the job completes.",
     ]);
 }
