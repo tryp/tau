@@ -404,9 +404,26 @@ function flushReadyCallbacks(): void {
     const cb = ready[0];
     if (!cb) return;
 
-    _pi.sendUserMessage(buildCallbackMessage(cb), {
+    const message = buildCallbackMessage(cb);
+
+    // Try to start a new agent turn with the callback message.
+    _pi.sendUserMessage(message, {
         deliverAs: "followUp",
     });
+
+    // Also persist the callback as a custom message in the session
+    // transcript. This ensures the callback text survives even if
+    // sendUserMessage doesn't start a new turn (e.g. session idle).
+    _pi.sendMessage(
+        {
+            customType: "callback",
+            content: [{ type: "text", text: message }],
+            display: true,
+            details: { cbId: cb.id, linkedJobId: cb.linkedJobId },
+        },
+        { deliverAs: "followUp" }
+    );
+
     callbacks.delete(cb.id);
     persistState();
 }
@@ -417,9 +434,6 @@ function scheduleReadyCallbackFlush(): void {
         _readyFlushTimer = null;
         flushReadyCallbacks();
     }, 0);
-    if (_readyFlushTimer && typeof _readyFlushTimer === "object") {
-        _readyFlushTimer.unref?.();
-    }
 }
 
 function fireCallback(id: string): void {
