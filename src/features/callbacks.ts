@@ -404,9 +404,26 @@ function flushReadyCallbacks(): void {
     const cb = ready[0];
     if (!cb) return;
 
-    _pi.sendUserMessage(buildCallbackMessage(cb), {
+    const message = buildCallbackMessage(cb);
+
+    // Try to start a new agent turn with the callback message.
+    _pi.sendUserMessage(message, {
         deliverAs: "followUp",
     });
+
+    // Also persist the callback as a custom message in the session
+    // transcript. This ensures the callback text survives even if
+    // sendUserMessage doesn't start a new turn (e.g. session idle).
+    _pi.sendMessage(
+        {
+            customType: "callback",
+            content: [{ type: "text", text: message }],
+            display: true,
+            details: { cbId: cb.id, linkedJobId: cb.linkedJobId },
+        },
+        { deliverAs: "followUp" }
+    );
+
     callbacks.delete(cb.id);
     persistState();
 }
@@ -417,9 +434,6 @@ function scheduleReadyCallbackFlush(): void {
         _readyFlushTimer = null;
         flushReadyCallbacks();
     }, 0);
-    if (_readyFlushTimer && typeof _readyFlushTimer === "object") {
-        _readyFlushTimer.unref?.();
-    }
 }
 
 function fireCallback(id: string): void {
@@ -749,6 +763,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Prefer shorter intervals (30s-5m) for monitoring tasks.",
             "The callback message should be specific about what to check.",
             "Do NOT use remind for things you can verify now.",
+            "When you set a remind callback with jobId, you can work on other things. " +
+                "The callback will fire when the time comes or the job completes — no need to poll.",
             "Use remind action=list to see pending callbacks with their IDs.",
             "Use remind action=cancel id=cb-3 to cancel a specific callback.",
             "Use remind action=cancel-all to cancel all pending callbacks.",
@@ -968,6 +984,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
 
                     if (params.jobId) {
                         result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
+
+                        // Let the agent know it can work on other things — the system delivers the callback
+                        result += "\n\nA callback has been registered on this job. You will be notified when it fires or the job completes — no need to poll. In the meantime, you can work on other things.";
 
                         // Subscribe triggers on the existing job
                         const triggersRaw = params.triggers;
