@@ -148,6 +148,8 @@ let _pi: ExtensionAPI | null = null;
 let _sessionId = "";
 let _watcher: ReturnType<typeof watch> | null = null;
 let _tauState: TauState | null = null;
+let _agentBusy = false;
+let _readyFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Cancel all pending callbacks linked to a given job ID.
@@ -156,7 +158,7 @@ let _tauState: TauState | null = null;
 export function cancelCallbacksForJob(jobId: string): number {
     let count = 0;
     for (const [id, cb] of callbacks) {
-        if (cb.linkedJobId === jobId && !cb.fired) {
+        if (cb.linkedJobId === jobId) {
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -166,7 +168,19 @@ export function cancelCallbacksForJob(jobId: string): number {
         }
     }
     if (count > 0) persistState();
+    // Also clear any pending completion notification for this job
+    _tauState?.cancelCompletionBatchForJob?.(jobId);
     return count;
+}
+
+/**
+ * Check whether any non-fired callbacks are linked to the given job.
+ */
+export function hasLinkedCallbacksForJob(jobId: string): boolean {
+    for (const cb of callbacks.values()) {
+        if (cb.linkedJobId === jobId && !cb.fired) return true;
+    }
+    return false;
 }
 
 /**
@@ -175,7 +189,7 @@ export function cancelCallbacksForJob(jobId: string): number {
 export function cancelCallbacksForGroup(group: string): number {
     let count = 0;
     for (const [id, cb] of callbacks) {
-        if (cb.group === group && !cb.fired) {
+        if (cb.group === group) {
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -246,41 +260,113 @@ function scheduleCallback(cb: ScheduledCallback): void {
         }
     }
 
-function fireCallback(id: string): void {
-    const cb = callbacks.get(id);
-    if (!cb || cb.fired) return;
+/**
+ * Read /proc/<pid>/stat and return a one-line resource snapshot.
+ * Returns null if /proc is unavailable or the process has exited.
+ */
+function readProcSnapshot(pid: number): string | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+		const closeParen = stat.lastIndexOf(")");
+		if (closeParen === -1) return null;
+		const parts = stat.slice(closeParen + 2).split(" ");
+		if (parts.length < 22) return null;
 
-    // If linked to a background job, skip delivery if the job is no longer
-    // running. The job may have completed between when the timer was set and
-    // when it fired, making this callback stale.
-    if (cb.linkedJobId && _tauState) {
-        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
-        if (job && job.status !== "running") {
-            // Job is done — cancel this callback silently
-            if (cb.timer) {
-                clearTimeout(cb.timer);
-                cb.timer = undefined;
-            }
-            callbacks.delete(id);
-            persistState();
-            return;
-        }
-    }
+		const utime = parseInt(parts[11], 10) || 0;
+		const stime = parseInt(parts[12], 10) || 0;
+		const cutime = parseInt(parts[13], 10) || 0;
+		const cstime = parseInt(parts[14], 10) || 0;
+		const cpuSec = ((utime + stime + cutime + cstime) / 100) * 1000;
+		const rssKb = (parseInt(parts[21], 10) || 0) * 4;
 
-    cb.fired = true;
-    if (cb.timer) {
-        clearTimeout(cb.timer);
-        cb.timer = undefined;
-    }
+		// Prefer VmRSS from /proc/status
+		try {
+			const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+			const vmRss = status.match(/^VmRSS:\s+(\d+)/m);
+			if (vmRss) {
+				const vmRssKb = parseInt(vmRss[1], 10);
+				return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round((vmRssKb || rssKb) / 1024)}MB state=${parts[0]}`;
+			}
+		} catch {}
+		return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round(rssKb / 1024)}MB state=${parts[0]}`;
+	} catch {
+		return null;
+	}
+}
 
+/**
+ * Read GPU utilization from sysfs (one line per GPU).
+ * Returns null if no GPU data is available.
+ */
+function readGpuSnapshot(): string | null {
+	try {
+		const entries = readdirSync("/sys/class/drm");
+		const lines: string[] = [];
+		for (const entry of entries) {
+			if (!entry.startsWith("card") || entry.includes("-")) continue;
+			const deviceDir = `/sys/class/drm/${entry}/device`;
+			try {
+				const busy = parseInt(
+					readFileSync(`${deviceDir}/gpu_busy_percent`, "utf-8").trim(),
+					10
+				);
+				// Try temp
+				let temp = "";
+				try {
+					const hwmons = readdirSync("/sys/class/hwmon");
+					for (const hw of hwmons) {
+						const hwmonDevice = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
+						if (hwmonDevice === "amdgpu" || hwmonDevice === "i915") {
+							const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
+							temp = ` ${(t / 1000).toFixed(0)}C`;
+							break;
+						}
+					}
+				} catch {}
+				lines.push(`${entry}: ${busy}%${temp}`);
+			} catch {}
+		}
+		return lines.length > 0 ? lines.join(", ") : null;
+	} catch {
+		return null;
+	}
+}
+
+function buildCallbackMessage(cb: ScheduledCallback): string {
     const elapsed = formatDuration(
         Date.now() - new Date(cb.createdAt).getTime()
     );
 
+    // If linked to a running job, include a resource snapshot
+    let resourceLine = "";
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (job && job.status === "running" && job.pid) {
+            const procInfo = readProcSnapshot(job.pid);
+            if (procInfo) {
+                resourceLine = `\nJob resource data: ${procInfo}`;
+            }
+            const gpuInfo = readGpuSnapshot();
+            if (gpuInfo) {
+                resourceLine += `\nGPU data: ${gpuInfo}`;
+            }
+        }
+    }
+
     // Collect other pending callbacks and append as structured XML so the
     // model can extract IDs and cancel all stale callbacks in one turn.
     const others = Array.from(callbacks.values())
-        .filter((other) => other.id !== cb.id && !other.fired);
+        .filter((other) => other.id !== cb.id && !other.fired)
+        .filter((other) => {
+            // Skip callbacks linked to jobs that are no longer running.
+            // The linked job may have completed between when the callback
+            // was scheduled and when this timer fires, making it stale.
+            if (other.linkedJobId && _tauState) {
+                const job = _tauState.backgroundJobs.get(other.linkedJobId);
+                if (!job || job.status !== "running") return false;
+            }
+            return true;
+        });
 
     let message = cb.message;
     if (others.length > 0) {
@@ -301,36 +387,90 @@ function fireCallback(id: string): void {
         message += "\n</other_callbacks_pending>";
     }
 
-    if (_pi) {
-        _pi.sendUserMessage(
-            `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`,
-            { deliverAs: "followUp" }
-        );
+    if (resourceLine) {
+        message += resourceLine;
     }
 
-    // Remove from map after firing
-    callbacks.delete(id);
+    return `<callback id="${cb.id}" source="${cb.source}" elapsed="${elapsed}">\n${message}\n</callback>`;
+}
 
-    // Update persisted state
+function flushReadyCallbacks(): void {
+    if (_agentBusy || !_pi) return;
+
+    const ready = Array.from(callbacks.values())
+        .filter((cb) => cb.fired)
+        .sort((a, b) => Date.parse(a.fireAt) - Date.parse(b.fireAt));
+    const cb = ready[0];
+    if (!cb) return;
+
+    _pi.sendUserMessage(buildCallbackMessage(cb), {
+        deliverAs: "followUp",
+    });
+    callbacks.delete(cb.id);
     persistState();
-    // Note: we do NOT auto-cancel other pending callbacks here, even if
-    // they share the same linkedJobId. Staggered reminders for the same
-    // job may have different intents (start-check vs progress vs
-    // completion) and the first firing does not invalidate the rest.
-    // The appended <other_callbacks_pending> block gives the model
-    // visibility to decide which (if any) to cancel.
+}
+
+function scheduleReadyCallbackFlush(): void {
+    if (_readyFlushTimer) return;
+    _readyFlushTimer = setTimeout(() => {
+        _readyFlushTimer = null;
+        flushReadyCallbacks();
+    }, 0);
+    if (_readyFlushTimer && typeof _readyFlushTimer === "object") {
+        _readyFlushTimer.unref?.();
+    }
+}
+
+function fireCallback(id: string): void {
+    const cb = callbacks.get(id);
+    if (!cb || cb.fired) return;
+
+    // If linked to a background job, skip delivery if the job is no longer
+    // running. The job may have completed between when the timer was set and
+    // when it fired, making this callback stale.
+    if (cb.linkedJobId && _tauState) {
+        const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (!job || job.status !== "running") {
+            // Job is gone or done — cancel this callback silently
+            if (cb.timer) {
+                clearTimeout(cb.timer);
+                cb.timer = undefined;
+            }
+            callbacks.delete(id);
+            persistState();
+            return;
+        }
+    }
+
+    cb.fired = true;
+    if (cb.timer) {
+        clearTimeout(cb.timer);
+        cb.timer = undefined;
+    }
+
+    // Keep fired callbacks in-memory until they are actually delivered so
+    // cancel/cancel-all can still suppress them if the agent stays busy.
+    // Persisted state omits fired callbacks, so they will not be restored
+    // across sessions.
+    persistState();
+    scheduleReadyCallbackFlush();
 }
 
 function cancelCallback(id: string): boolean {
     const cb = callbacks.get(id);
-    if (!cb || cb.fired) return false;
+    if (!cb) return false;
 
+    const linkedJobId = cb.linkedJobId;
     if (cb.timer) {
         clearTimeout(cb.timer);
         cb.timer = undefined;
     }
     callbacks.delete(id);
     persistState();
+    // Also clear any pending completion notification for the linked job
+    if (linkedJobId) {
+        _tauState?.cancelCompletionBatchForJob?.(linkedJobId);
+    }
     return true;
 }
 
@@ -345,6 +485,8 @@ function cancelAll(): number {
     }
     callbacks.clear();
     persistState();
+    // Also clear all pending completion notifications
+    _tauState?.cancelAllCompletionBatches?.();
     return count;
 }
 
@@ -481,6 +623,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
     pi.on("session_start", async (event, ctx) => {
         _sessionId = ctx.sessionManager.getSessionId();
         _pi = pi;
+        _agentBusy = false;
         cbNextId = 1;
 
         // Restore pending callbacks from the latest session entry.
@@ -522,8 +665,37 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             }
         }
 
+        // Clean up restored callbacks whose linked jobs no longer exist
+        // (orphaned from a previous process that tracked the job).
+        let orphanCount = 0;
+        const tauState = _tauState;
+        if (tauState) {
+            for (const [id, cb] of callbacks) {
+                if (cb.linkedJobId && !tauState.backgroundJobs.has(cb.linkedJobId)) {
+                    if (cb.timer) {
+                        clearTimeout(cb.timer);
+                        cb.timer = undefined;
+                    }
+                    callbacks.delete(id);
+                    orphanCount++;
+                }
+            }
+        }
+        if (orphanCount > 0) {
+            persistState();
+        }
+
         // Start watching for external callbacks
         startExternalWatcher(_sessionId);
+    });
+
+    pi.on("agent_start", async () => {
+        _agentBusy = true;
+    });
+
+    pi.on("agent_end", async () => {
+        _agentBusy = false;
+        scheduleReadyCallbackFlush();
     });
 
     pi.on("session_shutdown", async () => {
@@ -533,6 +705,11 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
         // Stop watcher
         stopExternalWatcher();
 
+        if (_readyFlushTimer) {
+            clearTimeout(_readyFlushTimer);
+            _readyFlushTimer = null;
+        }
+
         // Cancel all in-memory timers
         for (const cb of callbacks.values()) {
             if (cb.timer) {
@@ -541,6 +718,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             }
         }
         callbacks.clear();
+        _agentBusy = false;
         _pi = null;
     });
 
@@ -558,7 +736,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=list to see pending callbacks, " +
             "remind action=cancel id=cb-3 to cancel one, " +
             "remind action=cancel-all to cancel all. " +
-            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
+            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes. " +
+            "WARNING: manual remind() without jobId creates a standalone callback that persists " +
+            "until it fires or is explicitly cancelled. It will NOT auto-cancel when a job completes. " +
+            "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback.",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -569,7 +750,12 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Use remind action=cancel id=cb-3 to cancel a specific callback.",
             "Use remind action=cancel-all to cancel all pending callbacks.",
             "When a callback fires, other pending callbacks are listed in the message so the model can cancel them all in one turn.",
-            "Use jobId to link a callback to a background job — it auto-cancels when the job finishes.",
+            "For job monitoring, ALWAYS use bash_bg with remindDelay instead of manual remind(). " +
+                "remindDelay auto-links to the jobId, so the callback is cancelled on job completion. " +
+                "Manual remind() without jobId creates a standalone callback that fires even after " +
+                "the job finishes — you must cancel it explicitly.",
+            "Pass jobId when you must use manual remind() for a job-related check — " +
+                "this links the callback to the job so it auto-cancels on completion.",
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -602,7 +788,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             jobId: Type.Optional(
                 Type.String({
                     description:
-                        "Optional job ID to link this callback to. When set, the callback auto-cancels if the background job completes or is killed before the timer fires.",
+                        "Optional job ID to link this callback to. When set, the callback auto-cancels if the background job completes or is killed before the timer fires. " +
+                        "Without a jobId, this is a standalone callback that persists until it fires " +
+                        "or is explicitly cancelled — it will NOT auto-cancel when a job finishes. " +
+                        "For job monitoring, prefer bash_bg with remindDelay which auto-links.",
                 })
             ),
         }),
