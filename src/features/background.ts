@@ -58,7 +58,6 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
                 .all(cutoff) as { id: string }[];
 
             if (toDelete.length === 0) {
-                db.close();
                 return;
             }
 
@@ -101,7 +100,7 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
  * Look up a completed job's output from the context sidecar by job ID.
  * Returns the concatenated chunk content, or null if not found.
  */
-async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
+export async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
     const dbPath = sidecarDbPath();
     if (!existsSync(dbPath)) return null;
 
@@ -117,7 +116,6 @@ async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
                 )
                 .get();
             if (!tableCheck) {
-                db.close();
                 return null;
             }
 
@@ -133,7 +131,6 @@ async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
                 .get(jobId) as { id: string; input_summary: string } | undefined;
 
             if (!source) {
-                db.close();
                 return null;
             }
 
@@ -156,8 +153,6 @@ async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
                      ORDER BY ordinal ASC`
                 )
                 .all(source.id) as { content: string }[];
-
-            db.close();
 
             if (chunks.length === 0) return null;
             return logPathRef + chunks.map((c) => c.content).join("\n\n");
@@ -253,7 +248,7 @@ function makePreview(text: string): string {
  * Only stores output exceeding ~24 KiB / 300 lines to avoid bloating the
  * index with trivial results (matching the sidecar's own filtering).
  */
-async function indexJobOutputInSidecar(
+export async function indexJobOutputInSidecar(
     job: BackgroundJob,
     ctx: {
         cwd?: string;
@@ -296,7 +291,6 @@ async function indexJobOutputInSidecar(
                 )
                 .get();
             if (!tableCheck) {
-                db.close();
                 return;
             }
 
@@ -312,7 +306,6 @@ async function indexJobOutputInSidecar(
                 db.prepare(
                     "UPDATE context_sources SET returned_byte_count = returned_byte_count + ? WHERE id = ?"
                 ).run(bytes, existing.id);
-                db.close();
                 return;
             }
 
