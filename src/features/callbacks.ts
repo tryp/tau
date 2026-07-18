@@ -411,18 +411,17 @@ function flushReadyCallbacks(): void {
         deliverAs: "followUp",
     });
 
-    // Also persist the callback as a custom message in the session
-    // transcript. This ensures the callback text survives even if
-    // sendUserMessage doesn't start a new turn (e.g. session idle).
-    _pi.sendMessage(
-        {
-            customType: "callback",
-            content: [{ type: "text", text: message }],
-            display: true,
-            details: { cbId: cb.id, linkedJobId: cb.linkedJobId },
-        },
-        { deliverAs: "followUp" }
-    );
+    // Also persist the callback as a custom entry in the session
+    // transcript. This ensures the callback data survives compaction
+    // and session restores. appendEntry is used here instead of
+    // sendMessage+deliverAs:followUp to avoid delivering the same
+    // callback content to the LLM twice (sendUserMessage above
+    // already handles agent notification).
+    _pi.appendEntry("callback", {
+        cbId: cb.id,
+        linkedJobId: cb.linkedJobId,
+        message,
+    });
 
     callbacks.delete(cb.id);
     persistState();
@@ -443,6 +442,9 @@ function fireCallback(id: string): void {
     // If linked to a background job, skip delivery if the job is no longer
     // running. The job may have completed between when the timer was set and
     // when it fired, making this callback stale.
+    // If the job is still running, mark it so the completion notification
+    // is delivered when it eventually finishes (the linked callback has now
+    // been consumed, so flushCompletionBatch would otherwise suppress it).
     if (cb.linkedJobId && _tauState) {
         const job = _tauState.backgroundJobs.get(cb.linkedJobId);
         if (!job || job.status !== "running") {
@@ -455,6 +457,8 @@ function fireCallback(id: string): void {
             persistState();
             return;
         }
+        // Job is still running — ensure completion notification fires later
+        job.wantsCompletionNotification = true;
     }
 
     cb.fired = true;

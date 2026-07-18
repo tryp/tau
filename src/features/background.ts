@@ -657,12 +657,18 @@ function flushCompletionBatch(): void {
     if (batch.length === 0) return;
 
     // Suppress successful completions to avoid wasted LLM turns — UNLESS
-    // one of the jobs has linked callbacks, meaning the agent explicitly
-    // asked to be reminded about it. In that case, deliver the notification
-    // (which cancels the linked callbacks).
+    // one of the jobs has linked callbacks (meaning the agent explicitly
+    // asked to be reminded) OR a linked callback fired while the job was
+    // still running (meaning a progress check was delivered but the agent
+    // still wants the final completion notification). In either case,
+    // deliver the notification (which cancels any remaining linked callbacks).
     // Failed completions are always delivered.
     if (!hasFailedCompletion(batch)) {
-        const hasLinked = batch.some((j) => hasLinkedCallbacksForJob(j.job.id));
+        const hasLinked = batch.some(
+            (j) =>
+                hasLinkedCallbacksForJob(j.job.id) ||
+                j.job.wantsCompletionNotification
+        );
         if (!hasLinked) return;
     }
 
@@ -677,11 +683,19 @@ function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchI
     const unconsumedFailed = jobs.filter(
         (j) => j.job.status !== "completed" && !j.job.outputConsumed
     );
-    if (unconsumedFailed.length === 0) return [];
+    const unconsumedCompleted = jobs.filter(
+        (j) => j.job.status === "completed" && !j.job.outputConsumed
+    );
+
+    if (unconsumedFailed.length === 0 && unconsumedCompleted.length === 0) {
+        return [];
+    }
 
     const failedIds = new Set(unconsumedFailed.map((j) => j.job.id));
+    const completedIds = new Set(unconsumedCompleted.map((j) => j.job.id));
+
     return jobs.filter(
-        (j) => j.job.status === "completed" || failedIds.has(j.job.id)
+        (j) => completedIds.has(j.job.id) || failedIds.has(j.job.id)
     );
 }
 
@@ -2129,6 +2143,7 @@ export function registerBackgroundJobs(
     // can suppress stale job-completion notifications when cancelling reminders.
     state.cancelCompletionBatchForJob = clearJobFromCompletionBatch;
     state.cancelAllCompletionBatches = clearAllCompletionBatches;
+    state._flushCompletionBatch = flushCompletionBatch;
 
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts

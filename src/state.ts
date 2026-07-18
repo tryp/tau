@@ -96,4 +96,11 @@ export class TauState {
 
     /** Clear all pending-completion notifications from the debounced batch. */
     cancelAllCompletionBatches?: () => void;
+
+    /**
+     * Test-only: force-flush the completion delivery batch.
+     * Avoids waiting for the real debounce timer (which is .unref()'d and
+     * can't be awaited reliably in test environments).
+     */
+    _flushCompletionBatch?: () => void;
 }
