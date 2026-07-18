@@ -340,4 +340,32 @@ export function registerBackgroundCommands(
             await showTasksInterface(state, pi, ctx);
         },
     });
+
+    pi.registerCommand("jobs-panel", {
+        description: "Toggle visibility of the background jobs pill-bar widget",
+        handler: async (_args, ctx: ExtensionCommandContext) => {
+            state.jobsWidgetHidden = !state.jobsWidgetHidden;
+            updateWidget(state, ctx);
+            ctx.ui.notify(
+                state.jobsWidgetHidden
+                    ? "Jobs widget hidden (use /jobs-panel to show)"
+                    : "Jobs widget visible",
+                "info"
+            );
+        },
+    });
+
+    pi.registerShortcut("ctrl+shift+h", {
+        description: "Toggle jobs widget visibility",
+        handler: async (ctx) => {
+            state.jobsWidgetHidden = !state.jobsWidgetHidden;
+            updateWidget(state, ctx);
+            ctx.ui.notify(
+                state.jobsWidgetHidden
+                    ? "Jobs widget hidden"
+                    : "Jobs widget visible",
+                "info"
+            );
+        },
+    });
 }

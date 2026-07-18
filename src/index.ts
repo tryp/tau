@@ -67,11 +67,73 @@ import { registerSessionName } from "./features/session-name.ts";
 import { registerSummarize } from "./features/summarize.ts";
 import { registerContext } from "./features/context.ts";
 import { registerWebBrowse } from "./features/web-browse/index.ts";
+import { Text } from "@earendil-works/pi-tui";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
 
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
+
+    // ── Compact renderer for job-completion messages ──────────────────
+
+    pi.registerMessageRenderer("job-completion", (message, _options, theme) => {
+        const d = message.details as Record<string, unknown>;
+        const batch = d?.batch as
+            | Array<{
+                  jobId: string;
+                  status: string;
+                  exitCode?: number;
+                  duration: string;
+                  command: string;
+                  logPath: string;
+              }>
+            | undefined;
+
+        if (batch && batch.length > 1) {
+            // Aggregated batch format
+            const completed = batch.filter((b) => b.status === "completed");
+            const failed = batch.filter((b) => b.status !== "completed");
+            const parts: string[] = [];
+            if (completed.length > 0) parts.push(`${completed.length} completed`);
+            if (failed.length > 0) parts.push(`${failed.length} failed`);
+            const suffix =
+                ((d?.outstandingJobs as number) ?? 0) > 0
+                    ? ` (${d!.outstandingJobs} jobs outstanding)`
+                    : "";
+            const header = `🏁 ${parts.join(", ")}${suffix}`;
+            const lines = batch.map(
+                (b) =>
+                    `  ${b.status === "completed" ? "✅" : "❌"} ${b.jobId} ${b.status} (${b.duration})${
+                        b.exitCode !== undefined ? `, exit ${b.exitCode}` : ""
+                    }`
+            );
+            return new Text(`${header}\n${lines.join("\n")}`, 0, 0);
+        }
+
+        // Individual format
+        const emoji = batch && batch.length === 1
+            ? (batch[0].status === "completed" ? "✅" : "❌")
+            : (d?.status === "completed" ? "✅" : "❌");
+        const jobId = batch?.[0]?.jobId ?? (d?.jobId as string) ?? "";
+        const status = batch?.[0]?.status ?? (d?.status as string) ?? "";
+        const duration = batch?.[0]?.duration ?? (d?.duration as string) ?? "";
+        const exitCode = batch?.[0]?.exitCode ?? (d?.exitCode as number | undefined);
+        const command = batch?.[0]?.command ?? (d?.command as string) ?? "";
+        const logPath = batch?.[0]?.logPath ?? (d?.logPath as string) ?? "";
+        const suffix =
+            ((d?.outstandingJobs as number) ?? 0) > 0
+                ? ` (${d!.outstandingJobs} jobs outstanding)`
+                : "";
+        const lines: string[] = [
+            `${emoji} ${jobId} ${status} (${duration})${suffix}`,
+            `   Command: ${command}`,
+            `   Output: ${logPath}`,
+        ];
+        if (exitCode !== undefined) {
+            lines.push(`   Exit code: ${exitCode}`);
+        }
+        return new Text(lines.join("\n"), 0, 0);
+    });
 
     // ── Register all features ─────────────────────────────────────────
 
@@ -108,7 +170,22 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_call", async (event): Promise<ToolCallEventResult> => {
         // Agent backgrounding
         if (state.agentBackgrounded) {
-            return { block: true, reason: "" };
+            // Auto-resume on bash: the agent trying to run a command is a clear signal
+            // it should be working. This breaks the deadlock where all tools are blocked
+            // and the agent can never recover on its own.
+            if (event.toolName === "bash") {
+                state.agentBackgrounded = false;
+                return {};
+            }
+            // Allow jobs for inspection; block everything else with a clear reason.
+            if (event.toolName === "jobs") {
+                return {};
+            }
+            return {
+                block: true,
+                reason: "Agent is backgrounded. Run any bash command to auto-resume, " +
+                    "or use Ctrl+B or /bg to resume.",
+            };
         }
 
         // Pending job decision: block unrelated tools
