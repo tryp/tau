@@ -41,9 +41,7 @@ function sidecarDbPath(): string {
  * Look up a completed job's output from the context sidecar by job ID.
  * Returns the concatenated chunk content, or null if not found.
  */
-async function readJobOutputFromSidecar(
-    jobId: string
-): Promise<string | null> {
+async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
     const dbPath = sidecarDbPath();
     if (!existsSync(dbPath)) return null;
 
@@ -55,7 +53,7 @@ async function readJobOutputFromSidecar(
             // Check if the source table exists
             const tableCheck = db
                 .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'",
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
                 )
                 .get();
             if (!tableCheck) {
@@ -69,7 +67,7 @@ async function readJobOutputFromSidecar(
                     `SELECT id FROM context_sources
                      WHERE tool_name = 'bash_bg'
                        AND json_extract(input_summary, '$.jobId') = ?
-                     LIMIT 1`,
+                     LIMIT 1`
                 )
                 .get(jobId) as { id: string } | undefined;
 
@@ -83,7 +81,7 @@ async function readJobOutputFromSidecar(
                 .prepare(
                     `SELECT content FROM context_chunks
                      WHERE source_id = ?
-                     ORDER BY ordinal ASC`,
+                     ORDER BY ordinal ASC`
                 )
                 .all(source.id) as { content: string }[];
 
@@ -344,9 +342,11 @@ import {
  * proc.on("close") from sending a spurious job-completion message
  * that re-enters the agent loop.
  */
-export function silenceJobAfterKill(job: BackgroundJob): void {
+export function silenceJobAfterKill(job: BackgroundJob): number {
     markJobTerminal(job, "killed");
     job.outputConsumed = true;
+    // Cancel any callbacks linked to this job so stale reminders don't fire.
+    return cancelCallbacksForJob(job.id);
 }
 
 // ─── Stall watchdog ─────────────────────────────────────────────────
@@ -529,10 +529,7 @@ function removeJob(state: TauState, job: BackgroundJob): void {
 }
 
 /** Build a suffix like " (3 jobs outstanding)" or empty string if 0 */
-function outstandingJobsSuffix(
-    state: TauState,
-    excludeJobId: string
-): string {
+function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
     const count = Array.from(state.backgroundJobs.values()).filter((j) => {
         if (j.id === excludeJobId) return false;
         if (j.status !== "running") return false;
@@ -583,9 +580,7 @@ function flushCompletionBatch(): void {
     // NOT in this batch, since each notifyCompletion already called removeJob)
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
-        outstandingCount > 0
-            ? ` (${outstandingCount} jobs outstanding)`
-            : "";
+        outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
 
     // Single job → send the usual individual format
     if (batch.length === 1) {
@@ -618,8 +613,7 @@ function flushCompletionBatch(): void {
     const completed = batch.filter((j) => j.job.status === "completed");
     const failed = batch.filter((j) => j.job.status !== "completed");
     const parts: string[] = [];
-    if (completed.length > 0)
-        parts.push(`${completed.length} completed`);
+    if (completed.length > 0) parts.push(`${completed.length} completed`);
     if (failed.length > 0) parts.push(`${failed.length} failed`);
 
     const header = `🏁 ${parts.join(", ")}${suffix}`;
@@ -731,10 +725,17 @@ function registerBackgroundJob(
     }
     state.currentlyRunningToolCallId = null;
 
-    const cancelStall = startStallWatchdog(jobId, command, logPath, pi, state, () => {
-        if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
-        silenceJobAfterKill(job);
-    });
+    const cancelStall = startStallWatchdog(
+        jobId,
+        command,
+        logPath,
+        pi,
+        state,
+        () => {
+            if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
+            silenceJobAfterKill(job);
+        }
+    );
 
     proc.on("close", (code) => {
         cancelStall();
@@ -756,16 +757,6 @@ function registerBackgroundJob(
             job,
             code === 0 || code === null ? "completed" : "failed",
             code ?? 0
-        );
-        void indexJobOutputInSidecar(
-            job,
-            ctx as {
-                cwd?: string;
-                sessionManager?: {
-                    getSessionFile?: () => string | null;
-                    getSessionId?: () => string | null;
-                };
-            }
         );
         clearPendingDecision(state, job);
         notifyCompletion(job, state, pi, ctx);
@@ -1050,6 +1041,10 @@ export function registerBackgroundJobs(
                         ctx
                     );
 
+                    // Remove stale foreground entry created earlier — same process,
+                    // separate job ID that would otherwise stay in state forever.
+                    state.backgroundJobs.delete(jobId);
+
                     state.pendingDecisionJobId = job.id;
 
                     const duration = formatDuration(
@@ -1143,7 +1138,7 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindIn), or both.",
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. ",
         promptSnippet:
             "Run bash command in background immediately" +
             " (supports kill deadline and inline reminder)",
@@ -1151,7 +1146,7 @@ export function registerBackgroundJobs(
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
-            "Use remindIn to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
@@ -1173,18 +1168,18 @@ export function registerBackgroundJobs(
                         "Use when a command must finish within a time bound.",
                 })
             ),
-            remindIn: Type.Optional(
+            remindDelay: Type.Optional(
                 Type.String({
                     description:
-                        "Schedule a reminder callback after this duration (e.g. \"5m\", \"30s\", \"2h\"). " +
+                        'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
                         "The reminder auto-cancels if the job completes before it fires.",
                 })
             ),
             remindMessage: Type.Optional(
                 Type.String({
                     description:
-                        "Message for the reminder callback (default: \"check on <command>\"). " +
-                        "Only used when remindIn is set.",
+                        'Message for the reminder callback (default: "check on <command>"). ' +
+                        "Only used when remindDelay is set.",
                 })
             ),
         }),
@@ -1254,11 +1249,11 @@ export function registerBackgroundJobs(
 
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
-            if (params.remindIn) {
+            if (params.remindDelay) {
                 const msg =
                     params.remindMessage ??
                     `check on: ${params.command.slice(0, 80)}`;
-                const rid = scheduleJobReminder(jobId, params.remindIn, msg);
+                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
                 if (rid) reminderId = rid;
             }
 
@@ -1309,12 +1304,12 @@ export function registerBackgroundJobs(
             updateWidget(state, ctx);
 
             // Build summary line for reminders / timeout
-            let extra = "";
+            let extra = "\n You will recieve an async event on completion";
             if (killTimer) {
-                extra += `\nKill deadline: ${params.timeout}s`;
+                extra += ` or timeout within ${params.timeout}s`;
             }
             if (reminderId) {
-                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
+                extra += ` or reminder event ${reminderId} in ${params.remindIn}`;
             }
 
             return {
@@ -1358,6 +1353,8 @@ export function registerBackgroundJobs(
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
             "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
                 "default is 600 (10 minutes).",
+            "When jobs(output) hides lines or truncates, it will suggest grep='pattern' automatically — " +
+                "prefer grep over bash for searching large output.",
             "For searching across past or indexed job output, use context_search with tool_name='bash_bg'.",
         ],
         parameters: Type.Object({
@@ -1444,9 +1441,11 @@ export function registerBackgroundJobs(
 
                     const grepPattern = params.grep;
                     const headCount =
-                        params.head ?? (params.tail !== undefined ? undefined : undefined);
+                        params.head ??
+                        (params.tail !== undefined ? undefined : undefined);
                     const tailCount =
-                        params.tail ?? (params.head !== undefined ? undefined : 10);
+                        params.tail ??
+                        (params.head !== undefined ? undefined : 10);
 
                     // Helper: return matching lines (or all lines if no grep),
                     // each with a 1-based line number
@@ -1476,7 +1475,8 @@ export function registerBackgroundJobs(
                     // Build the final text from filtered + head/tail
                     function formatLines(
                         matched: { line: string; num: number }[],
-                        originalCount?: number
+                        originalCount?: number,
+                        truncated?: boolean
                     ): string {
                         if (matched.length === 0) {
                             return grepPattern
@@ -1489,16 +1489,27 @@ export function registerBackgroundJobs(
                                     `${String(num).padStart(4, " ")}: ${line}`
                             )
                             .join("\n");
+                        // Build hints footer
+                        const hints: string[] = [];
                         if (
                             originalCount !== undefined &&
                             matched.length < originalCount
                         ) {
                             const hidden = originalCount - matched.length;
+                            hints.push(
+                                `${hidden} more line${hidden !== 1 ? "s" : ""}`
+                            );
+                        }
+                        if (truncated) {
+                            hints.push("output was truncated");
+                        }
+                        if (hints.length > 0) {
+                            const suggestion = !grepPattern
+                                ? " or grep='pattern' to search"
+                                : "";
                             return (
                                 result +
-                                `\n... (${hidden} more line${
-                                    hidden !== 1 ? "s" : ""
-                                }, use head=N or tail=N to see more)`
+                                `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`
                             );
                         }
                         return result;
@@ -1511,31 +1522,41 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        // Agent has seen this terminal job's output —
+                        // suppress completion notification and cancel reminds.
+                        if (job.status !== "running") {
+                            job.outputConsumed = true;
+                            cancelCallbacksForJob(job.id);
+                        }
                         let matched = filterLines(output);
                         const total = matched.length;
                         if (headCount !== undefined)
                             matched = matched.slice(0, headCount);
                         if (tailCount !== undefined)
                             matched = matched.slice(-tailCount);
-                        const formatted = formatLines(matched, total);
+                        const isTruncated = output.startsWith("...[truncated");
+                        const formatted = formatLines(
+                            matched,
+                            total,
+                            isTruncated
+                        );
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text:
-                                        `Output for ${job.id} (${job.status})${
-                                            grepPattern
-                                                ? `, grep "${grepPattern}"`
-                                                : ""
-                                        }${
-                                            headCount !== undefined
-                                                ? `, head=${headCount}`
-                                                : ""
-                                        }${
-                                            tailCount !== undefined
-                                                ? `, tail=${tailCount}`
-                                                : ""
-                                        }\nLog: ${job.logPath}\n\n${formatted}`,
+                                    text: `Output for ${job.id} (${job.status})${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\nLog: ${job.logPath}\n\n${formatted}`,
                                 },
                             ],
                             details: undefined,
@@ -1553,25 +1574,30 @@ export function registerBackgroundJobs(
                             matched = matched.slice(0, headCount);
                         if (tailCount !== undefined)
                             matched = matched.slice(-tailCount);
-                        const formatted = formatLines(matched, total);
+                        const isTruncated =
+                            sidecarOutput.startsWith("...[truncated");
+                        const formatted = formatLines(
+                            matched,
+                            total,
+                            isTruncated
+                        );
                         return {
                             content: [
                                 {
                                     type: "text" as const,
-                                    text:
-                                        `Output for ${params.jobId} (from sidecar)${
-                                            grepPattern
-                                                ? `, grep "${grepPattern}"`
-                                                : ""
-                                        }${
-                                            headCount !== undefined
-                                                ? `, head=${headCount}`
-                                                : ""
-                                        }${
-                                            tailCount !== undefined
-                                                ? `, tail=${tailCount}`
-                                                : ""
-                                        }\n\n${formatted}`,
+                                    text: `Output for ${params.jobId} (from sidecar)${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\n\n${formatted}`,
                                 },
                             ],
                             details: undefined,
@@ -1592,13 +1618,17 @@ export function registerBackgroundJobs(
                         throw new Error(`Job is not running: ${job.id}`);
                     }
                     killProcessGroup(job.proc.pid!, "SIGTERM");
-                    silenceJobAfterKill(job);
+                    const cancelledCallbacks = silenceJobAfterKill(job);
                     clearPendingDecision(state, job);
+                    let killMsg = `Sent SIGTERM to ${job.id} (process group)`;
+                    if (cancelledCallbacks > 0) {
+                        killMsg += `\n${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
+                    }
                     return {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Sent SIGTERM to ${job.id} (process group)`,
+                                text: killMsg,
                             },
                         ],
                         details: undefined,
@@ -1799,10 +1829,14 @@ export function registerBackgroundJobs(
                     if (job.proc && job.status === "running") {
                         killProcessGroup(job.proc.pid!, "SIGTERM");
                     }
-                    silenceJobAfterKill(job);
+                    const cancelledCallbacks = silenceJobAfterKill(job);
                     state.pendingDecisionJobId = undefined;
+                    let killMsg = `Killed ${job.id}.`;
+                    if (cancelledCallbacks > 0) {
+                        killMsg += ` ${cancelledCallbacks} scheduled reminder${cancelledCallbacks > 1 ? "s were" : " was"} also cleaned up`;
+                    }
                     return {
-                        content: [{ type: "text", text: `Killed ${job.id}.` }],
+                        content: [{ type: "text", text: killMsg }],
                         details: undefined,
                     };
                 }
@@ -1823,6 +1857,12 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    // Agent has seen this terminal job's output —
+                    // suppress completion notification and cancel reminds.
+                    if (job.status !== "running") {
+                        job.outputConsumed = true;
+                        cancelCallbacksForJob(job.id);
+                    }
                     return {
                         content: [
                             {
