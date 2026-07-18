@@ -39,7 +39,7 @@ import {
 } from "./features/titlebar.ts";
 
 // Existing features
-import { registerBackgroundJobs } from "./features/background.ts";
+import { purgeSidecar, registerBackgroundJobs } from "./features/background.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import { registerPlanMode } from "./features/plan-mode.ts";
@@ -136,6 +136,9 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── Register all features ─────────────────────────────────────────
+
+    // Purge stale sidecar entries at startup
+    purgeSidecar();
 
     registerBackgroundJobs(pi, state);
     registerBackgroundCommands(pi, state);
