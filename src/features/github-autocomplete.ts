@@ -185,7 +185,7 @@ export function registerGithubAutocomplete(pi: ExtensionAPI): void {
     pi.on("session_start", async (_event, ctx) => {
         const resolvedRepo = await resolveGitHubRepo(pi, ctx.cwd);
         if (!resolvedRepo.ok) {
-            safeNotifyCtx(ctx, resolvedRepo.error, "error");
+            safeNotifyCtx(ctx, resolvedRepo.error, "trace");
             return;
         }
 

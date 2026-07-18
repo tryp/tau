@@ -548,6 +548,9 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
  * Completions that fire close together are aggregated into one message
  * so the agent doesn't get re-awoken for every individual job.
  */
+const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
+const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
+
 const completionBatch: {
     jobs: Array<{
         job: BackgroundJob;
@@ -555,9 +558,10 @@ const completionBatch: {
         emoji: string;
     }>;
     timer?: NodeJS.Timeout;
+    startTime: number;   // timestamp of the first job in the current batch
     pi?: ExtensionAPI;
     state?: TauState;
-} = { jobs: [] };
+} = { jobs: [], startTime: 0 };
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -571,6 +575,7 @@ function flushCompletionBatch(): void {
     const pi = completionBatch.pi!;
     const state = completionBatch.state!;
     completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
 
@@ -675,12 +680,22 @@ export function notifyCompletion(
     completionBatch.jobs.push({ job, duration, emoji });
     completionBatch.pi = pi;
     completionBatch.state = state;
-    if (!completionBatch.timer) {
-        completionBatch.timer = setTimeout(() => {
-            flushCompletionBatch();
-        }, 300);
-        completionBatch.timer.unref();
+
+    // Sliding-window debounce: each new completion resets the timer, extending
+    // the window to collect near-simultaneous completions into one message.
+    // Cap total delay so the agent never waits longer than BATCH_MAX_DELAY_MS
+    // from the first job in the batch.
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+    } else {
+        completionBatch.startTime = Date.now();
     }
+    const elapsed = Date.now() - completionBatch.startTime;
+    const delay = Math.min(BATCH_DEBOUNCE_MS, BATCH_MAX_DELAY_MS - elapsed);
+    completionBatch.timer = setTimeout(() => {
+        flushCompletionBatch();
+    }, Math.max(delay, 0));
+    completionBatch.timer.unref();
 
     removeJob(state, job);
 }
@@ -1147,6 +1162,10 @@ export function registerBackgroundJobs(
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — " +
+                "the callback auto-cancels if the job completes before the timer fires.",
+            "When timeout is set without remindDelay, a reminder is auto-scheduled at 90% of the timeout.",
+            "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
@@ -1172,7 +1191,9 @@ export function registerBackgroundJobs(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
-                        "The reminder auto-cancels if the job completes before it fires.",
+                        "The reminder auto-cancels if the job completes before it fires. " +
+                        "When timeout is set and remindDelay is omitted, a reminder is auto-scheduled " +
+                        'at 90% of the timeout duration.',
                 })
             ),
             remindMessage: Type.Optional(
@@ -1249,11 +1270,22 @@ export function registerBackgroundJobs(
 
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
-            if (params.remindDelay) {
+            // Auto-schedule a reminder just before the kill deadline when
+            // a timeout is set but no explicit remindDelay was given.
+            // This eliminates the need for manual remind() calls which
+            // create persistent custom_message entries.
+            const effectiveRemindDelay =
+                params.remindDelay ||
+                (typeof params.timeout === "number" && params.timeout > 10
+                    ? `${Math.floor(params.timeout * 0.9)}s`
+                    : undefined);
+            if (effectiveRemindDelay) {
                 const msg =
                     params.remindMessage ??
-                    `check on: ${params.command.slice(0, 80)}`;
-                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
+                    (params.remindDelay
+                        ? `check on: ${params.command.slice(0, 80)}`
+                        : `check on ${params.command.slice(0, 60)} before ${params.timeout}s timeout`);
+                const rid = scheduleJobReminder(jobId, effectiveRemindDelay, msg);
                 if (rid) reminderId = rid;
             }
 
@@ -1876,4 +1908,13 @@ export function registerBackgroundJobs(
             }
         },
     });
+
+    // Inject guidance about bash_bg + remindDelay into the remind tool.
+    // This belongs here (the bg module) rather than hardcoded in callbacks.ts
+    // because it's guidance about bg workflow, cross-cutting two tools.
+    pi.registerToolPromptGuidelines("remind", [
+        "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
+            "the callback auto-cancels when the job completes.",
+        "Use manual remind() only for standalone reminders that aren't linked to a job.",
+    ]);
 }
