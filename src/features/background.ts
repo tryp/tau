@@ -6,7 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -312,7 +312,8 @@ import {
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
-import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
+import type { BackgroundJob, JobTrigger, RunningProcess, UiContext } from "../types.ts";
+import { evaluateTrigger, makeTriggerAccum, type TriggerAccum } from "./trigger-check.ts";
 import {
     DEFAULT_TIMEOUT_MS,
     MAX_LOG_BYTES,
@@ -430,7 +431,68 @@ export function startStallWatchdog(
     };
 }
 
-/** Check if there are any foreground tasks that can be backgrounded. */
+/**
+ * Start a periodic poller that watches a background job's triggers and
+ * fires a `bg-trigger` custom event when a condition is met.
+ * Triggers are one-shot: after firing they are removed from the job.
+ */
+
+export function startTriggerMonitor(
+    job: BackgroundJob,
+    pi: ExtensionAPI,
+    state: TauState
+): () => void {
+    let cancelled = false;
+    const acc = makeTriggerAccum();
+
+    const timer = setInterval(() => {
+        if (cancelled || job.status !== "running") {
+            cancelled = true;
+            return;
+        }
+
+        const remaining: JobTrigger[] = [];
+        for (const t of job.triggers ?? []) {
+            try {
+                const result = evaluateTrigger(t, job.pid, job.logPath, acc);
+                if (result.met) {
+                    const label = t.label ?? `${t.type}=${t.value}`;
+                    const suffix = outstandingJobsSuffix(state, job.id);
+                    pi.sendMessage(
+                        {
+                            customType: "bg-trigger",
+                            content:
+                                `\u26a1 ${job.id} trigger: ${label} (current: ${result.current})${suffix}\n` +
+                                `Command: ${job.command}\nLog: ${job.logPath}`,
+                            display: true,
+                            details: {
+                                jobId: job.id,
+                                triggerType: t.type,
+                                threshold: t.value,
+                                current: result.current,
+                            },
+                        },
+                        { deliverAs: "followUp", triggerTurn: true }
+                    );
+                    continue; // remove fired trigger
+                }
+            } catch {}
+            remaining.push(t);
+        }
+        job.triggers = remaining.length > 0 ? remaining : undefined;
+        if (job.triggers === undefined) {
+            cancelled = true;
+            clearInterval(timer);
+        }
+    }, 2000);
+    timer.unref();
+
+    return () => {
+        cancelled = true;
+        clearInterval(timer);
+    };
+}
+
 export function hasForegroundTasks(state: TauState): boolean {
     return Array.from(state.backgroundJobs.values()).some(
         (job) => job.status === "running" && !job.isBackgrounded && job.proc
@@ -1335,24 +1397,24 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both. " +
+            "Schedule an inline reminder with remindDelay. " +
             "Unlike manual remind(), remindDelay auto-links the reminder to this job, " +
             "so it is auto-cancelled when the job finishes. " +
             "Manual remind() without a jobId creates a standalone callback that persists until it fires " +
-            "or is explicitly cancelled.",
+            "or is explicitly cancelled. " +
+            "Optionally set triggers (outputLines, rssKb, ioReadBytes, ioWriteBytes, cpuTime, ioBlock, wallTime) " +
+            "to fire async events when conditions are met.",
         promptSnippet:
             "Run bash command in background immediately" +
-            " (supports kill deadline and inline reminder)",
+            " (supports inline reminder and triggers)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
-            "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "PREFER bash_bg with remindDelay over manual remind() for job monitoring. " +
                 "remindDelay auto-links the callback to the jobId so it is cancelled on job completion. " +
                 "Manual remind() without a jobId creates a standalone callback that will fire even after " +
                 "the job has finished — you must cancel it explicitly.",
-            "When timeout is set without remindDelay, a reminder is auto-scheduled at 90% of the timeout.",
             "Use manual remind() only for standalone reminders that aren't linked to a job.",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
@@ -1368,21 +1430,12 @@ export function registerBackgroundJobs(
                     description: "Notify when complete (default: true)",
                 })
             ),
-            timeout: Type.Optional(
-                Type.Number({
-                    description:
-                        "Kill deadline in seconds. If the job runs longer than this, it is terminated. " +
-                        "Use when a command must finish within a time bound.",
-                })
-            ),
             remindDelay: Type.Optional(
                 Type.String({
                     description:
                         'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
                         "The reminder is auto-linked to this job and auto-cancels if the job completes " +
-                        "before it fires. Unlike manual remind(), no explicit cancel is needed. " +
-                        "When timeout is set and remindDelay is omitted, a reminder is auto-scheduled " +
-                        'at 90% of the timeout duration.',
+                        "before it fires. Unlike manual remind(), no explicit cancel is needed.",
                 })
             ),
             remindMessage: Type.Optional(
@@ -1391,6 +1444,37 @@ export function registerBackgroundJobs(
                         'Message for the reminder callback (default: "check on <command>"). ' +
                         "Only used when remindDelay is set.",
                 })
+            ),
+            triggers: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        type: Type.String({
+                            description:
+                                'Trigger type: "outputLines", "rssKb", "ioReadBytes", "ioWriteBytes", ' +
+                                '"cpuTime", "ioBlock", or "wallTime". ' +
+                                '"outputLines": fire when the log file has N+ lines. ' +
+                                '"rssKb": fire when RSS exceeds N KB. ' +
+                                '"ioReadBytes": fire when /proc/pid/io read_bytes exceeds N. ' +
+                                '"ioWriteBytes": fire when /proc/pid/io write_bytes exceeds N. ' +
+                                '"cpuTime": fire after N seconds of CPU usage (utime+stime+cutime+cstime). ' +
+                                '"ioBlock": fire after N seconds cumulative in D (I/O wait) state. ' +
+                                '"wallTime": fire after N seconds of wall-clock time.',
+                        }),
+                        value: Type.Number({
+                            description: "Threshold value.",
+                        }),
+                        label: Type.Optional(
+                            Type.String({
+                                description: "Optional label for the callback message.",
+                            })
+                        ),
+                    }),
+                    {
+                        description:
+                            "Triggers that fire async events when conditions are met. " +
+                            'Example: [{type:"outputLines",value:100}] notifies when the log has 100+ lines.',
+                    }
+                )
             ),
         }),
 
@@ -1404,6 +1488,32 @@ export function registerBackgroundJobs(
             const jobId = generateJobId(++state.jobCounter);
             const logPath = logPathForJob(jobId);
             const shouldNotify = params.notify !== false;
+
+            // Detect `timeout N command` prefix — guide agent to use remindDelay instead
+            if (/^timeout\s+\d+/.test(params.command)) {
+                const timeoutArg = params.command.match(/^timeout\s+(\d+)/)?.[1] ?? "30";
+                throw new Error(
+                    `Command starts with \`timeout\` which is not supported in bash_bg. ` +
+                    `Use remindDelay to schedule a time-based callback instead, ` +
+                    `e.g. remindDelay: "${timeoutArg}s". ` +
+                    `Or add a wallTime trigger, e.g. triggers: [{type:"wallTime", value: ${timeoutArg}}]. ` +
+                    `To kill a running job, use jobs action="kill" or job_decide. ` +
+                    `Call bash_bg with the plain command (no timeout prefix) so the job runs in the background.`
+                );
+            }
+
+            // Detect `timeout N command` prefix — guide agent to use remindDelay instead
+            if (/^timeout\s+\d+/.test(params.command)) {
+                const timeoutArg = params.command.match(/^timeout\s+(\d+)/)?.[1] ?? "30";
+                throw new Error(
+                    `Command starts with \`timeout\` which is not supported in bash_bg. ` +
+                    `Use remindDelay to schedule a time-based callback instead, ` +
+                    `e.g. remindDelay: "${timeoutArg}s". ` +
+                    `Or add a wallTime trigger, e.g. triggers: [{type:"wallTime", value: ${timeoutArg}}]. ` +
+                    `To kill a running job, use jobs action="kill" or job_decide. ` +
+                    `Call bash_bg with the plain command (no timeout prefix) so the job runs in the background.`
+                );
+            }
 
             const logFd = openSync(logPath, "w");
             const proc = spawn("bash", ["-c", params.command], {
@@ -1428,6 +1538,7 @@ export function registerBackgroundJobs(
                 proc,
                 toolCallId,
                 isBackgrounded: true,
+                triggers: params.triggers as JobTrigger[] | undefined,
             };
             createJobDonePromise(job);
             state.backgroundJobs.set(jobId, job);
@@ -1444,43 +1555,23 @@ export function registerBackgroundJobs(
                 }
             );
 
-            // ── Kill deadline timeout ──────────────────────────────────
-            let killTimer: ReturnType<typeof setTimeout> | undefined;
-            if (typeof params.timeout === "number" && params.timeout > 0) {
-                killTimer = setTimeout(() => {
-                    if (proc.pid && job.status === "running") {
-                        killProcessGroup(proc.pid, "SIGTERM");
-                        job.status = "killed";
-                        // Don't silence — let notifyCompletion send the notification
-                    }
-                }, params.timeout * 1_000);
-                killTimer.unref();
-            }
-
             // ── Inline reminder ───────────────────────────────────────
             let reminderId: string | undefined;
-            // Auto-schedule a reminder just before the kill deadline when
-            // a timeout is set but no explicit remindDelay was given.
-            // This eliminates the need for manual remind() calls which
-            // create persistent custom_message entries.
-            const effectiveRemindDelay =
-                params.remindDelay ||
-                (typeof params.timeout === "number" && params.timeout > 10
-                    ? `${Math.floor(params.timeout * 0.9)}s`
-                    : undefined);
-            if (effectiveRemindDelay) {
+            if (params.remindDelay) {
                 const msg =
                     params.remindMessage ??
-                    (params.remindDelay
-                        ? `check on: ${params.command.slice(0, 80)}`
-                        : `check on ${params.command.slice(0, 60)} before ${params.timeout}s timeout`);
-                const rid = scheduleJobReminder(jobId, effectiveRemindDelay, msg);
+                    `check on: ${params.command.slice(0, 80)}`;
+                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
                 if (rid) reminderId = rid;
             }
+
+            // ── Trigger monitor ───────────────────────────────────────
+            let cancelTriggers = startTriggerMonitor(job, pi, state);
 
             proc.on("close", (code) => {
                 cancelStall();
                 if (cancelTriggers) cancelTriggers();
+
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",
@@ -1503,8 +1594,7 @@ export function registerBackgroundJobs(
 
             proc.on("error", () => {
                 cancelStall();
-                if (killTimer) clearTimeout(killTimer);
-                killTimer = undefined;
+                if (cancelTriggers) cancelTriggers();
                 markJobTerminal(job, "failed");
                 void indexJobOutputInSidecar(
                     job,
@@ -1523,11 +1613,8 @@ export function registerBackgroundJobs(
 
             updateWidget(state, ctx);
 
-            // Build summary line for reminders / timeout
+            // Build summary line for async events
             let extra = "\n You will recieve an async event on completion";
-            if (killTimer) {
-                extra += ` or timeout within ${params.timeout}s`;
-            }
             if (reminderId) {
                 extra += ` or reminder event ${reminderId} in ${params.remindDelay}`;
             }
