@@ -675,8 +675,14 @@ function completionHarness(state: TauState) {
     return { sent, handlers, ctx, pi };
 }
 
-async function waitForCompletionDebounce() {
-    await new Promise((resolve) => setTimeout(resolve, 2100));
+/**
+ * Force-flush the completion delivery batch instead of waiting for the
+ * real debounce timer. The real debounce uses .unref()'d setTimeout with
+ * a minimum of 2s delay, which is unreliable in test environments due to
+ * Node.js timer coalescing behavior with piped stdout.
+ */
+function flushDebounce(state: TauState) {
+    state._flushCompletionBatch?.();
 }
 
 void describe("job completion notifications", () => {
@@ -689,7 +695,7 @@ void describe("job completion notifications", () => {
 
         handlers.get("agent_start")?.();
         notifyCompletion(job, state, pi, ctx);
-        await waitForCompletionDebounce();
+        flushDebounce(state);
 
         assert.equal(sent.length, 0);
         handlers.get("agent_end")?.();
@@ -706,13 +712,132 @@ void describe("job completion notifications", () => {
 
         handlers.get("agent_start")?.();
         notifyCompletion(job, state, pi, ctx);
-        await waitForCompletionDebounce();
+        flushDebounce(state);
 
         job.outputConsumed = true;
         state.cancelCompletionBatchForJob?.(job.id);
         handlers.get("agent_end")?.();
 
         assert.equal(sent.length, 0);
+        handlers.get("session_shutdown")?.();
+    });
+});
+
+// ─── Completion suppression / delivery via wantsCompletionNotification ─
+
+void describe("completion notification with wantsCompletionNotification", () => {
+    void it("suppresses successful completion when no linked callback exists", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({ id: "job-1-3", status: "completed", exitCode: 0 });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        // Agent becomes idle — flush should NOT deliver because there's
+        // no linked callback and no wantsCompletionNotification flag
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 0,
+            "successful completion without linked callback should be suppressed");
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("suppresses successful completion when wantsCompletionNotification is false", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({
+            id: "job-1-4",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: false,
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 0,
+            "explicit false should suppress just like undefined");
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("delivers successful completion when wantsCompletionNotification is true", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({
+            id: "job-1-5",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,  // set by fireCallback
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 1,
+            "should deliver when the linked callback already fired");
+        const msg = sent[0].message as Record<string, unknown>;
+        assert.equal(msg.customType, "job-completion");
+        assert.match(String(msg.content), /✅/);
+        assert.match(String(msg.content), /job-1-5/);
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("delivers failed completion regardless of wantsCompletionNotification", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({
+            id: "job-1-6",
+            status: "failed",
+            exitCode: 1,
+            wantsCompletionNotification: false,
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 1,
+            "failed jobs always get delivered regardless of flag");
+        const msg = sent[0].message as Record<string, unknown>;
+        assert.equal(msg.customType, "job-completion");
+        assert.match(String(msg.content), /❌/);
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("does not deliver when outputConsumed is true even with flag", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+        const job = makeJob({
+            id: "job-1-7",
+            status: "completed",
+            exitCode: 0,
+            outputConsumed: true,
+            wantsCompletionNotification: true,
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        handlers.get("agent_end")?.();
+        assert.equal(sent.length, 0,
+            "outputConsumed takes precedence over wantsCompletionNotification");
         handlers.get("session_shutdown")?.();
     });
 });
