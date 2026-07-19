@@ -151,6 +151,8 @@ let _watcher: ReturnType<typeof watch> | null = null;
 let _tauState: TauState | null = null;
 let _agentBusy = false;
 let _readyFlushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Tracks the set of auto-cancelled callback IDs for the next callback delivery. */
+let _autoCancelledIds: Set<string> | null = null;
 
 /**
  * Cancel all pending callbacks linked to a given job ID.
@@ -370,6 +372,16 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
         });
 
     let message = cb.message;
+
+    // If auto-cancelled callbacks exist, prepend a note so the agent is aware.
+    if (_autoCancelledIds && _autoCancelledIds.size > 0) {
+        message =
+            `NOTE: ${_autoCancelledIds.size} stale non-linked callback(s) were ` +
+            `auto-cancelled (the work they were checking on is likely done). ` +
+            `Use remind(action="list") to see remaining callbacks.\n\n${message}`;
+        _autoCancelledIds = null;
+    }
+
     if (others.length > 0) {
         const items = others.map((other) => {
             const remainingMs = Date.parse(other.fireAt) - Date.now();
@@ -378,10 +390,13 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
             const linkedAttr = other.linkedJobId
                 ? ` linkedTo="${other.linkedJobId}"`
                 : "";
+            const noStalenessAttr = other.linkedJobId
+                ? ""
+                : ' noStalenessCheck="true"';
             const itemElapsed = formatDuration(
                 Date.now() - Date.parse(other.createdAt)
             );
-            return `  <item id="${other.id}" source="${other.source}" elapsed="${itemElapsed}" fireIn="${fireIn}"${linkedAttr}>${other.message}</item>`;
+            return `  <item id="${other.id}" source="${other.source}" elapsed="${itemElapsed}" fireIn="${fireIn}"${linkedAttr}${noStalenessAttr}>${other.message}</item>`;
         });
         message += `\n\n<other_callbacks_pending count="${others.length}">\n`;
         message += items.join("\n");
@@ -459,6 +474,33 @@ function fireCallback(id: string): void {
         }
         // Job is still running — ensure completion notification fires later
         job.wantsCompletionNotification = true;
+    }
+
+    // Auto-cancel all other pending non-linked agent-originated callbacks.
+    // Non-linked callbacks have no staleness detection (no job to check), so
+    // they will always fire regardless of whether the work is done. When one
+    // fires, clean up the rest to prevent cascading stale callback deliveries.
+    // The agent can re-schedule any that are still needed.
+    if (!cb.linkedJobId && cb.source === "agent") {
+        const cancelled = new Set<string>();
+        for (const [otherId, other] of callbacks) {
+            if (
+                otherId !== id &&
+                !other.linkedJobId &&
+                other.source === "agent" &&
+                !other.fired
+            ) {
+                if (other.timer) {
+                    clearTimeout(other.timer);
+                    other.timer = undefined;
+                }
+                callbacks.delete(otherId);
+                cancelled.add(otherId);
+            }
+        }
+        if (cancelled.size > 0) {
+            _autoCancelledIds = cancelled;
+        }
     }
 
     cb.fired = true;
