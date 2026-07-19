@@ -56,8 +56,15 @@ export function evaluateTrigger(
 
     switch (trigger.type) {
         case "outputLines": {
+            // Uses sync I/O intentionally — this runs in a timer callback
+            // outside the agent loop, so blocking the event loop briefly is
+            // acceptable. The 64 KiB tail is the worst case; most logs are
+            // much smaller.
             const size = statSync(logPath).size;
             if (size === 0) { acc.prevSize = 0; acc.prevLines = 0; break; }
+
+            // If the log was rotated (size decreased), reset counters to
+            // avoid overcounting lines from the old log file.
             if (size < acc.prevSize) { acc.prevSize = 0; acc.prevLines = 0; }
             acc.prevSize = size;
 

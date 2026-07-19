@@ -58,7 +58,7 @@ export interface ScheduledCallback {
 // ─── Duration parsing ───────────────────────────────────────────────
 
 const SINGLE_DURATION_RE = /^(\d+(?:\.\d+)?)(s|m|h|d)$/;
-const COMPOUND_DURATION_RE = /^(\d+[smhd])+$/;
+const COMPOUND_DURATION_RE = /^\d+[smhd](?:\d+[smhd])*$/;
 const PURE_NUMBER_RE = /^\d+(?:\.\d+)?$/;
 
 const unitMs: Record<string, number> = {
@@ -143,6 +143,10 @@ function callbacksDir(sessionId: string): string {
 //
 // Kept at module level so exported functions like cancelCallbacksForJob()
 // can access the live callback map without complex wiring.
+//
+// Assumption: pi-tau is loaded once per process, so module-level state is
+// safe from cross-session corruption. If that changes, this state should
+// be migrated to a class instance managed by registerCallbacks().
 
 const callbacks = new Map<string, ScheduledCallback>();
 let cbNextId = 1;
@@ -152,8 +156,12 @@ let _watcher: ReturnType<typeof watch> | null = null;
 let _tauState: TauState | null = null;
 let _agentBusy = false;
 let _readyFlushTimer: ReturnType<typeof setTimeout> | null = null;
-/** Tracks the set of auto-cancelled callback IDs for the next callback delivery. */
-let _autoCancelledIds: Set<string> | null = null;
+/**
+ * Tracks the set of other pending non-linked callbacks to annotate in the
+ * next delivery message. The agent sees these listed and can proactively
+ * cancel any that are stale.
+ */
+let _pendingCallbacksForMessage: Set<string> | null = null;
 
 
 /**
@@ -375,13 +383,15 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
 
     let message = cb.message;
 
-    // If auto-cancelled callbacks exist, prepend a note so the agent is aware.
-    if (_autoCancelledIds && _autoCancelledIds.size > 0) {
+    // If there are other pending non-linked callbacks, prepend a note so
+    // the agent can decide if any are stale and cancel them proactively.
+    if (_pendingCallbacksForMessage && _pendingCallbacksForMessage.size > 0) {
+        const ids = Array.from(_pendingCallbacksForMessage);
         message =
-            `NOTE: ${_autoCancelledIds.size} stale non-linked callback(s) were ` +
-            `auto-cancelled (the work they were checking on is likely done). ` +
-            `Use remind(action="list") to see remaining callbacks.\n\n${message}`;
-        _autoCancelledIds = null;
+            `${ids.length} other non-linked callback(s) pending. ` +
+            `Use \`remind action="list"\` to see all, or ` +
+            `\`remind action="cancel" id=${ids[0]}\` to cancel if stale.\n\n${message}`;
+        _pendingCallbacksForMessage = null;
     }
 
     if (others.length > 0) {
@@ -478,13 +488,15 @@ function fireCallback(id: string): void {
         job.wantsCompletionNotification = true;
     }
 
-    // Auto-cancel all other pending non-linked agent-originated callbacks.
-    // Non-linked callbacks have no staleness detection (no job to check), so
-    // they will always fire regardless of whether the work is done. When one
-    // fires, clean up the rest to prevent cascading stale callback deliveries.
-    // The agent can re-schedule any that are still needed.
+    // Collect other pending non-linked callbacks for the message annotation,
+    // so the agent has awareness of all pending reminders at once.
+    // Unlike linked callbacks (which are auto-cancelled when the job completes),
+    // non-linked callbacks have no staleness detection — they always fire.
+    // Rather than deleting them here (which would silently drop reminders the
+    // agent may still need), we annotate the delivery message so the agent can
+    // proactively cancel any that are stale.
     if (!cb.linkedJobId && cb.source === "agent") {
-        const cancelled = new Set<string>();
+        const pending = new Set<string>();
         for (const [otherId, other] of callbacks) {
             if (
                 otherId !== id &&
@@ -492,16 +504,15 @@ function fireCallback(id: string): void {
                 other.source === "agent" &&
                 !other.fired
             ) {
-                if (other.timer) {
-                    clearTimeout(other.timer);
-                    other.timer = undefined;
-                }
-                callbacks.delete(otherId);
-                cancelled.add(otherId);
+                pending.add(otherId);
             }
         }
-        if (cancelled.size > 0) {
-            _autoCancelledIds = cancelled;
+        if (pending.size > 0) {
+            _pendingCallbacksForMessage = pending;
+            // Note: _pendingCallbacksForMessage is read by buildCallbackMessage to
+            // annotate the delivery. We do NOT delete these callbacks — they
+            // continue to fire on schedule. The agent sees them in the message
+            // and can cancel via remind action=cancel if they are stale.
         }
     }
 

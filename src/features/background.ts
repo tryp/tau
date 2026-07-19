@@ -78,7 +78,10 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
                 ).run(...batch);
             }
 
-            // VACUUM to reclaim free pages (fast at startup — no concurrent readers)
+            // VACUUM to reclaim free pages (fast at startup — no concurrent
+            // readers). For DBs with thousands of old entries this may take
+            // ~100-500ms; acceptable at startup where overall init time is
+            // dominated by model loading, not DB maintenance.
             db.prepare("VACUUM").run();
 
             // Minimal logging — visible in pi startup output
@@ -590,7 +593,15 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     }
 }
 
-/** Build a suffix like " (3 jobs outstanding)" or empty string if 0 */
+/**
+ * Count outstanding (still-running) jobs for a cosmetic suffix in
+ * completion notifications. Uses `process.kill(pid, 0)` as a quick
+ * liveness check — the signal 0 test returns successfully for running
+ * processes without actually sending a signal. EACCES/EPERM from
+ * permission errors on other platforms are treated as "running" since
+ * they indicate the process exists. This is cosmetic only; job state
+ * correctness is managed via the close handler.
+ */
 function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
     const count = Array.from(state.backgroundJobs.values()).filter((j) => {
         if (j.id === excludeJobId) return false;
@@ -599,6 +610,7 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
             if (j.pid) process.kill(j.pid, 0);
             return true;
         } catch {
+            // ESRCH = no such process, EACCES/EPERM = exists but can't signal
             return false;
         }
     }).length;
