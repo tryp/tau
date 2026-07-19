@@ -16,6 +16,7 @@ import type {
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
+import { isFeatureEnabled } from "./features-helpers.ts";
 import type { Task, TaskDetails, TaskLink, TaskStatus } from "../types.ts";
 import { captureReload } from "./reload.ts";
 
@@ -100,6 +101,44 @@ export function getDescendantIds(tasks: Task[], taskId: number): Set<number> {
         }
     }
     return descendants;
+}
+
+/**
+ * Count the number of independent task branches in the tree.
+ *
+ * A branch is a root task (no child-of link). Two branches are
+ * "dependent" if any task in one has a blocks/depends-on link to a
+ * task in the other. Independent branches can be dispatched as
+ * parallel agents.
+ *
+ * Returns the number of roots that are NOT involved in any
+ * inter-root dependency chain. Returns at least 1 if tasks exist.
+ */
+export function countIndependentBranches(tasks: Task[]): number {
+    if (tasks.length === 0) return 0;
+
+    const roots = tasks.filter(
+        (t) => !t.links.some((l) => l.type === "child-of")
+    );
+
+    if (roots.length <= 1) return 1;
+
+    const rootIds = new Set(roots.map((r) => r.id));
+    const rootsWithDeps = new Set<number>();
+
+    for (const root of roots) {
+        for (const link of root.links) {
+            if (
+                (link.type === "blocks" || link.type === "depends-on") &&
+                rootIds.has(link.targetId)
+            ) {
+                rootsWithDeps.add(root.id);
+                rootsWithDeps.add(link.targetId);
+            }
+        }
+    }
+
+    return roots.filter((r) => !rootsWithDeps.has(r.id)).length || 1;
 }
 
 /**
@@ -540,6 +579,18 @@ export function registerTask(pi: ExtensionAPI, state: TauState): void {
         parameters: TaskParams,
 
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+            if (!isFeatureEnabled(state, "task")) {
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: "Task management is disabled — run /tau to enable",
+                        },
+                    ],
+                    details: undefined,
+                };
+            }
+
             switch (params.action) {
                 case "list":
                     return handleList(state);
@@ -588,6 +639,14 @@ export function registerTask(pi: ExtensionAPI, state: TauState): void {
     pi.registerCommand("tasks", {
         description: "Show all tasks on the current branch",
         handler: async (_args, ctx: ExtensionCommandContext) => {
+            if (!isFeatureEnabled(state, "task")) {
+                ctx.ui.notify(
+                    "Task management is disabled — run /tau to enable",
+                    "info"
+                );
+                return;
+            }
+
             captureReload(state, ctx);
             if (!ctx.hasUI) {
                 ctx.ui.notify("/tasks requires interactive mode", "error");

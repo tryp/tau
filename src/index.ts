@@ -3,33 +3,29 @@
  *
  * Background tasks, notifications, plan mode, presets, and other enhancements.
  *
- * Tools: bash (overridden), bash_bg, jobs, job_decide, task
- * Commands: /bg, /fg, /jobs, /tasks, /tools, /plan, /bookmark, /unbookmark,
- *           /context, /footer, /handoff, /handover, /notifications, /preset,
+ * Tools: bash (overridden), bash_bg, jobs, job_decide, task,
+ *        enter_plan_mode, exit_plan_mode
+ * Commands: /bg, /fg, /jobs, /tasks, /tools, /plan, /perm, /bookmark,
+ *           /unbookmark, /context, /footer, /goal, /notifications, /preset,
  *           /session-name, /summarize
  * Shortcuts: Ctrl+B (background/resume), Ctrl+J / Shift+Down (tasks),
- *            Ctrl+X (kill), Ctrl+Alt+P (plan mode), Ctrl+Shift+U (preset cycle)
+ *            Ctrl+X (kill), Ctrl+Alt+P (plan mode), Ctrl+Shift+U (preset cycle),
+ *            Ctrl+Shift+M (permission mode cycle), Ctrl+Shift+T (thinking level)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { TauState } from "./state.ts";
+import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
+import { isSafeCommand } from "./plan-utils.ts";
 import {
-    cleanupStaleLogs,
-    NORMAL_MODE_TOOLS,
-    PLAN_MODE_TOOLS,
-} from "./utils.ts";
-import {
-    isSafeCommand,
-    extractTodoItems,
-    markCompletedSteps,
-} from "./plan-utils.ts";
-import {
-    isAssistantMessage,
-    getTextContent,
-    updatePlanStatus,
-} from "./features/plan-mode.ts";
+    initPermissionState,
+    reloadSettingsIfNeeded,
+    checkToolPermission,
+    modeStatusText,
+    modeColour,
+} from "./features/permissions/index.js";
 import {
     startTitlebarSpinner,
     stopTitlebarSpinner,
@@ -43,7 +39,12 @@ import { purgeSidecar, registerBackgroundJobs } from "./features/background.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import { registerPlanMode } from "./features/plan-mode.ts";
-import { registerTask, reconstructTaskState } from "./features/task.ts";
+import { getPlanFilePath } from "./features/plan-file.ts";
+import {
+    registerTask,
+    reconstructTaskState,
+    formatTaskTree,
+} from "./features/task.ts";
 import {
     registerToolsSelector,
     restoreToolsFromBranch,
@@ -56,20 +57,36 @@ import {
 
 // New integrations
 import { registerBookmark } from "./features/bookmark.ts";
-import { registerClaudeRules } from "./features/claude-rules.ts";
+import { registerContextFiles } from "./features/context-files.ts";
+import { registerMemory } from "./features/memory.ts";
 import { registerCustomFooter } from "./features/custom-footer.ts";
-import { registerGitCheckpoint } from "./features/git-checkpoint.ts";
-import { registerGithubAutocomplete } from "./features/github-autocomplete.ts";
-import { registerHandoff } from "./features/handoff.ts";
+// Handoff disabled — import { registerHandoff } from "./features/handoff.ts";
+import { registerGoal } from "./features/goal.ts";
+import { registerWorkflow } from "./features/workflow.ts";
 import { registerPreset } from "./features/preset.ts";
 import { registerLoop } from "./features/loop.ts";
 import { registerSessionName } from "./features/session-name.ts";
 import { registerSummarize } from "./features/summarize.ts";
 import { registerContext } from "./features/context.ts";
 import { registerWebBrowse } from "./features/web-browse/index.ts";
+import { registerWebSearch } from "./features/web-search/index.ts";
+import { registerAgentSdkProvider } from "./features/agent-sdk/index.ts";
+import { registerClaudeResumeCommand } from "./features/claude-resume.ts";
+import { buildStatusBars, readUsageSnapshot } from "./features/quota-bars.ts";
 import { Text } from "@earendil-works/pi-tui";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
+import { registerPermissions } from "./features/permissions/commands.js";
+import { registerPlanTools } from "./features/plan-tools.js";
+import { registerTauCommand } from "./features/features-register.ts";
+import { restoreFeaturesState } from "./features/features-state.ts";
+import { isTmuxAvailable } from "./tmux.ts";
+import {
+    cleanupTmuxRunDir,
+    cleanupStaleTmuxRunDirs,
+    attachTmuxContext,
+} from "./features/bash-tmux.ts";
+import { checkExitCode } from "./tmux.ts";
 
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
@@ -147,22 +164,64 @@ export default function (pi: ExtensionAPI) {
     registerTask(pi, state);
     registerToolsSelector(pi, state);
     registerNotifications(pi, state);
-    registerBookmark(pi);
-    registerClaudeRules(pi);
-    registerCustomFooter(pi);
-    registerGitCheckpoint(pi);
-    registerGithubAutocomplete(pi);
-    registerHandoff(pi, state);
-    registerPreset(pi);
-    registerLoop(pi);
-    registerSessionName(pi);
-    registerSummarize(pi);
-    registerContext(pi);
-    registerWebBrowse(pi);
+    registerBookmark(pi, state);
+    registerContextFiles(pi, state);
+    registerMemory(pi, state);
+    registerCustomFooter(pi, state);
+    // registerHandoff(pi, state); // disabled
+    registerPreset(pi, state);
+    registerLoop(pi, state);
+    registerSessionName(pi, state);
+    registerSummarize(pi, state);
+    registerContext(pi, state);
+    registerWebBrowse(pi, state);
+    registerWebSearch(pi, state);
+    registerAgentSdkProvider(pi, state);
+    registerClaudeResumeCommand(pi, state);
     registerReloadTool(pi, state);
     registerCallbacks(pi, state);
+    registerPermissions(pi, state);
+    registerPlanTools(pi, state);
+    registerGoal(pi, state);
+    registerWorkflow(pi, state);
+    registerTauCommand(pi, state);
 
     // ── Agent events (cross-cutting) ──────────────────────────────────
+
+    /** Build a status bar string for web tool calls showing URL or query. */
+    function getWebToolStatus(
+        toolName: string,
+        input: Record<string, unknown>,
+        theme: { fg(colour: string, text: string): string }
+    ): string | undefined {
+        const webTools = new Set([
+            "web_browse",
+            "web_screenshot",
+            "web_interact",
+            "web_search",
+        ]);
+        if (!webTools.has(toolName)) return undefined;
+
+        if (toolName === "web_search") {
+            const query = input.query;
+            if (typeof query === "string" && query) {
+                return theme.fg(
+                    "dim",
+                    `🔍 ${query.length > 60 ? query.slice(0, 57) + "…" : query}`
+                );
+            }
+        }
+
+        const url = input.url;
+        if (typeof url === "string" && url) {
+            return theme.fg(
+                "dim",
+                `🌐 ${url.length > 60 ? url.slice(0, 57) + "…" : url}`
+            );
+        }
+
+        return undefined;
+    }
 
     pi.on("agent_start", async (_event, ctx) => {
         startTitlebarSpinner(pi, state, ctx);
@@ -170,7 +229,19 @@ export default function (pi: ExtensionAPI) {
         startAgentTimer(state, ctx);
     });
 
-    pi.on("tool_call", async (event): Promise<ToolCallEventResult> => {
+    pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult> => {
+        // Show URL/query in status bar for web tools
+        if (ctx.hasUI) {
+            const webStatus = getWebToolStatus(
+                event.toolName,
+                event.input,
+                ctx.ui.theme
+            );
+            if (webStatus) {
+                ctx.ui.setStatus("tau-web", webStatus);
+            }
+        }
+
         // Agent backgrounding
         if (state.agentBackgrounded) {
             // Auto-resume on bash: the agent trying to run a command is a clear signal
@@ -209,8 +280,45 @@ export default function (pi: ExtensionAPI) {
             };
         }
 
-        // Plan-mode: block destructive bash commands
-        if (state.planModeEnabled && event.toolName === "bash") {
+        // ── Permission system ──────────────────────────────────────
+
+        // Reload settings if stale
+        const permState = await reloadSettingsIfNeeded(
+            {
+                mode: state.permissionMode,
+                rules: state.permissionRules,
+                additionalDirectories: state.permissionAdditionalDirectories,
+                disableBypass: state.permissionDisableBypass,
+                lastLoadedAt: state.permissionLastLoadedAt,
+                sessionRules: state.permissionSessionRules,
+                askedCommands: state.permissionAskedCommands,
+                planSlug: state.planSlug,
+                planSessionDir: ctx.sessionManager.getSessionDir(),
+            },
+            ctx.cwd
+        );
+        state.permissionMode = permState.mode;
+        state.permissionRules = permState.rules;
+        state.permissionAdditionalDirectories = permState.additionalDirectories;
+        state.permissionDisableBypass = permState.disableBypass;
+        state.permissionLastLoadedAt = permState.lastLoadedAt;
+        state.permissionSessionRules = permState.sessionRules;
+        state.permissionAskedCommands = permState.askedCommands;
+
+        // Run the permission pipeline
+        const permResult = await checkToolPermission(
+            event,
+            permState,
+            ctx.cwd,
+            ctx
+        );
+        if (permResult.block) {
+            return permResult;
+        }
+
+        // The permission system's plan mode handles bash filtering.
+        // This legacy guard is kept only for the --plan CLI flag path.
+        if (state.permissionMode === "plan" && event.toolName === "bash") {
             const command = event.input.command as string;
             if (!isSafeCommand(command)) {
                 return {
@@ -223,85 +331,113 @@ export default function (pi: ExtensionAPI) {
         return {};
     });
 
-    pi.on("tool_result", async (event) => {
-        // Track file paths accessed by read/edit/write for handoff directory detection.
-        if (
-            (event.toolName === "read" ||
-                event.toolName === "edit" ||
-                event.toolName === "write") &&
-            typeof event.input.path === "string"
-        ) {
-            state.accessedFilePaths.push(event.input.path);
-        }
-    });
+    // Handoff disabled — file path tracking removed
+    // pi.on("tool_result", async (event) => {
+    //     if (
+    //         (event.toolName === "read" ||
+    //             event.toolName === "edit" ||
+    //             event.toolName === "write") &&
+    //         typeof event.input.path === "string"
+    //     ) {
+    //         state.accessedFilePaths.push(event.input.path);
+    //     }
+    // });
 
     pi.on("turn_start", async (_event, ctx) => {
         if (state.agentStartTime !== undefined && !state.agentTimer)
             startAgentTimer(state, ctx);
+
+        // First user interaction — clear the shortcut hint from status bar
+        if (!state.hasInteracted) {
+            state.hasInteracted = true;
+            state.permissionModeHintUntil = 0;
+            if (ctx.hasUI) {
+                const colour = modeColour(state.permissionMode);
+                ctx.ui.setStatus(
+                    "tau-perm-mode",
+                    ctx.ui.theme.fg(
+                        colour,
+                        modeStatusText(state.permissionMode, false)
+                    )
+                );
+            }
+        }
     });
 
-    pi.on("turn_end", async (event, ctx) => {
+    pi.on("turn_end", async (_event, ctx) => {
         // Stop the elapsed timer between turns
         if (state.agentTimer) {
             clearInterval(state.agentTimer);
             state.agentTimer = null;
         }
 
-        // Plan-mode progress tracking
-        if (state.planExecutionMode && state.planItems.length > 0) {
-            if (isAssistantMessage(event.message)) {
-                const text = getTextContent(event.message);
-                if (markCompletedSteps(text, state.planItems) > 0) {
-                    updatePlanStatus(state, ctx);
-                }
-            }
+        // Clear web tool status after each turn
+        if (ctx.hasUI) {
+            ctx.ui.setStatus("tau-web", undefined);
+        }
+
+        // Render context / 5h / 7d bars in the status line, matching Claude
+        // Code's own layout. Prefer claude-hud's snapshot (both windows);
+        // fall back to the agent-sdk rate-limit events (binding window only).
+        if (ctx.hasUI) {
+            // Prefer the raw statusline capture (both windows, freshest);
+            // fall back to claude-hud's snapshot, then SDK rate_limit events.
+            const snapshot = readUsageSnapshot();
+            const rl = state.agentSdkRateLimits;
+            const cu = ctx.getContextUsage();
+            const bars = buildStatusBars(
+                {
+                    contextPct: cu?.percent ?? null,
+                    sessionPct: null,
+                    sessionLabel: null,
+                    fiveHourPct:
+                        snapshot?.fiveHourPct ??
+                        rl.fiveHour?.utilization ??
+                        null,
+                    sevenDayPct:
+                        snapshot?.sevenDayPct ??
+                        rl.sevenDay?.utilization ??
+                        null,
+                },
+                ctx.ui.theme
+            );
+            ctx.ui.setStatus("tau-quota", bars);
         }
     });
 
     // Plan-mode: inject context before agent starts
-    pi.on("before_agent_start", async () => {
-        if (state.planModeEnabled) {
+    pi.on("before_agent_start", async (_event, ctx) => {
+        if (state.permissionMode === "plan" && state.planSlug) {
+            const sessionDir = ctx.sessionManager.getSessionDir();
+            const planPath = getPlanFilePath(sessionDir, state.planSlug);
+            const taskTree =
+                state.tasks.length > 0
+                    ? `\n\nCurrent task tree:\n${formatTaskTree(state.tasks)}`
+                    : "";
             return {
                 message: {
                     customType: "plan-mode-context",
                     content: `[PLAN MODE ACTIVE]
-You are in plan mode - a read-only exploration mode for safe code analysis.
+You are in plan mode — a read-only exploration mode for structured planning.
 
 Restrictions:
-- You can only use: read, bash, grep, find, ls, questionnaire
-- You CANNOT use: edit, write (file modifications are disabled)
+- Only read-only tools are available (read, bash, grep, find, ls)
 - Bash is restricted to an allowlist of read-only commands
+- The ONLY writable file is the plan file at: ${planPath}
+- The task tool is fully available — use it to structure the implementation
 
-Ask clarifying questions using the questionnaire tool.
+Your job is to:
+1. Explore the codebase using read-only tools
+2. Build a structured task tree using the task tool:
+   - Create a root task for the overall goal
+   - Decompose into subtasks with child-of links
+   - Add blocks/depends-on links for ordering constraints
+   - Tasks without dependency links between them are parallel candidates
+3. Write the narrative plan to ${planPath}
+4. Call exit_plan_mode when the plan is ready for user approval
 
-Create a detailed numbered plan under a "Plan:" header:
-
-Plan:
-1. First step description
-2. Second step description
-...
-
-Do NOT attempt to make changes - just describe what you would do.`,
-                    display: false,
-                },
-            };
-        }
-
-        if (state.planExecutionMode && state.planItems.length > 0) {
-            const remaining = state.planItems.filter((t) => !t.completed);
-            const todoList = remaining
-                .map((t) => `${t.step}. ${t.text}`)
-                .join("\n");
-            return {
-                message: {
-                    customType: "plan-execution-context",
-                    content: `[EXECUTING PLAN - Full tool access enabled]
-
-Remaining steps:
-${todoList}
-
-Execute each step in order.
-After completing a step, include a [DONE:n] tag in your response.`,
+The plan file should include: Context, Approach, Files to modify,
+Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                     display: false,
                 },
             };
@@ -310,7 +446,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
     // Plan-mode: filter out stale context when not active
     pi.on("context", async (event) => {
-        if (state.planModeEnabled) return;
+        if (state.permissionMode === "plan") return;
 
         return {
             messages: event.messages.filter((m) => {
@@ -336,6 +472,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
     });
 
     pi.on("session_tree", async (_event, ctx) => {
+        restoreFeaturesState(state, ctx);
         reconstructTaskState(state, ctx);
         restoreToolsFromBranch(pi, state, ctx);
     });
@@ -344,6 +481,34 @@ After completing a step, include a [DONE:n] tag in your response.`,
 
     pi.on("session_start", async (_event, ctx) => {
         ctx.ui.setStatus("tau-turn", ctx.ui.theme.fg("dim", "Ready"));
+
+        // ── Feature toggle state restoration ───────────────────────
+        restoreFeaturesState(state, ctx);
+
+        // ── Tmux detection ───────────────────────────────────────────
+        state.tmuxAvailable = isTmuxAvailable();
+        if (!state.tmuxAvailable && !state.tmuxWarningShown) {
+            state.tmuxWarningShown = true;
+            ctx.ui.notify(
+                "⚠️ tmux not found — using direct process management",
+                "warning"
+            );
+        }
+
+        // ── Print/non-interactive detection ──────────────────────────
+        // Mirror pi's own mode decision (print || !stdin.isTTY). When
+        // non-interactive there is no agent loop to answer the bash tool's
+        // auto-background job_decide prompt, so the tool must run commands to
+        // completion instead of backgrounding on timeout.
+        state.nonInteractive = detectNonInteractive(
+            process.argv,
+            Boolean(process.stdin.isTTY)
+        );
+
+        // Clean up run directories and tmux sessions from dead pi processes
+        if (state.tmuxAvailable) {
+            cleanupStaleTmuxRunDirs();
+        }
 
         // Restore background-tasks state
         const entries = ctx.sessionManager.getEntries();
@@ -365,10 +530,37 @@ After completing a step, include a [DONE:n] tag in your response.`,
                 if (data.jobs) {
                     for (const [id, jobData] of data.jobs) {
                         if (jobData.status === "running") {
-                            try {
-                                process.kill(jobData.pid, 0);
-                            } catch {
-                                jobData.status = "completed";
+                            // Tmux jobs store context in an ad-hoc `tmux` property
+                            // that survives serialisation.
+                            const tmux: unknown = (
+                                jobData as unknown as Record<string, unknown>
+                            ).tmux;
+                            if (
+                                typeof tmux === "object" &&
+                                tmux !== null &&
+                                "exitCodeFile" in tmux
+                            ) {
+                                // Tmux job — check sentinel file instead of pid
+                                const exitCodeFile = (
+                                    tmux as { exitCodeFile: string }
+                                ).exitCodeFile;
+                                const code = checkExitCode(exitCodeFile);
+                                if (code !== undefined) {
+                                    jobData.status = "completed";
+                                    jobData.exitCode = code;
+                                }
+                                // else: still running — reattach the context
+                                attachTmuxContext(
+                                    jobData,
+                                    tmux as import("./features/bash-tmux.js").TmuxJobContext
+                                );
+                            } else {
+                                // Direct-spawn job — check if pid is alive
+                                try {
+                                    process.kill(jobData.pid, 0);
+                                } catch {
+                                    jobData.status = "completed";
+                                }
                             }
                         }
                         state.backgroundJobs.set(id, jobData);
@@ -384,11 +576,12 @@ After completing a step, include a [DONE:n] tag in your response.`,
             }
         }
 
-        // Restore plan-mode state
+        // Restore plan-mode state from CLI flag
         if (pi.getFlag("plan") === true) {
-            state.planModeEnabled = true;
+            state.permissionMode = "plan";
         }
 
+        // Restore plan-mode state from session entries
         const planModeEntry = entries
             .filter(
                 (e: { type: string; customType?: string }) =>
@@ -397,64 +590,74 @@ After completing a step, include a [DONE:n] tag in your response.`,
             .pop() as
             | {
                   data?: {
-                      enabled: boolean;
-                      todos?: import("./plan-utils.js").TodoItem[];
-                      executing?: boolean;
+                      enabled?: boolean;
+                      slug?: string;
+                      previousMode?: import("./features/permissions/types.js").PermissionMode;
                   };
               }
             | undefined;
 
         if (planModeEntry?.data) {
-            state.planModeEnabled =
-                planModeEntry.data.enabled ?? state.planModeEnabled;
-            state.planItems = planModeEntry.data.todos ?? state.planItems;
-            state.planExecutionMode =
-                planModeEntry.data.executing ?? state.planExecutionMode;
+            if (planModeEntry.data.enabled) {
+                state.permissionMode = "plan";
+            }
+            state.planSlug = planModeEntry.data.slug;
+            state.planPreviousMode = planModeEntry.data.previousMode;
         }
 
-        // On resume: re-scan messages to rebuild plan completion state
-        if (
-            planModeEntry !== undefined &&
-            state.planExecutionMode &&
-            state.planItems.length > 0
-        ) {
-            let executeIndex = -1;
-            for (let i = entries.length - 1; i >= 0; i--) {
-                const entry = entries[i] as {
-                    type: string;
-                    customType?: string;
-                };
-                if (entry.customType === "plan-mode-execute") {
-                    executeIndex = i;
-                    break;
-                }
-            }
-            const messages: import("@earendil-works/pi-ai").AssistantMessage[] =
-                [];
-            for (let i = executeIndex + 1; i < entries.length; i++) {
-                const entry = entries[i];
-                if (
-                    entry.type === "message" &&
-                    "message" in entry &&
-                    isAssistantMessage(entry.message)
-                ) {
-                    messages.push(entry.message);
-                }
-            }
-            const allText = messages.map(getTextContent).join("\n");
-            markCompletedSteps(allText, state.planItems);
+        if (state.permissionMode === "plan") {
+            pi.setActiveTools([
+                "read",
+                "bash",
+                "grep",
+                "find",
+                "ls",
+                "questionnaire",
+                "task",
+                "enter_plan_mode",
+                "exit_plan_mode",
+            ]);
         }
-
-        if (state.planModeEnabled) {
-            pi.setActiveTools(PLAN_MODE_TOOLS);
-        }
-        updatePlanStatus(state, ctx);
 
         // Restore task state
         reconstructTaskState(state, ctx);
 
         // Restore tools-selector state
         restoreToolsFromBranch(pi, state, ctx);
+
+        // ── Permission state initialisation ────────────────────────
+        const permState = await initPermissionState(ctx.cwd);
+        state.permissionMode = permState.mode;
+        state.permissionRules = permState.rules;
+        state.permissionAdditionalDirectories = permState.additionalDirectories;
+        state.permissionDisableBypass = permState.disableBypass;
+        state.permissionLastLoadedAt = permState.lastLoadedAt;
+        state.permissionSessionRules = permState.sessionRules;
+        state.permissionAskedCommands = permState.askedCommands;
+
+        // ── Mode indicator in status bar (with shortcut hint at startup) ──
+        if (ctx.hasUI) {
+            const colour = modeColour(state.permissionMode);
+            ctx.ui.setStatus(
+                "tau-perm-mode",
+                ctx.ui.theme.fg(
+                    colour,
+                    modeStatusText(state.permissionMode, true)
+                )
+            );
+            state.permissionModeHintUntil = Date.now() + 10000;
+            setTimeout(() => {
+                if (Date.now() >= state.permissionModeHintUntil) {
+                    ctx.ui.setStatus(
+                        "tau-perm-mode",
+                        ctx.ui.theme.fg(
+                            modeColour(state.permissionMode),
+                            modeStatusText(state.permissionMode, false)
+                        )
+                    );
+                }
+            }, 10000);
+        }
 
         // Restore notification config
         for (const entry of ctx.sessionManager.getBranch()) {
@@ -501,93 +704,6 @@ After completing a step, include a [DONE:n] tag in your response.`,
         showAgentTurnComplete(state, ctx);
         state.agentStartTime = undefined;
 
-        // ── Plan-mode: completion detection ──────────────────────────
-        if (state.planExecutionMode && state.planItems.length > 0) {
-            if (state.planItems.every((t) => t.completed)) {
-                const completedList = state.planItems
-                    .map((t) => `~~${t.text}~~`)
-                    .join("\n");
-                pi.sendMessage(
-                    {
-                        customType: "plan-complete",
-                        content: `**Plan Complete!** ✓\n\n${completedList}`,
-                        display: true,
-                    },
-                    { triggerTurn: false }
-                );
-                state.planExecutionMode = false;
-                state.planItems = [];
-                pi.setActiveTools(NORMAL_MODE_TOOLS);
-                updatePlanStatus(state, ctx);
-                pi.appendEntry("plan-mode", {
-                    enabled: false,
-                    todos: [],
-                    executing: false,
-                });
-            } else {
-                pi.appendEntry("plan-mode", {
-                    enabled: state.planModeEnabled,
-                    todos: state.planItems,
-                    executing: state.planExecutionMode,
-                });
-            }
-        } else if (state.planModeEnabled && ctx.hasUI) {
-            const lastAssistant = [...event.messages]
-                .reverse()
-                .find(isAssistantMessage);
-            if (lastAssistant) {
-                const extracted = extractTodoItems(
-                    getTextContent(lastAssistant)
-                );
-                if (extracted.length > 0) state.planItems = extracted;
-            }
-
-            if (state.planItems.length > 0) {
-                const todoListText = state.planItems
-                    .map((t, i) => `${i + 1}. ☐ ${t.text}`)
-                    .join("\n");
-                pi.sendMessage(
-                    {
-                        customType: "plan-todo-list",
-                        content: `**Plan Steps (${state.planItems.length}):**\n\n${todoListText}`,
-                        display: true,
-                    },
-                    { triggerTurn: false }
-                );
-            }
-
-            const choice = await ctx.ui.select("Plan mode - what next?", [
-                state.planItems.length > 0
-                    ? "Execute the plan (track progress)"
-                    : "Execute the plan",
-                "Stay in plan mode",
-                "Refine the plan",
-            ]);
-
-            if (choice?.startsWith("Execute")) {
-                state.planModeEnabled = false;
-                state.planExecutionMode = state.planItems.length > 0;
-                pi.setActiveTools(NORMAL_MODE_TOOLS);
-                updatePlanStatus(state, ctx);
-
-                const execMessage =
-                    state.planItems.length > 0
-                        ? `Execute the plan. Start with: ${state.planItems[0].text}`
-                        : "Execute the plan you just created.";
-                pi.sendMessage(
-                    {
-                        customType: "plan-mode-execute",
-                        content: execMessage,
-                        display: true,
-                    },
-                    { triggerTurn: true }
-                );
-            } else if (choice === "Refine the plan") {
-                const refinement = await ctx.ui.editor("Refine the plan:", "");
-                if (refinement?.trim()) pi.sendUserMessage(refinement.trim());
-            }
-        }
-
         // ── Notification ──────────────────────────────────────────────
         const doNotify = await shouldNotify(state);
         if (doNotify) {
@@ -604,6 +720,8 @@ After completing a step, include a [DONE:n] tag in your response.`,
         stopTitlebarSpinner(pi, state, ctx);
         stopAgentTimer(state);
         state.agentStartTime = undefined;
+
+        cleanupTmuxRunDir();
 
         pi.appendEntry("background-tasks-state", {
             jobs: Array.from(state.backgroundJobs.entries()).map(

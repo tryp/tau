@@ -15,9 +15,10 @@
  */
 
 import { connect, type Socket } from "node:net";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { userInfo } from "node:os";
+import { redactText } from "./redact.ts";
 
 const SOCKET_DIR = `/tmp/pi-chrome-bridge-${getUsername()}`;
 const MAX_MESSAGE_SIZE = 1024 * 1024; // 1 MB
@@ -56,6 +57,13 @@ interface SocketConnection {
     socketPath: string;
 }
 
+/** Resolved profile metadata from a native host's sidecar file. */
+interface SocketProfile {
+    socketPath: string;
+    profile: string;
+    profileDir: string;
+    email: string;
+}
 // ── Socket discovery ─────────────────────────────────────────────────
 
 /** Get all active socket paths (belonging to living processes). */
@@ -78,6 +86,83 @@ function findActiveSockets(): string[] {
         // Directory doesn't exist — native host not running
     }
     return paths;
+}
+
+/** Read a sidecar file for a socket PID. Returns null if unreadable. */
+function readSidecar(pid: number): {
+    profile: string;
+    profileDir: string;
+    email: string;
+} | null {
+    const sidecarPath = join(SOCKET_DIR, `${pid}.profile.json`);
+    try {
+        const data = JSON.parse(readFileSync(sidecarPath, "utf-8")) as {
+            profile?: string;
+            profileDir?: string;
+            email?: string;
+        };
+        if (data.profile) {
+            return {
+                profile: data.profile,
+                profileDir: data.profileDir ?? "",
+                email: data.email ?? "",
+            };
+        }
+    } catch {
+        // Sidecar doesn't exist or isn't ready yet
+    }
+    return null;
+}
+
+/** Get profile metadata for all active sockets. */
+function resolveSocketProfiles(): SocketProfile[] {
+    const profiles: SocketProfile[] = [];
+    try {
+        const files = readdirSync(SOCKET_DIR);
+        for (const file of files) {
+            if (!file.endsWith(".sock")) continue;
+            const pid = parseInt(file.replace(".sock", ""), 10);
+            if (isNaN(pid)) continue;
+            try {
+                process.kill(pid, 0);
+            } catch {
+                continue;
+            }
+            const socketPath = join(SOCKET_DIR, file);
+            const sidecar = readSidecar(pid);
+            profiles.push({
+                socketPath,
+                profile: sidecar?.profile ?? "Unknown",
+                profileDir: sidecar?.profileDir ?? "",
+                email: sidecar?.email ?? "",
+            });
+        }
+    } catch {
+        // Directory doesn't exist
+    }
+    return profiles;
+}
+
+/**
+ * Find which socket owns a specific profile by name.
+ * Returns the socket path, or null if no match found.
+ */
+function findSocketForProfile(profileName: string): string | null {
+    const profiles = resolveSocketProfiles();
+    const normalised = profileName.toLowerCase();
+    for (const p of profiles) {
+        if (p.profile.toLowerCase() === normalised) {
+            return p.socketPath;
+        }
+    }
+    return null;
+}
+
+/** Get the profile name for a given socket path from sidecar data. */
+function getProfileForSocket(socketPath: string): string {
+    const profiles = resolveSocketProfiles();
+    const found = profiles.find((p) => p.socketPath === socketPath);
+    return found?.profile ?? "Unknown";
 }
 
 // ── Multi-socket connection pool ─────────────────────────────────────
@@ -117,7 +202,12 @@ export async function isAvailable(): Promise<boolean> {
 function getConnection(socketPath: string): Promise<SocketConnection> {
     const existing = connections.get(socketPath);
     if (existing && !existing.socket.destroyed) {
-        return Promise.resolve(existing);
+        // Health check: verify the socket is still writable
+        if (!existing.socket.writable) {
+            connections.delete(socketPath);
+        } else {
+            return Promise.resolve(existing);
+        }
     }
 
     return new Promise((resolve, reject) => {
@@ -199,8 +289,31 @@ function processBuffer(conn: SocketConnection): void {
     }
 }
 
-/** Send a command to a specific native host socket. */
+/** Send a command to a specific native host socket. Retries once on connection failure. */
 async function sendCommand(
+    socketPath: string,
+    method: string,
+    params?: unknown
+): Promise<unknown> {
+    try {
+        return await sendCommandInner(socketPath, method, params);
+    } catch (err) {
+        // If the connection was stale (dead socket, ECONNREFUSED),
+        // clear it and retry with a fresh connection.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+            msg.includes("ECONNREFUSED") ||
+            msg.includes("EOF") ||
+            msg.includes("destroyed")
+        ) {
+            connections.delete(socketPath);
+            return await sendCommandInner(socketPath, method, params);
+        }
+        throw err;
+    }
+}
+
+async function sendCommandInner(
     socketPath: string,
     method: string,
     params?: unknown
@@ -251,35 +364,6 @@ async function getDefaultSocketPath(): Promise<string> {
     return socketPaths[0];
 }
 
-/** Send a command to ALL native host sockets and collect results. */
-async function sendCommandAll(
-    method: string,
-    params?: unknown
-): Promise<Array<{ result: unknown; socketPath: string }>> {
-    const socketPaths = findActiveSockets();
-    if (socketPaths.length === 0) {
-        throw new Error("Pi Chrome Bridge native host is not running.");
-    }
-
-    const results = await Promise.allSettled(
-        socketPaths.map(async (socketPath) => {
-            const result = await sendCommand(socketPath, method, params);
-            return { result, socketPath };
-        })
-    );
-
-    return results
-        .filter(
-            (
-                r
-            ): r is PromiseFulfilledResult<{
-                result: unknown;
-                socketPath: string;
-            }> => r.status === "fulfilled"
-        )
-        .map((r) => r.value);
-}
-
 /** Find which socket owns a tab by its ID. */
 async function findSocketForTab(tabId: number): Promise<string> {
     const socketPaths = findActiveSockets();
@@ -302,15 +386,34 @@ async function findSocketForTab(tabId: number): Promise<string> {
 
 // ── Public API ───────────────────────────────────────────────────────
 
-/** List all open Chrome tabs across all profiles. */
+/** List all open Chrome tabs across all profiles with correct profile names. */
 export async function listTabs(): Promise<BridgeTabInfo[]> {
-    const results = await sendCommandAll("list-tabs");
+    const socketProfiles = resolveSocketProfiles();
     const allTabs: BridgeTabInfo[] = [];
-    for (const { result } of results) {
-        const tabs =
-            (result as { tabs?: BridgeTabInfo[] } | undefined)?.tabs ?? [];
-        allTabs.push(...tabs);
+
+    for (const sp of socketProfiles) {
+        try {
+            const result = (await sendCommand(sp.socketPath, "list-tabs")) as
+                | { tabs?: Array<Record<string, unknown>> }
+                | undefined;
+            const tabs = result?.tabs ?? [];
+
+            for (const tab of tabs) {
+                allTabs.push({
+                    id: tab.id as number,
+                    windowId: tab.windowId as number,
+                    index: tab.index as number,
+                    title: (tab.title as string) ?? "",
+                    url: (tab.url as string) ?? "",
+                    active: tab.active as boolean,
+                    profile: sp.profile,
+                });
+            }
+        } catch {
+            // Skip failed sockets
+        }
     }
+
     return allTabs;
 }
 
@@ -327,7 +430,7 @@ export async function getTabText(
         tabId,
         selector,
     });
-    return (result as string) ?? "";
+    return redactText((result as string) ?? "");
 }
 
 /** Execute JavaScript in a tab. */
@@ -341,7 +444,20 @@ export async function evaluate(
         tabId,
         expression,
     });
-    return result as string;
+    return redactText(result as string);
+}
+
+/**
+ * Inject the markdown/structure converters into the page's MAIN world.
+ * Idempotent: re-injecting into a tab that already has the converters
+ * is a no-op (each converter's IIFE checks for the existing global).
+ */
+export async function injectConverters(
+    tabId: number,
+    socketPath?: string
+): Promise<unknown> {
+    const resolvedPath = socketPath ?? (await findSocketForTab(tabId));
+    return await sendCommand(resolvedPath, "inject-converters", { tabId });
 }
 
 /** Navigate a tab to a URL. */
@@ -360,11 +476,34 @@ export interface NewTabResult {
     socketPath: string;
 }
 
-export async function newTab(url?: string): Promise<NewTabResult> {
-    const { result, socketPath } = await sendCommandAny("new-tab", {
-        url: url ?? "about:blank",
-    });
-    const createdTab = result as BridgeTabInfo;
+export async function newTab(
+    url?: string,
+    profile?: string
+): Promise<NewTabResult> {
+    let socketPath: string;
+    let createdTab: BridgeTabInfo;
+
+    if (profile) {
+        const found = findSocketForProfile(profile);
+        if (!found) {
+            const available = resolveSocketProfiles().map((p) => p.profile);
+            throw new Error(
+                `No Chrome profile named "${profile}" found. ` +
+                    `Available profiles: ${available.join(", ")}`
+            );
+        }
+        socketPath = found;
+        const result = await sendCommand(socketPath, "new-tab", {
+            url: url ?? "about:blank",
+        });
+        createdTab = result as BridgeTabInfo;
+    } else {
+        const anyResult = await sendCommandAny("new-tab", {
+            url: url ?? "about:blank",
+        });
+        socketPath = anyResult.socketPath;
+        createdTab = anyResult.result as BridgeTabInfo;
+    }
 
     // chrome.tabs.create() may return a preliminary tab ID that differs from
     // the final stable ID. Poll list-tabs until the tab appears with the
@@ -376,7 +515,61 @@ export async function newTab(url?: string): Promise<NewTabResult> {
         targetUrl
     );
 
-    return { tabInfo: stableTab ?? createdTab, socketPath };
+    const profileName = getProfileForSocket(socketPath);
+    const taggedTab: BridgeTabInfo = {
+        ...(stableTab ?? createdTab),
+        profile: profileName,
+    };
+
+    return { tabInfo: taggedTab, socketPath };
+}
+
+/**
+ * Open a new incognito window and return its first tab. The window does
+ * not steal focus from the user's current work. The caller is
+ * responsible for closing the window when finished — use closeWindow()
+ * with the returned windowId.
+ */
+export interface IncognitoTabResult {
+    tabInfo: BridgeTabInfo;
+    socketPath: string;
+    windowId: number;
+}
+
+export async function newTabInIncognitoWindow(
+    url?: string
+): Promise<IncognitoTabResult> {
+    const socketPath = await getDefaultSocketPath();
+    const result = (await sendCommand(socketPath, "create-window", {
+        url: url ?? "about:blank",
+        incognito: true,
+        focused: false,
+    })) as BridgeWindow;
+
+    const firstTab = result.tabs?.[0];
+    if (!firstTab) {
+        throw new Error(
+            "Failed to create incognito window: Chrome returned no tabs. " +
+                "Check that Chrome is running and incognito is not disabled by policy."
+        );
+    }
+    if (result.id === undefined) {
+        throw new Error(
+            "Failed to create incognito window: Chrome returned no window ID."
+        );
+    }
+
+    const profileName = getProfileForSocket(socketPath);
+    const tabInfo: BridgeTabInfo = {
+        id: firstTab.id,
+        windowId: result.id,
+        index: firstTab.index,
+        title: firstTab.title,
+        url: firstTab.url,
+        active: firstTab.active,
+        profile: profileName,
+    };
+    return { tabInfo, socketPath, windowId: result.id };
 }
 
 /**
@@ -762,6 +955,17 @@ export async function sendCdp(
         method,
         params,
     });
+}
+
+/** Get all resolved socket profiles. */
+export function getAvailableProfiles(): Array<{
+    profile: string;
+    email: string;
+}> {
+    return resolveSocketProfiles().map((sp) => ({
+        profile: sp.profile,
+        email: sp.email,
+    }));
 }
 
 /** Disconnect from all native host sockets. */

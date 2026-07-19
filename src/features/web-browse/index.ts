@@ -3,7 +3,7 @@
  *
  * Browser modes:
  *   - bridge     (Chrome extension, no prompts) — default for chrome_list
- *   - isolated   (fresh headless Chromium per call) — requires playwright-core, default for browse/screenshot/interact
+ *   - isolated   (fresh headless Chromium per call) — requires patchright, default for browse/screenshot/interact
  *   - cdp        (connect to running Chrome via DevTools Protocol)
  *   - applescript (read-only queries on macOS Chrome via AppleScript)
  *
@@ -17,16 +17,20 @@
  *   - web_screenshot Capture full-page or viewport screenshots
  *   - web_interact   Multi-step interaction (click, fill, scroll, etc.)
  *
- * Playwright-core is an optional dependency — only needed for isolated
- * and CDP modes. Bridge and AppleScript modes work without it.
+ * Patchright (a patched Playwright fork that removes CDP-leak signals) is
+ * an optional dependency — only needed for isolated and CDP modes. Bridge
+ * and AppleScript modes work without it. When CloakBrowser is also
+ * installed, the isolated mode uses its C++-patched Chromium binary for
+ * source-level fingerprint resistance.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { domToMarkdown } from "./markdown.ts";
+import { domToStructure } from "./structure.ts";
 
 /** Types for DOM converter scripts injected into pages at runtime. */
 declare global {
@@ -36,22 +40,119 @@ declare global {
     }
 }
 
-// Lazy-loaded playwright-core (optional dependency)
-type PlaywrightBrowser = import("playwright-core").Browser;
-type PlaywrightPage = import("playwright-core").Page;
+// Lazy-loaded patchright (optional dependency — patched Playwright fork
+// that removes CDP-leak signals from the automation protocol handshake).
+type PlaywrightBrowser = import("patchright").Browser;
+type PlaywrightPage = import("patchright").Page;
 
-let _playwrightCore: typeof import("playwright-core") | undefined;
-async function getPlaywright(): Promise<typeof import("playwright-core")> {
-    if (_playwrightCore) return _playwrightCore;
+let _patchright: typeof import("patchright") | undefined;
+async function getPlaywright(): Promise<typeof import("patchright")> {
+    if (_patchright) return _patchright;
     try {
-        _playwrightCore = await import("playwright-core");
-        return _playwrightCore;
+        _patchright = await import("patchright");
+        return _patchright;
     } catch {
         throw new Error(
-            "playwright-core is not installed. Install it with:\n" +
-                "  cd ~/.pi/agent/extensions/tau && pnpm add playwright-core\n" +
-                "\nAlternatively, use browser: 'bridge' or browser: 'applescript' which don't require playwright."
+            "patchright is not installed. Install it with:\n" +
+                "  cd ~/.pi/agent/extensions/tau && pnpm add patchright\n" +
+                "\nAlternatively, use browser: 'bridge' or browser: 'applescript' which don't require it."
         );
+    }
+}
+
+// Lazy-loaded CloakBrowser (optional — provides a C++-patched Chromium
+// binary with source-level fingerprint resistance). When available, the
+// isolated browser mode uses its binary instead of vanilla Chromium,
+// combining CloakBrowser's C++ stealth patches with Patchright's
+// protocol-level patches.
+//
+// If CloakBrowser is not installed, it is installed automatically on
+// first use of isolated mode. The npm package (~5 MB) and the stealth
+// Chromium binary (~140 MB) are downloaded once and cached at
+// ~/.cloakbrowser/.
+let _cloakBinaryPath: string | undefined;
+let _cloakInstallAttempted = false;
+
+/** Resolve the tau extension root directory for running pnpm. */
+function getExtensionDir(): string {
+    // src/features/web-browse/index.ts → ../../.. = tau root
+    return join(import.meta.dirname, "..", "..", "..");
+}
+
+/**
+ * Install CloakBrowser via pnpm if it's not already importable.
+ * Returns true if installation succeeded (or was already installed).
+ */
+async function ensureCloakBrowserInstalled(): Promise<boolean> {
+    if (_cloakInstallAttempted) return _cloakBinaryPath !== undefined;
+    _cloakInstallAttempted = true;
+
+    // First check: is it already importable?
+    try {
+        const { ensureBinary } = await import("cloakbrowser");
+        const path = await ensureBinary();
+        if (typeof path === "string" && path) {
+            _cloakBinaryPath = path;
+            return true;
+        }
+    } catch {
+        // Not installed — proceed to install
+    }
+
+    // Install the npm package
+    const { execFileSync } = await import("node:child_process");
+    const extDir = getExtensionDir();
+
+    try {
+        execFileSync("pnpm", ["add", "-O", "cloakbrowser@0.3.29"], {
+            cwd: extDir,
+            stdio: "pipe",
+            timeout: 60_000,
+        });
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+            `[tau] Failed to install CloakBrowser: ${msg}` +
+                "\nFalling back to Patchright-only mode."
+        );
+        return false;
+    }
+
+    // Now import the freshly installed module and download the binary
+    try {
+        const { ensureBinary } = await import("cloakbrowser");
+        const path = await ensureBinary();
+        if (typeof path === "string" && path) {
+            _cloakBinaryPath = path;
+            return true;
+        }
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+            `[tau] CloakBrowser installed but binary download failed: ${msg}` +
+                "\nFalling back to Patchright-only mode."
+        );
+    }
+
+    return false;
+}
+
+async function getCloakBinaryPath(): Promise<string | undefined> {
+    if (_cloakBinaryPath !== undefined) return _cloakBinaryPath;
+    await ensureCloakBrowserInstalled();
+    return _cloakBinaryPath;
+}
+
+let _cloakStealthArgs: string[] | undefined;
+
+async function getCloakStealthArgs(): Promise<string[]> {
+    if (_cloakStealthArgs) return _cloakStealthArgs;
+    try {
+        const { getDefaultStealthArgs } = await import("cloakbrowser");
+        _cloakStealthArgs = getDefaultStealthArgs();
+        return _cloakStealthArgs;
+    } catch {
+        return [];
     }
 }
 
@@ -60,11 +161,17 @@ import {
     appendConsoleLog,
     type ConsoleCollector,
 } from "./console-collector.ts";
+import {
+    collectNetwork,
+    formatNetworkEntries,
+    type NetworkCollector,
+} from "./network-collector.ts";
 import * as cdp from "./cdp.ts";
 import * as applescript from "./applescript.ts";
 import * as bridge from "./bridge.ts";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { matchGitHubRepo, extractRepoStructure } from "./github-structure.ts";
+import type { TauState } from "../../state.ts";
+import { isFeatureEnabled } from "../features-helpers.ts";
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -73,22 +180,12 @@ const VIEWPORT = { width: 1280, height: 720 } as const;
 const USER_AGENT =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// Resolve the shared JS converter scripts from the skill directory
-// ~/.agents/skills/web-browse/scripts/
-const CONVERTERS_DIR = join(
-    __dirname,
-    "..",
-    "..",
-    "..",
-    "..",
-    "..",
-    "..",
-    "..",
-    ".agents",
-    "skills",
-    "web-browse",
-    "scripts"
-);
+// Page-side converter scripts. The arrow functions in markdown.ts and
+// structure.ts are self-contained (no closures, no imports — see their
+// file headers) and serialised to strings here so they can be injected
+// into the page without depending on files on disk.
+const MARKDOWN_INIT = `window.__domToMarkdown = ${domToMarkdown.toString()};`;
+const STRUCTURE_INIT = `window.__domToStructure = ${domToStructure.toString()};`;
 
 // ── Shared browser mode parameter ────────────────────────────────────
 
@@ -107,8 +204,10 @@ const BROWSER_PARAM = StringEnum(
 const TAB_ID_PARAM = Type.Optional(
     Type.Number({
         description:
-            "Tab ID from chrome_list output. Required for browser: 'cdp' and browser: 'applescript'. " +
-            "Call chrome_list first to see available tabs and their IDs.",
+            "Tab ID from chrome_list output. Tab IDs are specific to the browser mode — " +
+            "a tab ID from bridge mode will NOT work in CDP mode and vice versa. " +
+            "Always use chrome_list with the same browser mode you plan to use for the subsequent operation. " +
+            "Required for browser: 'cdp' and browser: 'applescript'.",
     })
 );
 
@@ -120,10 +219,112 @@ const WAIT_UNTIL_PARAM = Type.Optional(
     })
 );
 
-// ── Isolated browser helpers (lazy playwright) ───────────────────────
+const SESSION_PARAM = Type.Optional(
+    StringEnum(["fresh"] as const, {
+        description:
+            "Session isolation hint. 'fresh' opens a new incognito window so " +
+            "the call does not mutate the user's actual Chrome (cookies, history, " +
+            "logins). The incognito window is closed when the call finishes. " +
+            "Only honoured in browser: 'bridge' mode. In browser: 'isolated' mode " +
+            "the browser is already fresh per call, so this is a no-op. " +
+            "In browser: 'cdp' and 'applescript' modes it is rejected.",
+    })
+);
+
+const COOKIES_PARAM = Type.Optional(
+    Type.String({
+        description:
+            "Import cookies from a Chrome profile before navigating. " +
+            "Set to a profile name (e.g. 'Personal') to import cookies from the Pi Bridge, " +
+            "or 'auto' to import from the default profile. " +
+            "Only works in browser: 'isolated' mode and requires the Pi Chrome Bridge to be running.",
+    })
+);
+
+// ── Persistent isolated browser ────────────────────────────────────
+//
+// Instead of launching a fresh Chromium per call, the browser instance
+// persists across calls within a session. Pages are created and closed
+// per call, but the browser process stays alive for 60 seconds of
+// inactivity before shutting down.
+
+const BROWSER_IDLE_TIMEOUT_MS = 60_000;
+
+let persistentBrowser: PlaywrightBrowser | undefined;
+let browserIdleTimer: ReturnType<typeof setTimeout> | undefined;
+let browserLaunching: Promise<PlaywrightBrowser> | undefined;
+
+/** Get or launch the persistent isolated browser. Serialises concurrent launches. */
+async function getBrowser(): Promise<PlaywrightBrowser> {
+    // If a browser exists and is connected, reuse it
+    if (persistentBrowser) {
+        try {
+            persistentBrowser.contexts(); // health check
+            resetIdleTimer();
+            return persistentBrowser;
+        } catch {
+            // Dead — discard
+            persistentBrowser = undefined;
+        }
+    }
+
+    // If a launch is already in flight, wait for it
+    if (browserLaunching) {
+        return browserLaunching;
+    }
+
+    // Launch a new browser
+    browserLaunching = launchBrowser();
+    try {
+        persistentBrowser = await browserLaunching;
+        resetIdleTimer();
+        return persistentBrowser;
+    } finally {
+        browserLaunching = undefined;
+    }
+}
+
+/** Reset the idle shutdown timer. Call on every browser use. */
+function resetIdleTimer(): void {
+    if (browserIdleTimer) clearTimeout(browserIdleTimer);
+    browserIdleTimer = setTimeout(() => {
+        if (persistentBrowser) {
+            persistentBrowser.close().catch(() => {});
+            persistentBrowser = undefined;
+        }
+        browserIdleTimer = undefined;
+    }, BROWSER_IDLE_TIMEOUT_MS);
+}
+
+/** Shut down the persistent browser immediately (session shutdown). */
+async function shutdownBrowser(): Promise<void> {
+    if (browserIdleTimer) {
+        clearTimeout(browserIdleTimer);
+        browserIdleTimer = undefined;
+    }
+    if (persistentBrowser) {
+        const b = persistentBrowser;
+        persistentBrowser = undefined;
+        await b.close().catch(() => {});
+    }
+}
 
 async function launchBrowser(): Promise<PlaywrightBrowser> {
     const pw = await getPlaywright();
+    const cloakPath = await getCloakBinaryPath();
+
+    if (cloakPath) {
+        // CloakBrowser binary + Patchright protocol patches: C++ fingerprint
+        // resistance combined with a clean CDP handshake.
+        const stealthArgs = await getCloakStealthArgs();
+        return pw.chromium.launch({
+            headless: true,
+            executablePath: cloakPath,
+            args: stealthArgs,
+        });
+    }
+
+    // Patchright only — protocol-level patches, standard Chromium binary.
     return pw.chromium.launch({ headless: true });
 }
 
@@ -144,15 +345,18 @@ async function createPage(browser: PlaywrightBrowser): Promise<PlaywrightPage> {
         }
     });
 
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => false });
-    });
-    await page.addInitScript({
-        path: join(CONVERTERS_DIR, "dom-to-markdown.js"),
-    });
-    await page.addInitScript({
-        path: join(CONVERTERS_DIR, "dom-to-structure.js"),
-    });
+    // navigator.webdriver shim — redundant when CloakBrowser's C++ patches
+    // already hide it at the binary level. Kept as fallback for vanilla
+    // Chromium via Patchright.
+    if (!_cloakBinaryPath) {
+        await page.addInitScript(() => {
+            Object.defineProperty(navigator, "webdriver", {
+                get: () => false,
+            });
+        });
+    }
+    await page.addInitScript({ content: MARKDOWN_INIT });
+    await page.addInitScript({ content: STRUCTURE_INIT });
     page.setDefaultTimeout(TIMEOUT);
     return page;
 }
@@ -163,6 +367,271 @@ async function navigateTo(
     waitUntil: "load" | "domcontentloaded" | "networkidle" = "domcontentloaded"
 ): Promise<void> {
     await page.goto(url, { waitUntil, timeout: TIMEOUT });
+}
+
+// ── Smart browser mode fallback ─────────────────────────────────────
+
+type BrowserMode = "bridge" | "isolated" | "cdp" | "applescript";
+
+const READ_FALLBACK_CHAIN: BrowserMode[] = [
+    "bridge",
+    "cdp",
+    "applescript",
+    "isolated",
+];
+const WRITE_FALLBACK_CHAIN: BrowserMode[] = ["bridge", "cdp", "isolated"];
+const LIST_FALLBACK_CHAIN: BrowserMode[] = ["bridge", "cdp", "applescript"];
+
+/** Check if a browser mode is available without throwing. */
+async function isModeAvailable(mode: BrowserMode): Promise<boolean> {
+    switch (mode) {
+        case "bridge":
+            return await bridge.isAvailable();
+        case "cdp": {
+            try {
+                await cdp.discover();
+                return true;
+            } catch {
+                return false;
+            }
+        }
+        case "applescript":
+            return await applescript.isAvailable();
+        case "isolated":
+            return true;
+    }
+}
+
+/** Get the effective browser mode with fallback. */
+async function resolveBrowserMode(
+    requested: BrowserMode,
+    operation: "read" | "write" | "list"
+): Promise<BrowserMode> {
+    if (await isModeAvailable(requested)) return requested;
+
+    const chain =
+        operation === "list"
+            ? LIST_FALLBACK_CHAIN
+            : operation === "read"
+              ? READ_FALLBACK_CHAIN
+              : WRITE_FALLBACK_CHAIN;
+
+    for (const fallback of chain) {
+        if (fallback === requested) continue;
+        if (await isModeAvailable(fallback)) return fallback;
+    }
+
+    return requested; // Will throw with a helpful error downstream
+}
+
+// ── PDF detection ────────────────────────────────────────────────────
+
+async function isPdfPage(page: PlaywrightPage): Promise<boolean> {
+    const url = page.url();
+    if (url.toLowerCase().endsWith(".pdf") || url.includes(".pdf?"))
+        return true;
+    try {
+        const contentType = await page.evaluate(
+            () => document.contentType ?? ""
+        );
+        if (contentType.includes("pdf")) return true;
+    } catch {
+        /* ignore */
+    }
+    try {
+        const hasViewer = await page.evaluate(
+            () =>
+                document.querySelector("embed[type='application/pdf']") !==
+                    null ||
+                document.querySelector("iframe[src*='.pdf']") !== null
+        );
+        if (hasViewer) return true;
+    } catch {
+        /* ignore */
+    }
+    return false;
+}
+
+async function getPdfText(page: PlaywrightPage): Promise<string> {
+    const text = await page.evaluate(() => {
+        const embed = document.querySelector("embed[type='application/pdf']");
+        if (embed) {
+            const pdfDoc = (embed as HTMLObjectElement).contentDocument;
+            if (pdfDoc) return pdfDoc.body?.innerText ?? "";
+        }
+        return document.body?.innerText ?? "";
+    });
+    if (text.trim().length > 0) {
+        return `Title: PDF Document\nURL: ${page.url()}\n\n---\n\n${text}`;
+    }
+    return `Title: PDF Document\nURL: ${page.url()}\n\n---\n\nThis is a PDF document. The built-in viewer did not expose extractable text.\nUse web_screenshot to capture a visual representation, or download the file\nand use a dedicated PDF parser.`;
+}
+
+// ── Bot detection ────────────────────────────────────────────────────
+
+async function detectBotChallenge(page: PlaywrightPage): Promise<boolean> {
+    try {
+        return await page.evaluate(() => {
+            const title = document.title?.toLowerCase() ?? "";
+            const body = document.body?.innerText?.toLowerCase() ?? "";
+            if (
+                title.includes("just a moment") ||
+                title.includes("attention required")
+            )
+                return true;
+            if (
+                body.includes("checking your browser") &&
+                body.includes("cloudflare")
+            )
+                return true;
+            if (document.querySelector("#challenge-running") !== null)
+                return true;
+            if (document.querySelector(".cf-browser-verification") !== null)
+                return true;
+            if (title.includes("access denied") && body.includes("bot"))
+                return true;
+            if (body.includes("please verify you are a human")) return true;
+            if (body.includes("enable javascript and cookies to continue"))
+                return true;
+            return false;
+        });
+    } catch {
+        return false;
+    }
+}
+
+async function waitForChallengeResolution(page: PlaywrightPage): Promise<void> {
+    const maxPolls = 30; // 15 seconds at 500ms intervals
+    for (let i = 0; i < maxPolls; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        if (!(await detectBotChallenge(page))) return;
+    }
+}
+
+// ── Cookie import ────────────────────────────────────────────────────
+
+async function importCookies(
+    context: import("patchright").BrowserContext,
+    url: string
+): Promise<void> {
+    if (!(await bridge.isAvailable())) {
+        throw new Error(
+            "Cannot import cookies: Pi Chrome Bridge is not available."
+        );
+    }
+
+    const tabs = await bridge.listTabs();
+    if (tabs.length === 0) {
+        throw new Error("Cannot import cookies: no Chrome tabs found.");
+    }
+
+    const targetTab = tabs[0];
+
+    await bridge.attachDebugger(targetTab.id);
+    try {
+        const result = await bridge.sendCdp(
+            targetTab.id,
+            "Network.getCookies",
+            { urls: [url] }
+        );
+        const cdpResponse = result as {
+            cookies?: Array<{
+                name: string;
+                value: string;
+                domain: string;
+                path?: string;
+                secure?: boolean;
+                httpOnly?: boolean;
+                sameSite?: string;
+                expires?: number;
+            }>;
+        };
+
+        const cookies = cdpResponse.cookies ?? [];
+        if (cookies.length === 0) return;
+
+        await context.addCookies(
+            cookies.map((c) => ({
+                name: c.name,
+                value: c.value,
+                domain: c.domain,
+                path: c.path ?? "/",
+                secure: c.secure ?? false,
+                httpOnly: c.httpOnly ?? false,
+                sameSite: (c.sameSite as "Strict" | "Lax" | "None") ?? "Lax",
+                expires: c.expires ?? -1,
+            }))
+        );
+    } finally {
+        await bridge.detachDebugger(targetTab.id).catch(() => {});
+    }
+}
+
+// ── Navigation with retry and bot detection ──────────────────────────
+
+const MAX_NAVIGATION_RETRIES = 2;
+const RETRY_DELAY_MS = 2_000;
+
+async function navigateAndExtract(
+    page: PlaywrightPage,
+    url: string,
+    waitUntil: "load" | "domcontentloaded" | "networkidle",
+    format: "text" | "markdown" | "structure",
+    params: { selector?: string; url: string },
+    consoleCollector: ConsoleCollector,
+    browserMode: "isolated" | "cdp"
+): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+    details: Record<string, unknown>;
+}> {
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt <= MAX_NAVIGATION_RETRIES; attempt++) {
+        if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+        }
+
+        try {
+            await navigateTo(page, url, waitUntil);
+
+            // Detect and wait for Cloudflare/bot challenge pages
+            if (await detectBotChallenge(page)) {
+                await waitForChallengeResolution(page);
+            }
+
+            const result = await extractPageContent(
+                page,
+                { ...params, format },
+                consoleCollector,
+                browserMode
+            );
+
+            // Retry if text content is suspiciously empty (JS-heavy page)
+            const text = result.content[0]?.text ?? "";
+            if (
+                format === "text" &&
+                text.trim().length < 50 &&
+                attempt < MAX_NAVIGATION_RETRIES
+            ) {
+                continue;
+            }
+
+            return result;
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            const msg = lastError.message;
+            const isTransient =
+                msg.includes("Timeout") ||
+                msg.includes("net::ERR") ||
+                msg.includes("Navigation") ||
+                msg.includes("ERR_CONNECTION") ||
+                msg.includes("ERR_NAME_NOT_RESOLVED");
+            if (!isTransient || attempt >= MAX_NAVIGATION_RETRIES)
+                throw lastError;
+        }
+    }
+
+    throw lastError ?? new Error("Navigation failed after retries");
 }
 
 async function getPageText(page: PlaywrightPage): Promise<string> {
@@ -201,12 +670,8 @@ async function ensureConverters(page: PlaywrightPage): Promise<void> {
     );
     if (hasConverters) return;
 
-    await page.addScriptTag({
-        path: join(CONVERTERS_DIR, "dom-to-markdown.js"),
-    });
-    await page.addScriptTag({
-        path: join(CONVERTERS_DIR, "dom-to-structure.js"),
-    });
+    await page.addScriptTag({ content: MARKDOWN_INIT });
+    await page.addScriptTag({ content: STRUCTURE_INIT });
 }
 
 /**
@@ -230,12 +695,28 @@ async function resolveCDPPage(
 
 // ── Registration ─────────────────────────────────────────────────────
 
-export function registerWebBrowse(pi: ExtensionAPI): void {
+export function registerWebBrowse(pi: ExtensionAPI, state: TauState): void {
     // Clean up connections on session shutdown
     pi.on("session_shutdown", async () => {
         cdp.disconnect();
         bridge.disconnect();
+        tabCache.clear();
+        await shutdownBrowser();
     });
+
+    // ── chrome_list TTL cache ────────────────────────────────────────
+    const TAB_CACHE_TTL_MS = 30_000;
+    const tabCache = new Map<
+        string,
+        {
+            tabs: Array<
+                | cdp.TabInfo
+                | applescript.AppleScriptTabInfo
+                | bridge.BridgeTabInfo
+            >;
+            fetchedAt: number;
+        }
+    >();
 
     // ── chrome_list ─────────────────────────────────────────────────
     pi.registerTool({
@@ -248,6 +729,9 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
         promptSnippet: "List the user's open Chrome tabs",
         promptGuidelines: [
             "Use chrome_list to see what tabs the user has open before operating on a specific tab.",
+            "Tab IDs are mode-specific — a tab ID from bridge mode will NOT work in CDP or applescript mode.",
+            "Always call chrome_list with the same browser mode you will use for subsequent operations on those tabs.",
+            "If you get 'Tab ID not found', you likely mixed modes. Re-list with the correct browser mode.",
         ],
         parameters: Type.Object({
             browser: Type.Optional(
@@ -260,7 +744,21 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             ),
         }),
         async execute(_toolCallId, params, signal) {
-            const mode = params.browser ?? "bridge";
+            if (!isFeatureEnabled(state, "web-browse")) {
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: "Web browsing is disabled — run /tau to enable",
+                        },
+                    ],
+                    details: undefined,
+                };
+            }
+            const mode = await resolveBrowserMode(
+                params.browser ?? "bridge",
+                "list"
+            );
             let usedMode: string = "bridge";
             let tabs: Array<
                 | cdp.TabInfo
@@ -268,7 +766,12 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                 | bridge.BridgeTabInfo
             > = [];
 
-            if (mode === "bridge") {
+            // Check TTL cache for this mode
+            const cached = tabCache.get(mode);
+            if (cached && Date.now() - cached.fetchedAt < TAB_CACHE_TTL_MS) {
+                tabs = cached.tabs;
+                usedMode = mode;
+            } else if (mode === "bridge") {
                 if (!(await bridge.isAvailable())) {
                     throw new Error(
                         "Pi Chrome Bridge is not available. Install the extension and native host:\n" +
@@ -285,6 +788,11 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             } else if (mode === "applescript") {
                 tabs = await applescript.listTabs();
                 usedMode = "applescript";
+            }
+
+            // Update cache (only after a fresh fetch, not a cache hit)
+            if (!cached || Date.now() - cached.fetchedAt >= TAB_CACHE_TTL_MS) {
+                tabCache.set(mode, { tabs, fetchedAt: Date.now() });
             }
 
             if (tabs.length === 0) {
@@ -401,6 +909,8 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             "Use web_browse instead of bash with curl/wget when the page requires JavaScript rendering.",
             "Use 'markdown' format when you need structured content with headings, links, and tables.",
             "Use 'structure' format when you need machine-readable JSON data from the page.",
+            "Tab IDs are mode-specific. If you got a tab ID from chrome_list with browser: 'bridge', " +
+                "use browser: 'bridge' for the subsequent web_browse call — NOT 'cdp' or 'applescript'.",
             "Use browser: 'cdp' with tabId to read content from the user's open Chrome tabs (call chrome_list first to get tab IDs).",
             "Use browser: 'applescript' with tabId for read-only access to the user's Chrome without needing CDP setup.",
         ],
@@ -422,10 +932,41 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             waitUntil: WAIT_UNTIL_PARAM,
             browser: Type.Optional(BROWSER_PARAM),
             tabId: TAB_ID_PARAM,
+            session: SESSION_PARAM,
+            cookies: COOKIES_PARAM,
         }),
         async execute(_toolCallId, params, signal) {
-            const browserMode = params.browser ?? "isolated";
+            if (!isFeatureEnabled(state, "web-browse")) {
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: "Web browsing is disabled — run /tau to enable",
+                        },
+                    ],
+                    details: undefined,
+                };
+            }
+            const browserMode = await resolveBrowserMode(
+                params.browser ?? "isolated",
+                "read"
+            );
             const format = params.format ?? "text";
+            const session = params.session;
+
+            if (session === "fresh" && browserMode === "cdp") {
+                throw new Error(
+                    "session: 'fresh' is only supported in browser: 'bridge' mode. " +
+                        "browser: 'cdp' operates on the user's existing Chrome tabs and cannot open an isolated window. " +
+                        "Use browser: 'bridge' (default for the fresh session) or drop session: 'fresh'."
+                );
+            }
+            if (session === "fresh" && browserMode === "applescript") {
+                throw new Error(
+                    "session: 'fresh' is only supported in browser: 'bridge' mode. " +
+                        "browser: 'applescript' is read-only and operates on the user's existing Chrome tabs."
+                );
+            }
 
             // ── Bridge mode ──────────────────────────────────────────
             if (browserMode === "bridge") {
@@ -437,63 +978,124 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
 
                 let tabId = params.tabId;
                 let socketPath: string | undefined;
+                let incognitoWindowId: number | undefined;
 
-                if (tabId === undefined) {
+                if (session === "fresh") {
+                    // Open a new incognito window; any provided tabId is
+                    // ignored — session: 'fresh' always uses a fresh tab.
+                    const result = await bridge.newTabInIncognitoWindow(
+                        params.url
+                    );
+                    tabId = result.tabInfo.id;
+                    socketPath = result.socketPath;
+                    incognitoWindowId = result.windowId;
+                    await new Promise((r) => setTimeout(r, 3000));
+                } else if (tabId === undefined) {
                     const newTabResult = await bridge.newTab(params.url);
                     tabId = newTabResult.tabInfo.id;
                     socketPath = newTabResult.socketPath;
                     await new Promise((r) => setTimeout(r, 3000));
                 }
 
-                if (format === "text") {
-                    const text = await bridge.getTabText(
-                        tabId,
-                        params.selector,
-                        socketPath
-                    );
-                    return {
-                        content: [{ type: "text", text }],
-                        details: {
-                            format: "text",
-                            browser: "bridge",
-                            tabId: tabId,
-                        },
-                    };
-                }
+                try {
+                    if (format === "text") {
+                        const text = await bridge.getTabText(
+                            tabId,
+                            params.selector,
+                            socketPath
+                        );
+                        return {
+                            content: [{ type: "text", text }],
+                            details: {
+                                format: "text",
+                                browser: "bridge",
+                                tabId: tabId,
+                                session,
+                            },
+                        };
+                    }
 
-                if (format === "markdown") {
-                    const md = await bridge.evaluate(
-                        tabId,
-                        `(() => { if (typeof window.__domToMarkdown !== 'function') return 'Converters not injected'; return window.__domToMarkdown(); })()`,
-                        socketPath
-                    );
-                    return {
-                        content: [{ type: "text", text: String(md) }],
-                        details: {
-                            format: "markdown",
-                            browser: "bridge",
-                            tabId: tabId,
-                        },
-                    };
-                }
+                    if (format === "markdown") {
+                        await bridge.injectConverters(tabId, socketPath);
+                        const md = await bridge.evaluate(
+                            tabId,
+                            "window.__domToMarkdown()",
+                            socketPath
+                        );
+                        return {
+                            content: [{ type: "text", text: String(md) }],
+                            details: {
+                                format: "markdown",
+                                browser: "bridge",
+                                tabId: tabId,
+                                session,
+                            },
+                        };
+                    }
 
-                if (format === "structure") {
-                    const data = await bridge.evaluate(
-                        tabId,
-                        `(() => { if (typeof window.__domToStructure !== 'function') return { error: 'Converters not injected' }; return window.__domToStructure(); })()`,
-                        socketPath
-                    );
-                    return {
-                        content: [{ type: "text", text: String(data) }],
-                        details: {
-                            format: "structure",
-                            browser: "bridge",
-                            tabId: tabId,
-                        },
-                    };
-                }
+                    if (format === "structure") {
+                        // GitHub-aware: shallow-clone repo instead of DOM walk
+                        const gh = matchGitHubRepo(params.url);
+                        if (gh) {
+                            try {
+                                const repoData = extractRepoStructure(
+                                    gh.owner,
+                                    gh.repo
+                                );
+                                return {
+                                    content: [
+                                        {
+                                            type: "text",
+                                            text: JSON.stringify(
+                                                repoData,
+                                                null,
+                                                2
+                                            ),
+                                        },
+                                    ],
+                                    details: {
+                                        format: "github-repo",
+                                        browser: "bridge",
+                                        tabId: tabId,
+                                        session,
+                                    },
+                                };
+                            } catch {
+                                // Clone failed — fall through to DOM extraction
+                            }
+                        }
 
-                throw new Error(`Unknown format: ${String(format)}`);
+                        await bridge.injectConverters(tabId, socketPath);
+                        const data = await bridge.evaluate(
+                            tabId,
+                            "JSON.stringify(window.__domToStructure())",
+                            socketPath
+                        );
+                        return {
+                            content: [{ type: "text", text: String(data) }],
+                            details: {
+                                format: "structure",
+                                browser: "bridge",
+                                tabId: tabId,
+                                session,
+                            },
+                        };
+                    }
+
+                    throw new Error(`Unknown format: ${String(format)}`);
+                } finally {
+                    if (incognitoWindowId !== undefined) {
+                        try {
+                            await bridge.closeWindow(
+                                incognitoWindowId,
+                                socketPath
+                            );
+                        } catch {
+                            // Best-effort cleanup — the original result
+                            // (or error) is what the caller cares about.
+                        }
+                    }
+                }
             }
 
             // ── AppleScript mode ───────────────────────────────────
@@ -509,7 +1111,7 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                     details: {
                         format,
                         browser: "applescript",
-                        tabId: params.tabId,
+                        tabId: params.tabId ?? 0,
                         consoleErrors: 0,
                     },
                 };
@@ -541,22 +1143,36 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             }
 
             // ── Isolated mode (default) ──────────────────────────────
-            const browser = await launchBrowser();
+            const browser = await getBrowser();
+            let page: PlaywrightPage | undefined;
             try {
-                const page = await createPage(browser);
+                page = await createPage(browser);
                 const consoleCollector = collectConsole(page);
-                await navigateTo(page, params.url, params.waitUntil);
+
+                // Import cookies from Pi Chrome Bridge if requested
+                if (params.cookies) {
+                    try {
+                        await importCookies(page.context(), params.url);
+                    } catch (err) {
+                        const msg =
+                            err instanceof Error ? err.message : String(err);
+                        console.warn(`[tau] Cookie import failed: ${msg}`);
+                    }
+                }
 
                 if (signal?.aborted) throw new Error("Cancelled");
 
-                return await extractPageContent(
+                return await navigateAndExtract(
                     page,
-                    { ...params, format },
+                    params.url,
+                    params.waitUntil ?? "domcontentloaded",
+                    format,
+                    { ...params },
                     consoleCollector,
                     "isolated"
                 );
             } finally {
-                await browser.close();
+                if (page) await page.close().catch(() => {});
             }
         },
     });
@@ -590,16 +1206,46 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                     default: true,
                 })
             ),
+            selector: Type.Optional(
+                Type.String({
+                    description:
+                        "CSS selector to screenshot a specific element. When set, only the matched element is captured.",
+                })
+            ),
             waitUntil: WAIT_UNTIL_PARAM,
             browser: Type.Optional(BROWSER_PARAM),
             tabId: TAB_ID_PARAM,
+            session: SESSION_PARAM,
         }),
         async execute(_toolCallId, params, signal) {
-            const browserMode = params.browser ?? "isolated";
+            if (!isFeatureEnabled(state, "web-browse")) {
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: "Web browsing is disabled — run /tau to enable",
+                        },
+                    ],
+                    details: undefined,
+                };
+            }
+            const browserMode = await resolveBrowserMode(
+                params.browser ?? "isolated",
+                "write"
+            );
+            const session = params.session;
 
             if (browserMode === "applescript") {
                 throw new Error(
                     "Screenshots are not supported in AppleScript mode. Use browser: 'bridge', 'cdp', or 'isolated'."
+                );
+            }
+
+            if (session === "fresh" && browserMode === "cdp") {
+                throw new Error(
+                    "session: 'fresh' is only supported in browser: 'bridge' mode. " +
+                        "browser: 'cdp' operates on the user's existing Chrome tabs and cannot open an isolated window. " +
+                        "Use browser: 'bridge' (default for the fresh session) or drop session: 'fresh'."
                 );
             }
 
@@ -613,36 +1259,67 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
 
                 let tabId = params.tabId;
                 let socketPath: string | undefined;
+                let incognitoWindowId: number | undefined;
 
-                if (tabId === undefined) {
+                if (session === "fresh") {
+                    // Open a new incognito window; any provided tabId is
+                    // ignored — session: 'fresh' always uses a fresh tab.
+                    const result = await bridge.newTabInIncognitoWindow(
+                        params.url
+                    );
+                    tabId = result.tabInfo.id;
+                    socketPath = result.socketPath;
+                    incognitoWindowId = result.windowId;
+                    await new Promise((r) => setTimeout(r, 3000));
+                } else if (tabId === undefined) {
                     const newTabResult = await bridge.newTab(params.url);
                     tabId = newTabResult.tabInfo.id;
                     socketPath = newTabResult.socketPath;
                     await new Promise((r) => setTimeout(r, 3000));
                 }
 
-                const path =
-                    params.outputPath ??
-                    join("/tmp", `screenshot-${Date.now()}.png`);
+                try {
+                    const path =
+                        params.outputPath ??
+                        join("/tmp", `screenshot-${Date.now()}.png`);
 
-                const base64Png = await bridge.screenshot(tabId, socketPath);
-                const buffer = Buffer.from(base64Png, "base64");
-                const dir = path.substring(0, path.lastIndexOf("/"));
-                if (dir) mkdirSync(dir, { recursive: true });
-                writeFileSync(path, buffer);
+                    const base64Png = await bridge.screenshot(
+                        tabId,
+                        socketPath
+                    );
+                    const buffer = Buffer.from(base64Png, "base64");
+                    const dir = path.substring(0, path.lastIndexOf("/"));
+                    if (dir) mkdirSync(dir, { recursive: true });
+                    writeFileSync(path, buffer);
 
-                return {
-                    content: [
-                        { type: "text", text: `Screenshot saved to: ${path}` },
-                    ],
-                    details: {
-                        path,
-                        browser: "bridge",
-                        tabId: tabId,
-                        consoleErrors: 0,
-                        url: params.url,
-                    },
-                };
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Screenshot saved to: ${path}`,
+                            },
+                        ],
+                        details: {
+                            path,
+                            browser: "bridge",
+                            tabId: tabId,
+                            consoleErrors: 0,
+                            url: params.url,
+                            session,
+                        },
+                    };
+                } finally {
+                    if (incognitoWindowId !== undefined) {
+                        try {
+                            await bridge.closeWindow(
+                                incognitoWindowId,
+                                socketPath
+                            );
+                        } catch {
+                            // Best-effort cleanup
+                        }
+                    }
+                }
             }
 
             // ── CDP mode ────────────────────────────────────────────
@@ -667,10 +1344,12 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                 const dir = path.substring(0, path.lastIndexOf("/"));
                 if (dir) mkdirSync(dir, { recursive: true });
 
-                await page.screenshot({
-                    path,
-                    fullPage: params.fullPage !== false,
-                });
+                await (params.selector
+                    ? page.locator(params.selector).screenshot({ path })
+                    : page.screenshot({
+                          path,
+                          fullPage: params.fullPage !== false,
+                      }));
 
                 return {
                     content: [
@@ -683,16 +1362,18 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                         path,
                         url: page.url(),
                         browser: "cdp",
-                        tabId: params.tabId,
+                        tabId: params.tabId ?? 0,
                         consoleErrors: 0,
+                        session: undefined,
                     },
                 };
             }
 
             // ── Isolated mode (default) ──────────────────────────────
-            const browser = await launchBrowser();
+            const browser = await getBrowser();
+            let page: PlaywrightPage | undefined;
             try {
-                const page = await createPage(browser);
+                page = await createPage(browser);
                 const consoleCollector = collectConsole(page);
                 await navigateTo(page, params.url, params.waitUntil);
 
@@ -704,10 +1385,12 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                 const dir = path.substring(0, path.lastIndexOf("/"));
                 if (dir) mkdirSync(dir, { recursive: true });
 
-                await page.screenshot({
-                    path,
-                    fullPage: params.fullPage !== false,
-                });
+                await (params.selector
+                    ? page.locator(params.selector).screenshot({ path })
+                    : page.screenshot({
+                          path,
+                          fullPage: params.fullPage !== false,
+                      }));
 
                 const errorCount = consoleCollector.messages.filter(
                     (m) => m.type === "error"
@@ -728,12 +1411,13 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                         path,
                         url: params.url,
                         browser: "isolated",
-                        tabId: params.tabId,
+                        tabId: params.tabId ?? 0,
                         consoleErrors: errorCount,
+                        session: undefined,
                     },
                 };
             } finally {
-                await browser.close();
+                if (page) await page.close().catch(() => {});
             }
         },
     });
@@ -779,6 +1463,7 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                         "console",
                         "evaluate",
                         "inject_script",
+                        "network",
                     ] as const),
                     selector: Type.Optional(
                         Type.String({ description: "CSS selector" })
@@ -831,14 +1516,38 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
             ),
             browser: Type.Optional(BROWSER_PARAM),
             tabId: TAB_ID_PARAM,
+            session: SESSION_PARAM,
         }),
         async execute(_toolCallId, params, signal) {
-            const browserMode = params.browser ?? "isolated";
+            if (!isFeatureEnabled(state, "web-browse")) {
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: "Web browsing is disabled — run /tau to enable",
+                        },
+                    ],
+                    details: undefined,
+                };
+            }
+            const browserMode = await resolveBrowserMode(
+                params.browser ?? "isolated",
+                "write"
+            );
             const returnFormat = params.returnFormat ?? "text";
+            const session = params.session;
 
             if (browserMode === "applescript") {
                 throw new Error(
                     "Interaction is not supported in AppleScript mode. Use browser: 'bridge', 'cdp', or 'isolated'."
+                );
+            }
+
+            if (session === "fresh" && browserMode === "cdp") {
+                throw new Error(
+                    "session: 'fresh' is only supported in browser: 'bridge' mode. " +
+                        "browser: 'cdp' operates on the user's existing Chrome tabs and cannot open an isolated window. " +
+                        "Use browser: 'bridge' (default for the fresh session) or drop session: 'fresh'."
                 );
             }
 
@@ -852,195 +1561,227 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
 
                 let tabId = params.tabId;
                 let socketPath: string | undefined;
-                if (tabId === undefined) {
+                let incognitoWindowId: number | undefined;
+
+                if (session === "fresh") {
+                    // Open a new incognito window; any provided tabId is
+                    // ignored — session: 'fresh' always uses a fresh tab.
+                    const result = await bridge.newTabInIncognitoWindow(
+                        params.url
+                    );
+                    tabId = result.tabInfo.id;
+                    socketPath = result.socketPath;
+                    incognitoWindowId = result.windowId;
+                    await new Promise((r) => setTimeout(r, 3000));
+                } else if (tabId === undefined) {
                     const newTabResult = await bridge.newTab(params.url);
                     tabId = newTabResult.tabInfo.id;
                     socketPath = newTabResult.socketPath;
                     await new Promise((r) => setTimeout(r, 3000));
                 }
 
-                const outputs: string[] = [];
+                try {
+                    const outputs: string[] = [];
 
-                for (const action of params.actions) {
-                    switch (action.type) {
-                        case "navigate":
-                            await bridge.navigate(
-                                tabId,
-                                action.url ?? params.url,
-                                socketPath
-                            );
-                            await new Promise((r) => setTimeout(r, 2000));
-                            break;
-                        case "click":
-                            await bridge.click(
-                                tabId,
-                                action.selector!,
-                                socketPath
-                            );
-                            await new Promise((r) => setTimeout(r, 1000));
-                            break;
-                        case "fill":
-                            await bridge.fill(
-                                tabId,
-                                action.selector!,
-                                action.value ?? "",
-                                socketPath
-                            );
-                            break;
-                        case "select":
-                            await bridge.selectOption(
-                                tabId,
-                                action.selector!,
-                                action.value ?? "",
-                                socketPath
-                            );
-                            break;
-                        case "press": {
-                            await bridge.pressKey(
-                                tabId,
-                                action.key!,
-                                action.selector,
-                                socketPath
-                            );
-                            break;
-                        }
-                        case "hover": {
-                            await bridge.hover(
-                                tabId,
-                                action.selector!,
-                                socketPath
-                            );
-                            await new Promise((r) => setTimeout(r, 500));
-                            break;
-                        }
-                        case "scroll": {
-                            await bridge.scroll(
-                                tabId,
-                                action.direction ?? "down",
-                                action.selector,
-                                undefined,
-                                socketPath
-                            );
-                            break;
-                        }
-                        case "wait": {
-                            if (action.selector) {
-                                const waited = await bridge.waitForElement(
+                    for (const action of params.actions) {
+                        switch (action.type) {
+                            case "navigate":
+                                await bridge.navigate(
                                     tabId,
-                                    action.selector,
-                                    action.ms,
+                                    action.url ?? params.url,
                                     socketPath
                                 );
-                                if (!waited.found)
-                                    outputs.push(
-                                        `Element not found: ${action.selector}`
-                                    );
-                            } else {
-                                await new Promise((r) =>
-                                    setTimeout(r, action.ms ?? 1000)
+                                await new Promise((r) => setTimeout(r, 2000));
+                                break;
+                            case "click":
+                                await bridge.click(
+                                    tabId,
+                                    action.selector!,
+                                    socketPath
                                 );
+                                await new Promise((r) => setTimeout(r, 1000));
+                                break;
+                            case "fill":
+                                await bridge.fill(
+                                    tabId,
+                                    action.selector!,
+                                    action.value ?? "",
+                                    socketPath
+                                );
+                                break;
+                            case "select":
+                                await bridge.selectOption(
+                                    tabId,
+                                    action.selector!,
+                                    action.value ?? "",
+                                    socketPath
+                                );
+                                break;
+                            case "press": {
+                                await bridge.pressKey(
+                                    tabId,
+                                    action.key!,
+                                    action.selector,
+                                    socketPath
+                                );
+                                break;
                             }
-                            break;
+                            case "hover": {
+                                await bridge.hover(
+                                    tabId,
+                                    action.selector!,
+                                    socketPath
+                                );
+                                await new Promise((r) => setTimeout(r, 500));
+                                break;
+                            }
+                            case "scroll": {
+                                await bridge.scroll(
+                                    tabId,
+                                    action.direction ?? "down",
+                                    action.selector,
+                                    undefined,
+                                    socketPath
+                                );
+                                break;
+                            }
+                            case "wait": {
+                                if (action.selector) {
+                                    const waited = await bridge.waitForElement(
+                                        tabId,
+                                        action.selector,
+                                        action.ms,
+                                        socketPath
+                                    );
+                                    if (!waited.found)
+                                        outputs.push(
+                                            `Element not found: ${action.selector}`
+                                        );
+                                } else {
+                                    await new Promise((r) =>
+                                        setTimeout(r, action.ms ?? 1000)
+                                    );
+                                }
+                                break;
+                            }
+                            case "evaluate": {
+                                const expr =
+                                    action.expression ?? action.value ?? "";
+                                const result = await bridge.evaluate(
+                                    tabId,
+                                    expr,
+                                    socketPath
+                                );
+                                outputs.push(
+                                    `Evaluate result: ${String(result)}`
+                                );
+                                break;
+                            }
+                            case "extract": {
+                                const attrs = await bridge.getAttributes(
+                                    tabId,
+                                    action.selector!,
+                                    undefined,
+                                    socketPath
+                                );
+                                outputs.push(JSON.stringify(attrs, null, 2));
+                                break;
+                            }
+                            case "content": {
+                                const text = await bridge.getTabText(
+                                    tabId,
+                                    undefined,
+                                    socketPath
+                                );
+                                outputs.push(text);
+                                break;
+                            }
+                            case "screenshot": {
+                                const path =
+                                    action.path ??
+                                    join(
+                                        "/tmp",
+                                        `screenshot-${Date.now()}.png`
+                                    );
+                                const base64Png = await bridge.screenshot(
+                                    tabId,
+                                    socketPath
+                                );
+                                writeFileSync(
+                                    path,
+                                    Buffer.from(base64Png, "base64")
+                                );
+                                outputs.push(`Screenshot saved: ${path}`);
+                                break;
+                            }
+                            default:
+                                outputs.push(
+                                    `(Action '${action.type}' not yet supported in bridge mode)`
+                                );
                         }
-                        case "evaluate": {
-                            const expr =
-                                action.expression ?? action.value ?? "";
-                            const result = await bridge.evaluate(
+                    }
+
+                    let finalContent: string;
+                    if (returnFormat === "markdown") {
+                        finalContent = String(
+                            await bridge.evaluate(
                                 tabId,
-                                expr,
+                                "(() => { if (typeof window.__domToMarkdown !== 'function') return document.body.innerText; return window.__domToMarkdown(); })()",
+                                socketPath
+                            )
+                        );
+                    } else if (returnFormat === "structure") {
+                        finalContent = String(
+                            await bridge.evaluate(
+                                tabId,
+                                "(() => { if (typeof window.__domToStructure !== 'function') return JSON.stringify({error:'Converters not injected'}); return JSON.stringify(window.__domToStructure()); })()",
+                                socketPath
+                            )
+                        );
+                    } else {
+                        finalContent = await bridge.getTabText(
+                            tabId,
+                            undefined,
+                            socketPath
+                        );
+                    }
+
+                    const parts = outputs.join("\n\n");
+                    const fullText = parts
+                        ? `${parts}\n\n---\n\n${finalContent}`
+                        : finalContent;
+
+                    return {
+                        content: [{ type: "text", text: fullText }],
+                        details: {
+                            url: params.url,
+                            actionCount: params.actions.length,
+                            returnFormat,
+                            browser: "bridge",
+                            tabId: tabId,
+                            consoleErrors: 0,
+                            session,
+                        },
+                    };
+                } finally {
+                    if (incognitoWindowId !== undefined) {
+                        try {
+                            await bridge.closeWindow(
+                                incognitoWindowId,
                                 socketPath
                             );
-                            outputs.push(`Evaluate result: ${String(result)}`);
-                            break;
+                        } catch {
+                            // Best-effort cleanup
                         }
-                        case "extract": {
-                            const attrs = await bridge.getAttributes(
-                                tabId,
-                                action.selector!,
-                                undefined,
-                                socketPath
-                            );
-                            outputs.push(JSON.stringify(attrs, null, 2));
-                            break;
-                        }
-                        case "content": {
-                            const text = await bridge.getTabText(
-                                tabId,
-                                undefined,
-                                socketPath
-                            );
-                            outputs.push(text);
-                            break;
-                        }
-                        case "screenshot": {
-                            const path =
-                                action.path ??
-                                join("/tmp", `screenshot-${Date.now()}.png`);
-                            const base64Png = await bridge.screenshot(
-                                tabId,
-                                socketPath
-                            );
-                            writeFileSync(
-                                path,
-                                Buffer.from(base64Png, "base64")
-                            );
-                            outputs.push(`Screenshot saved: ${path}`);
-                            break;
-                        }
-                        default:
-                            outputs.push(
-                                `(Action '${action.type}' not yet supported in bridge mode)`
-                            );
                     }
                 }
-
-                let finalContent: string;
-                if (returnFormat === "markdown") {
-                    finalContent = String(
-                        await bridge.evaluate(
-                            tabId,
-                            "(() => { if (typeof window.__domToMarkdown !== 'function') return document.body.innerText; return window.__domToMarkdown(); })()",
-                            socketPath
-                        )
-                    );
-                } else if (returnFormat === "structure") {
-                    finalContent = String(
-                        await bridge.evaluate(
-                            tabId,
-                            "(() => { if (typeof window.__domToStructure !== 'function') return JSON.stringify({error:'Converters not injected'}); return JSON.stringify(window.__domToStructure()); })()",
-                            socketPath
-                        )
-                    );
-                } else {
-                    finalContent = await bridge.getTabText(
-                        tabId,
-                        undefined,
-                        socketPath
-                    );
-                }
-
-                const parts = outputs.join("\n\n");
-                const fullText = parts
-                    ? `${parts}\n\n---\n\n${finalContent}`
-                    : finalContent;
-
-                return {
-                    content: [{ type: "text", text: fullText }],
-                    details: {
-                        url: params.url,
-                        actionCount: params.actions.length,
-                        returnFormat,
-                        browser: "bridge",
-                        tabId: tabId,
-                        consoleErrors: 0,
-                    },
-                };
             }
 
             // ── CDP mode ────────────────────────────────────────────
             if (browserMode === "cdp") {
                 const page = await resolveCDPPage(params.tabId, signal);
                 const consoleCollector = collectConsole(page);
+                const networkCollector = collectNetwork(page);
 
                 if (params.url && params.url !== "about:blank") {
                     const currentUrl = page.url();
@@ -1056,7 +1797,8 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                     page,
                     params.actions,
                     consoleCollector,
-                    signal
+                    signal,
+                    networkCollector
                 );
 
                 if (signal?.aborted) throw new Error("Cancelled");
@@ -1078,26 +1820,30 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                         actionCount: params.actions.length,
                         returnFormat,
                         browser: "cdp",
-                        tabId: params.tabId,
+                        tabId: params.tabId ?? 0,
                         consoleErrors: consoleCollector.messages.filter(
                             (m) => m.type === "error"
                         ).length,
+                        session: undefined,
                     },
                 };
             }
 
             // ── Isolated mode (default) ──────────────────────────────
-            const browser = await launchBrowser();
+            const browser = await getBrowser();
+            let page: PlaywrightPage | undefined;
             try {
-                const page = await createPage(browser);
+                page = await createPage(browser);
                 const consoleCollector = collectConsole(page);
+                const networkCollector = collectNetwork(page);
                 await navigateTo(page, params.url, params.waitUntil);
 
                 const outputs = await executeActions(
                     page,
                     params.actions,
                     consoleCollector,
-                    signal
+                    signal,
+                    networkCollector
                 );
 
                 if (signal?.aborted) throw new Error("Cancelled");
@@ -1119,14 +1865,15 @@ export function registerWebBrowse(pi: ExtensionAPI): void {
                         actionCount: params.actions.length,
                         returnFormat,
                         browser: "isolated",
-                        tabId: params.tabId,
+                        tabId: params.tabId ?? 0,
                         consoleErrors: consoleCollector.messages.filter(
                             (m) => m.type === "error"
                         ).length,
+                        session: undefined,
                     },
                 };
             } finally {
-                await browser.close();
+                if (page) await page.close().catch(() => {});
             }
         },
     });
@@ -1147,6 +1894,27 @@ async function extractPageContent(
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
 }> {
+    // PDF detection — extract text from PDFs instead of DOM walking
+    if (await isPdfPage(page)) {
+        const text = await getPdfText(page);
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: appendConsoleLog(text, consoleCollector),
+                },
+            ],
+            details: {
+                format: "pdf",
+                url: params.url,
+                browser: browserMode,
+                consoleErrors: consoleCollector.messages.filter(
+                    (m) => m.type === "error"
+                ).length,
+            },
+        };
+    }
+
     switch (params.format) {
         case "markdown": {
             const md: string = await page.evaluate(() =>
@@ -1170,6 +1938,30 @@ async function extractPageContent(
             };
         }
         case "structure": {
+            // GitHub-aware: shallow-clone repo instead of DOM walk
+            const gh = matchGitHubRepo(params.url);
+            if (gh) {
+                try {
+                    const repoData = extractRepoStructure(gh.owner, gh.repo);
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify(repoData, null, 2),
+                            },
+                        ],
+                        details: {
+                            format: "github-repo",
+                            url: params.url,
+                            browser: browserMode,
+                            consoleErrors: 0,
+                        },
+                    };
+                } catch {
+                    // Clone failed — fall through to DOM extraction
+                }
+            }
+
             const data: unknown = await page.evaluate(() =>
                 window.__domToStructure()
             );
@@ -1277,7 +2069,8 @@ async function executeActions(
         expression?: string;
     }>,
     consoleCollector: ConsoleCollector,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    networkCollector?: NetworkCollector
 ): Promise<string[]> {
     const outputs: string[] = [];
 
@@ -1384,6 +2177,22 @@ async function executeActions(
                 } else if (inlineScript) {
                     await page.addScriptTag({ content: inlineScript });
                     outputs.push("Injected inline script");
+                }
+                break;
+            }
+            case "network": {
+                if (!networkCollector) {
+                    outputs.push(
+                        "(Network capture not available in this browser mode)"
+                    );
+                    break;
+                }
+                const urlPattern = action.value || undefined;
+                const filtered = networkCollector.getFiltered(urlPattern);
+                if (filtered.length === 0) {
+                    outputs.push("(no network requests captured)");
+                } else {
+                    outputs.push(formatNetworkEntries(filtered, true));
                 }
                 break;
             }

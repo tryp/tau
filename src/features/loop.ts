@@ -4,6 +4,7 @@
  * Parses the first token to determine loop mode:
  *
  *   /loop 5 do something         — run 5 times, then stop
+ *   /loop 5                      — run 5 times (prompt inferred from context)
  *   /loop 5m do something        — run every 5 minutes
  *   /loop 2h check the deploy    — run every 2 hours
  *   /loop do something           — infinite loop (proactive mode)
@@ -29,6 +30,8 @@ import type {
     SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
+import type { TauState } from "../state.ts";
+import { isFeatureEnabled } from "./features-helpers.ts";
 
 // --- Constants ---
 
@@ -219,7 +222,7 @@ export function parseLoopArgs(input: string): ParsedLoop {
 
     // Check if first token is a plain integer (count)
     const countMatch = tokens[0].match(/^(\d+)$/);
-    if (countMatch && tokens.length > 1) {
+    if (countMatch) {
         return {
             mode: { kind: "count", count: parseInt(countMatch[1], 10) },
             prompt: tokens.slice(1).join(" "),
@@ -435,15 +438,46 @@ export function truncatePrompt(text: string): string {
 
 // --- Feature registration ---
 
-export function registerLoop(pi: ExtensionAPI): void {
+export function registerLoop(pi: ExtensionAPI, state: TauState): void {
     const loops: LoopEntry[] = [];
     let nextId = 1;
 
+    // Track whether the agent is currently processing a turn. Updated via
+    // agent_start/agent_end events. Used by emitTick to decide whether to pass
+    // deliverAs: "followUp" (when the agent is busy) or trigger a new turn
+    // directly (when the agent is idle). The previous unconditional
+    // deliverAs was safe in this SDK version, but tracking the state
+    // explicitly matches the goal feature's pattern and guards against
+    // future SDK changes where deliverAs might be respected even when idle.
+    let isAgentIdle = true;
+
+    pi.on("agent_start", () => {
+        isAgentIdle = false;
+    });
+
+    pi.on("agent_end", () => {
+        // agent_end fires while the agent is still streaming (isStreaming
+        // stays true until finishRun runs in the finally block). Defer the
+        // state update so it reflects the post-finish state.
+        setTimeout(() => {
+            isAgentIdle = true;
+        }, 0);
+    });
+
+    function sendTick(msg: string): void {
+        if (isAgentIdle) {
+            // Agent is idle: trigger a new turn directly.
+            pi.sendUserMessage(msg);
+        } else {
+            // Agent is busy: queue as a follow-up so it runs after the
+            // current turn completes.
+            pi.sendUserMessage(msg, { deliverAs: "followUp" });
+        }
+    }
+
     function emitTick(entry: LoopEntry): void {
         entry.lastTickAt = new Date();
-        pi.sendUserMessage(buildTickMessage(entry.prompt, entry.lastTickAt), {
-            deliverAs: "followUp",
-        });
+        sendTick(buildTickMessage(entry.prompt, entry.lastTickAt));
     }
 
     function startLoop(parsed: ParsedLoop): LoopEntry {
@@ -536,6 +570,7 @@ export function registerLoop(pi: ExtensionAPI): void {
     // --- Event handlers ---
 
     pi.on("session_start", async () => {
+        if (!isFeatureEnabled(state, "loop")) return;
         stopAll();
         nextId = 1;
     });
@@ -644,7 +679,10 @@ You will receive periodic <${TICK_TAG}> prompts. These are check-ins: continue w
             const msg = buildTickMessage(loop.prompt, loop.lastTickAt);
             loop.pendingTick = setTimeout(() => {
                 loop.pendingTick = null;
-                pi.sendUserMessage(msg, { deliverAs: "followUp" });
+                // By TICK_DELAY_MS (500ms) the agent has finished its current
+                // turn, so sendTick will trigger a new turn rather than
+                // queueing as a follow-up.
+                sendTick(msg);
             }, TICK_DELAY_MS);
         }
     });
@@ -781,6 +819,8 @@ You will receive periodic <${TICK_TAG}> prompts. These are check-ins: continue w
     pi.registerShortcut("ctrl+l", {
         description: "Open loop manager",
         handler: async (_ctx) => {
+            if (!isFeatureEnabled(state, "loop")) return;
+
             // Shortcuts receive ExtensionContext, not ExtensionCommandContext.
             // We can't open the full TUI from here without a command context.
             // Instead, show a notification summary.
@@ -808,6 +848,11 @@ You will receive periodic <${TICK_TAG}> prompts. These are check-ins: continue w
         description:
             'Loop a prompt: count (5), duration (5m), cron (*/5 * * * *), or infinite (no prefix). Flags: --completion-promise[="text"]',
         handler: async (args, ctx: ExtensionCommandContext) => {
+            if (!isFeatureEnabled(state, "loop")) {
+                ctx.ui.notify("Loop is disabled — run /tau to enable", "info");
+                return;
+            }
+
             const trimmed = args.trim().toLowerCase();
 
             if (trimmed === "list") {

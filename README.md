@@ -56,10 +56,14 @@ Background tasks, notifications, plan mode, presets, and other enhancements for 
 
 - `/session-name [name]` — set a friendly name that appears in the session selector
 
-### Claude Rules
+### Instructions
 
-- Automatically scans `.claude/rules/*.md` (recursively) and injects the list into the system prompt
+- Automatically scans `.agents/rules/*.md` and `.claude/rules/*.md` (recursively) and injects them into the system prompt
+- Also loads `AGENTS.md` / `CLAUDE.md` (and `*.local.md` variants), `.agents/AGENTS.md`, `.claude/CLAUDE.md`
+- Walks from cwd up to root, with `~/.agents/rules/` and `~/.claude/rules/` as global fallbacks
+- Both `.agents/` and `.claude/` are walked; `.agents/` wins on canonical-name conflict
 - The agent can `read` specific rule files when relevant
+- Memory: `MEMORY.md` from `.agents/memory/` or `.claude/memory/` is auto-loaded (when present); topic files are read on demand
 
 ### Custom Footer
 
@@ -106,6 +110,42 @@ Background tasks, notifications, plan mode, presets, and other enhancements for 
 - Playwright-core is optional — only needed for isolated and CDP modes
 - Chrome extension + native messaging bridge included for zero-prompt tab access
 
+### Feature Toggles
+
+All tau features can be toggled on or off via the `/tau` command with six configuration scopes:
+
+```
+/tau features                              # open TUI overlay
+/tau features set <id> on|off --scope <s>  # disable or enable a feature
+/tau features get <id>                     # show effective value and source
+/tau features unset <id> --scope <s>       # clear override, fall through to layer below
+```
+
+| Scope | Storage | Survives reload? | Survives session? |
+|-------|----------|-------------------|--------------------|
+| `temporary` | in-memory | no | no |
+| `thread` | session branch entry | yes (per branch) | no |
+| `session` | in-memory | no | no |
+| `cwd` | `cwd/.pi/settings.json` | yes | yes |
+| `project` | nearest `.pi/settings.json` walking up to git root | yes | yes |
+| `global` | `~/.pi/agent/settings.json` | yes | yes |
+
+Features default to on. The TUI shows the source layer for each feature's current value.
+
+On-disk format in `.pi/settings.json`:
+
+```json
+{
+  "tau": {
+    "features": {
+      "bookmark": false
+    }
+  }
+}
+```
+
+Some features (instructions, git-checkpoint) bootstrap at session start; toggling them at runtime requires `/reload` to take full effect. The TUI flags these with a reload indicator.
+
 ## Tools
 
 | Tool | Purpose |
@@ -138,6 +178,7 @@ Background tasks, notifications, plan mode, presets, and other enhancements for 
 | `/preset [name]` | Switch preset configuration |
 | `/handoff <goal>` | Transfer context to a new focused session |
 | `/summarize` | Summarise the current conversation |
+| `/tau` | Toggle features: set, get, unset, or open TUI |
 
 ## Shortcuts
 
@@ -174,7 +215,7 @@ src/
     tools-selector.ts   /tools command, state persistence
     notifications.ts    /notifications, agent_end notification, DnD support
     bookmark.ts         /bookmark, /unbookmark
-    claude-rules.ts     .claude/rules/ scanning
+    context-files.ts    project instructions, rules, and memory loading
     custom-footer.ts    /footer command
     git-checkpoint.ts   git stash checkpointing
     github-autocomplete.ts  # issue autocomplete
