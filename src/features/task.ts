@@ -370,7 +370,9 @@ const TaskParams = Type.Object({
         "move",
         "link",
         "unlink",
-    ] as const),
+    ] as const, {
+        description: "Action to perform",
+    }),
     title: Type.Optional(
         Type.String({ description: "Task title (for add, update)" })
     ),
