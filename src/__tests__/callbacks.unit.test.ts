@@ -11,6 +11,8 @@ import {
     formatRelative,
     registerCallbacks,
     hasLinkedCallbacksForJob,
+    cancelCallbacksForJob,
+    scheduleJobReminder,
 } from "../features/callbacks.ts";
 import { TauState } from "../state.ts";
 import type { BackgroundJob } from "../types.ts";
@@ -478,5 +480,234 @@ void describe("wantsCompletionNotification flag", () => {
 
         assert.equal(job.wantsCompletionNotification, true,
             "flag must survive callback delivery so flushCompletionBatch can read it later");
+    });
+});
+
+// ─── cancelCallbacksForJob ───────────────────────────────────────────
+
+void describe("cancelCallbacksForJob", () => {
+    void it("cancels all linked callbacks for the given job", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const job = makeJob({ id: "job-cancel-1", status: "running" });
+        state.backgroundJobs.set(job.id, job);
+
+        await h.invoke("agent_start");
+
+        // Schedule two linked callbacks for the same job
+        const remind = h.getRemindTool();
+        await remind.execute(
+            "tc-1",
+            { message: "check 1", delay: "30s", jobId: "job-cancel-1" },
+            null,
+            null,
+            null
+        );
+        await remind.execute(
+            "tc-2",
+            { message: "check 2", delay: "60s", jobId: "job-cancel-1" },
+            null,
+            null,
+            null
+        );
+
+        assert.equal(
+            hasLinkedCallbacksForJob("job-cancel-1"),
+            true,
+            "linked callbacks exist before cancellation"
+        );
+
+        const count = cancelCallbacksForJob("job-cancel-1");
+
+        assert.equal(count, 2, "should cancel both linked callbacks");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-cancel-1"),
+            false,
+            "no linked callbacks remain after cancellation"
+        );
+    });
+
+    void it("returns 0 when no callbacks are linked to the job", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const count = cancelCallbacksForJob("job-nonexistent");
+        assert.equal(count, 0, "no callbacks cancelled for unrelated job");
+    });
+
+    void it("only cancels callbacks for the specified job, not others", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const jobA = makeJob({ id: "job-cancel-a", status: "running" });
+        const jobB = makeJob({ id: "job-cancel-b", status: "running" });
+        state.backgroundJobs.set(jobA.id, jobA);
+        state.backgroundJobs.set(jobB.id, jobB);
+
+        await h.invoke("agent_start");
+
+        const remind = h.getRemindTool();
+        await remind.execute(
+            "tc-1",
+            { message: "check A", delay: "30s", jobId: "job-cancel-a" },
+            null,
+            null,
+            null
+        );
+        await remind.execute(
+            "tc-2",
+            { message: "check B", delay: "30s", jobId: "job-cancel-b" },
+            null,
+            null,
+            null
+        );
+
+        const count = cancelCallbacksForJob("job-cancel-a");
+
+        assert.equal(count, 1, "only the callback for job A should be cancelled");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-cancel-a"),
+            false,
+            "job A has no remaining callbacks"
+        );
+        assert.equal(
+            hasLinkedCallbacksForJob("job-cancel-b"),
+            true,
+            "job B still has its callback"
+        );
+    });
+
+    void it("removes already-fired callbacks from the map and returns count", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const job = makeJob({ id: "job-cancel-fired", status: "running" });
+        state.backgroundJobs.set(job.id, job);
+
+        await h.invoke("agent_start");
+
+        // Schedule a callback that fires quickly
+        const remind = h.getRemindTool();
+        await remind.execute(
+            "tc-1",
+            { message: "fast check", delay: "0.001s", jobId: "job-cancel-fired" },
+            null,
+            null,
+            null
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // The callback has fired (cb.fired = true) but is still in the map
+        // so cancel/cancel-all can suppress it before delivery.
+        // cancelCallbacksForJob removes it from the map regardless.
+        const count = cancelCallbacksForJob("job-cancel-fired");
+        assert.equal(count, 1, "fired callback is still in the map and gets removed");
+
+        assert.equal(
+            hasLinkedCallbacksForJob("job-cancel-fired"),
+            false,
+            "callback is gone after cancellation"
+        );
+    });
+});
+
+// ─── scheduleJobReminder ─────────────────────────────────────────────
+
+void describe("scheduleJobReminder", () => {
+    void it("returns a callback ID for a valid remindIn duration", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const id = scheduleJobReminder("job-sched-1", "30s", "check job");
+        assert.ok(id, "should return a callback ID");
+        assert.ok(id?.startsWith("cb-"), "callback ID should start with 'cb-'");
+    });
+
+    void it("returns null for an invalid remindIn duration", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const id = scheduleJobReminder("job-sched-invalid", "not-a-duration");
+        assert.equal(id, null, "invalid duration should return null");
+    });
+
+    void it("creates a callback that hasLinkedCallbacksForJob can find", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const id = scheduleJobReminder("job-sched-2", "60s");
+        assert.ok(id, "should create a callback");
+
+        assert.equal(
+            hasLinkedCallbacksForJob("job-sched-2"),
+            true,
+            "the newly created callback should be findable"
+        );
+    });
+
+    void it("uses the default message when none is provided", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const id = scheduleJobReminder("job-sched-3", "30s");
+        assert.ok(id, "should create a callback without explicit message");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-sched-3"),
+            true,
+            "callback exists with default message"
+        );
+    });
+
+    void it("creates a callback cancellable by cancelCallbacksForJob", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        const id = scheduleJobReminder("job-sched-4", "120s", "long wait");
+        assert.ok(id, "should create a callback");
+
+        assert.equal(
+            hasLinkedCallbacksForJob("job-sched-4"),
+            true,
+            "callback exists before cancellation"
+        );
+
+        const count = cancelCallbacksForJob("job-sched-4");
+        assert.equal(count, 1, "should cancel the scheduled callback");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-sched-4"),
+            false,
+            "callback is gone after cancellation"
+        );
+    });
+
+    void it("does not create callback for jobs with non-existent IDs", () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+
+        // scheduleJobReminder should succeed even if the job doesn't exist
+        // in state — it's a fire-and-forget linked callback
+        const id = scheduleJobReminder("job-ghost", "30s", "ghost check");
+        assert.ok(id, "should create callback regardless of job existence in state");
+
+        assert.equal(
+            hasLinkedCallbacksForJob("job-ghost"),
+            true,
+            "callback exists even for ghost job"
+        );
     });
 });

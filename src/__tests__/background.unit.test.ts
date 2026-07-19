@@ -6,6 +6,7 @@ import {
     lookupJob,
     startTimeoutTimer,
     notifyCompletion,
+    clearJobFromCompletionBatch,
     clearAllCompletionBatches,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
@@ -887,5 +888,125 @@ void describe("job cleanup after completion", () => {
             }
         }
         assert.equal(state.recentTerminalJobs.length, 20);
+    });
+});
+
+// ─── clearJobFromCompletionBatch ───────────────────────────────────────
+
+void describe("clearJobFromCompletionBatch", () => {
+    void it("removes a pending job from the batch and suppresses only its delivery", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+
+        const job1 = makeJob({
+            id: "job-batch-1",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+        const job2 = makeJob({
+            id: "job-batch-2",
+            status: "failed",
+            exitCode: 1,
+        });
+        state.backgroundJobs.set(job1.id, job1);
+        state.backgroundJobs.set(job2.id, job2);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job1, state, pi, ctx);
+        notifyCompletion(job2, state, pi, ctx);
+        flushDebounce(state);
+
+        // Remove job1 (completed, linked-callback) from the batch
+        clearJobFromCompletionBatch(job1.id);
+
+        handlers.get("agent_end")?.();
+
+        // Only job2 (failed) should have been delivered — job1 was removed
+        assert.equal(sent.length, 1, "only the failed job should be delivered");
+        if (sent.length > 0) {
+            const msg = sent[0].message as Record<string, unknown>;
+            assert.match(
+                String(msg.content),
+                /job-batch-2/,
+                "delivered message should reference the remaining failed job"
+            );
+            assert.doesNotMatch(
+                String(msg.content),
+                /job-batch-1/,
+                "delivered message should NOT reference the removed job"
+            );
+        }
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("removing the last job cancels the batch timer", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+
+        const job = makeJob({
+            id: "job-batch-3",
+            status: "failed",
+            exitCode: 1,
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job, state, pi, ctx);
+        flushDebounce(state);
+
+        // Remove the only job
+        clearJobFromCompletionBatch(job.id);
+
+        handlers.get("agent_end")?.();
+
+        // Nothing should be delivered since the batch was emptied
+        assert.equal(sent.length, 0, "no delivery when the only job is removed");
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("removes jobs from pendingCompletionDeliveries", async () => {
+        clearAllCompletionBatches();
+        const state = new TauState();
+        const { sent, handlers, ctx, pi } = completionHarness(state);
+
+        const job1 = makeJob({
+            id: "job-batch-4",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+        const job2 = makeJob({
+            id: "job-batch-5",
+            status: "failed",
+            exitCode: 1,
+        });
+        state.backgroundJobs.set(job1.id, job1);
+        state.backgroundJobs.set(job2.id, job2);
+
+        handlers.get("agent_start")?.();
+        notifyCompletion(job1, state, pi, ctx);
+        notifyCompletion(job2, state, pi, ctx);
+        flushDebounce(state);
+
+        // Remove the failed job — the completed job has no linked callbacks,
+        // so the pending delivery should be pruned entirely
+        clearJobFromCompletionBatch(job2.id);
+
+        // Force agent_end to try delivery
+        handlers.get("agent_end")?.();
+
+        // With both jobs removed or their completion suppressed,
+        // nothing should be delivered
+        assert.equal(sent.length, 0, "no delivery when all jobs are removed or suppressed");
+        handlers.get("session_shutdown")?.();
+    });
+
+    void it("is a no-op for a job not in the batch", () => {
+        clearAllCompletionBatches();
+        // Should not throw
+        clearJobFromCompletionBatch("job-nonexistent");
     });
 });
