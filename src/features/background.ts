@@ -6,13 +6,371 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import type {
-    AgentToolResult,
-    AgentToolUpdateCallback,
-} from "@earendil-works/pi-agent-core";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+
+// ─── Context sidecar integration ────────────────────────────────────
+
+/**
+ * Hard cap on stored output per job (bytes).
+ */
+const SIDECAR_MAX_BYTES = 512 * 1024;
+
+/** Default age (days) for purging sidecar entries at startup. */
+const SIDECAR_PURGE_AGE_DAYS = 10;
+
+/**
+ * Build the path to the context sidecar's SQLite database.
+ */
+function sidecarDbPath(): string {
+    const agentDir =
+        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    return join(agentDir, "context.db");
+}
+
+/**
+ * Purge sidecar entries older than `ageDays` days. Runs at startup to
+ * prevent unbounded growth. Scoped to bash_bg entries since that's what
+ * pi-tau owns.
+ */
+export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
+    const dbPath = sidecarDbPath();
+    if (!existsSync(dbPath)) return;
+
+    const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
+
+    try {
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+        try {
+            // Select IDs to delete so we can log the count
+            const toDelete = db
+                .prepare(
+                    `SELECT id FROM context_sources
+                     WHERE tool_name = 'bash_bg'
+                       AND created_at < ?`
+                )
+                .all(cutoff) as { id: string }[];
+
+            if (toDelete.length === 0) {
+                return;
+            }
+
+            // Delete chunks first (FTS triggers fire properly), then sources.
+            // Use chunked batches to keep the WAL manageable.
+            const ids = toDelete.map((r) => r.id);
+            const batchSize = 100;
+            for (let i = 0; i < ids.length; i += batchSize) {
+                const batch = ids.slice(i, i + batchSize);
+                const placeholders = batch.map(() => "?").join(",");
+
+                db.prepare(
+                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
+                ).run(...batch);
+
+                db.prepare(
+                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
+                ).run(...batch);
+            }
+
+            // VACUUM to reclaim free pages (fast at startup — no concurrent
+            // readers). For DBs with thousands of old entries this may take
+            // ~100-500ms; acceptable at startup where overall init time is
+            // dominated by model loading, not DB maintenance.
+            db.prepare("VACUUM").run();
+
+            // Minimal logging — visible in pi startup output
+            console.error(
+                `[tau] purged ${toDelete.length} sidecar entries older than ${ageDays} days, ` +
+                `VACUUM reclaimed freed space`
+            );
+        } finally {
+            db.close();
+        }
+    } catch (err) {
+        console.error(
+            `[tau] sidecar purge failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+    }
+}
+
+/**
+ * Look up a completed job's output from the context sidecar by job ID.
+ * Returns the concatenated chunk content, or null if not found.
+ */
+export async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
+    const dbPath = sidecarDbPath();
+    if (!existsSync(dbPath)) return null;
+
+    try {
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+        try {
+            // Check if the source table exists
+            const tableCheck = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
+                )
+                .get();
+            if (!tableCheck) {
+                return null;
+            }
+
+            // Find source by jobId in input_summary, also get input_summary
+            // for the log path reference.
+            const source = db
+                .prepare(
+                    `SELECT id, input_summary FROM context_sources
+                     WHERE tool_name = 'bash_bg'
+                       AND json_extract(input_summary, '$.jobId') = ?
+                     LIMIT 1`
+                )
+                .get(jobId) as { id: string; input_summary: string } | undefined;
+
+            if (!source) {
+                return null;
+            }
+
+            // Extract logPath from input_summary for the reference line
+            let logPathRef = "";
+            try {
+                const summary = JSON.parse(source.input_summary);
+                if (summary.logPath) {
+                    logPathRef = `Log: ${summary.logPath}\n\n`;
+                }
+            } catch {
+                // old records may lack logPath; skip
+            }
+
+            // Read all chunks for this source, ordered by ordinal
+            const chunks = db
+                .prepare(
+                    `SELECT content FROM context_chunks
+                     WHERE source_id = ?
+                     ORDER BY ordinal ASC`
+                )
+                .all(source.id) as { content: string }[];
+
+            if (chunks.length === 0) return null;
+            return logPathRef + chunks.map((c) => c.content).join("\n\n");
+        } finally {
+            db.close();
+        }
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
+ */
+export function chunkText(
+    text: string,
+    sourceId: string
+): {
+    id: string;
+    sourceId: string;
+    ordinal: number;
+    title: string;
+    content: string;
+    byteCount: number;
+}[] {
+    const paragraphs = text.split(/\n{2,}/);
+    const chunks: string[] = [];
+    let current = "";
+    const targetBytes = 4096;
+
+    for (const paragraph of paragraphs) {
+        if (Buffer.byteLength(paragraph, "utf8") > targetBytes) {
+            if (current) chunks.push(current);
+            // Split large paragraph by lines
+            for (const line of paragraph.split("\n")) {
+                const next = current ? `${current}\n${line}` : line;
+                if (Buffer.byteLength(next, "utf8") <= targetBytes) {
+                    current = next;
+                } else {
+                    if (current) chunks.push(current);
+                    current = line;
+                }
+            }
+            current = "";
+            continue;
+        }
+        const next = current ? `${current}\n\n${paragraph}` : paragraph;
+        if (Buffer.byteLength(next, "utf8") > targetBytes && current) {
+            chunks.push(current);
+            current = paragraph;
+        } else {
+            current = next;
+        }
+    }
+    if (current) chunks.push(current);
+    if (chunks.length === 0) chunks.push(text);
+
+    return chunks.map((content, index) => ({
+        id: `${sourceId}_${String(index + 1).padStart(4, "0")}`,
+        sourceId,
+        ordinal: index + 1,
+        title:
+            content
+                .split("\n")
+                .find((l) => l.trim())
+                ?.trim() ?? "(empty)",
+        content,
+        byteCount: Buffer.byteLength(content, "utf8"),
+    }));
+}
+
+/**
+ * Build a short preview from the first content lines.
+ */
+function makePreview(text: string): string {
+    const lines = text.split("\n");
+    const previewLines = lines.slice(0, 40);
+    let result = previewLines.join("\n");
+    if (Buffer.byteLength(result, "utf8") > 4096) {
+        result = Buffer.from(result, "utf8").subarray(0, 4096).toString("utf8");
+    }
+    if (lines.length > 40) result += "\n...";
+    return result;
+}
+
+/**
+ * Index a completed job's output into the context sidecar SQLite database.
+ *
+ * Writes directly to the sidecar's context.db using the same schema so that
+ * context_search / context_get / context_list can find the data.  Skips
+ * silently if the DB or the sidecar tables don't exist (sidecar not loaded).
+ *
+ * Only stores output exceeding ~24 KiB / 300 lines to avoid bloating the
+ * index with trivial results (matching the sidecar's own filtering).
+ */
+export async function indexJobOutputInSidecar(
+    job: BackgroundJob,
+    ctx: {
+        cwd?: string;
+        sessionManager?: {
+            getSessionFile?: () => string | null;
+            getSessionId?: () => string | null;
+        };
+    }
+): Promise<void> {
+    try {
+        const text = await readFile(job.logPath, "utf-8").catch(() => "");
+        if (!text) return;
+
+        // Check output size before indexing
+        const bytes = Buffer.byteLength(text, "utf8");
+        const lines = text.split("\n").length;
+        if (bytes > SIDECAR_MAX_BYTES) return;
+
+        const sessionId =
+            ctx?.sessionManager?.getSessionFile?.() ??
+            ctx?.sessionManager?.getSessionId?.() ??
+            null;
+        const projectPath = ctx?.cwd ?? process.cwd();
+
+        const dbPath = sidecarDbPath();
+        if (!existsSync(dbPath)) {
+            // Sidecar not installed or never initialized — skip
+            return;
+        }
+
+        const db = new DatabaseSync(dbPath, {
+            enableForeignKeyConstraints: true,
+        });
+
+        try {
+            // Check if the source table exists (sidecar schema applied)
+            const tableCheck = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
+                )
+                .get();
+            if (!tableCheck) {
+                return;
+            }
+
+            // Dedup: skip if exact content hash already exists for this project
+            const contentHash = createHash("sha256").update(text).digest("hex");
+            const existing = db
+                .prepare(
+                    "SELECT id FROM context_sources WHERE content_hash = ? AND (project_path = ? OR project_path IS NULL) LIMIT 1"
+                )
+                .get(contentHash, projectPath);
+            if (existing) {
+                // Update returned byte count on the existing record
+                db.prepare(
+                    "UPDATE context_sources SET returned_byte_count = returned_byte_count + ? WHERE id = ?"
+                ).run(bytes, existing.id);
+                return;
+            }
+
+            // Generate a unique source ID matching the sidecar's format
+            const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+            const createdAt = Date.now();
+            const preview = makePreview(text);
+            const previewBytes = Buffer.byteLength(preview, "utf8");
+            const inputSummary = JSON.stringify({
+                command: job.command,
+                jobId: job.id,
+                exitCode: job.exitCode,
+                status: job.status,
+                logPath: job.logPath,
+            });
+
+            // Insert source record
+            db.prepare(
+                `INSERT INTO context_sources
+                 (id, session_id, project_path, tool_name, input_summary,
+                  created_at, byte_count, line_count, content_hash,
+                  preview_byte_count, returned_byte_count)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+            ).run(
+                sourceId,
+                sessionId,
+                projectPath,
+                "bash_bg",
+                inputSummary,
+                createdAt,
+                bytes,
+                lines,
+                contentHash,
+                previewBytes
+            );
+
+            // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
+            const chunks = chunkText(text, sourceId);
+            const insertChunk = db.prepare(
+                `INSERT INTO context_chunks
+                 (id, source_id, ordinal, title, content, byte_count)
+                 VALUES (?, ?, ?, ?, ?, ?)`
+            );
+
+            for (const chunk of chunks) {
+                insertChunk.run(
+                    chunk.id,
+                    chunk.sourceId,
+                    chunk.ordinal,
+                    chunk.title,
+                    chunk.content,
+                    chunk.byteCount
+                );
+            }
+        } finally {
+            db.close();
+        }
+    } catch {
+        // DB unavailable or schema mismatch — skip silently
+    }
+}
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
     createBashTool,
@@ -20,6 +378,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
+import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
 import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
@@ -73,6 +432,7 @@ export function startStallWatchdog(
     command: string,
     logPath: string,
     pi: ExtensionAPI,
+    state: TauState,
     onOversize?: () => void
 ): () => void {
     let lastSize = 0;
@@ -88,10 +448,11 @@ export function startStallWatchdog(
                 cancelled = true;
                 clearInterval(timer);
                 if (onOversize) onOversize();
+                const suffix = outstandingJobsSuffix(state, jobId);
                 pi.sendMessage(
                     {
                         customType: "bg-stall",
-                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.`,
+                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.${suffix}`,
                         display: true,
                         details: { jobId, logPath, command },
                     },
@@ -123,10 +484,11 @@ export function startStallWatchdog(
                 `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
                 `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
 
+            const suffix = outstandingJobsSuffix(state, jobId);
             pi.sendMessage(
                 {
                     customType: "bg-stall",
-                    content: `⚠️ ${summary}`,
+                    content: `⚠️ ${summary}${suffix}`,
                     display: true,
                     details: { jobId, logPath, command },
                 },
@@ -158,6 +520,12 @@ export function updateWidget(state: TauState, ctx: UiContext): void {
     const runningJobs = allJobs.filter((job) => job.status === "running");
 
     if (runningJobs.length === 0 && !state.agentBackgrounded) {
+        ctx.ui.setWidget("background-jobs", undefined);
+        ctx.ui.setStatus("background-jobs", undefined);
+        return;
+    }
+
+    if (state.jobsWidgetHidden) {
         ctx.ui.setWidget("background-jobs", undefined);
         ctx.ui.setStatus("background-jobs", undefined);
         return;
@@ -220,7 +588,7 @@ export function clearPendingDecision(
 }
 
 /** Maximum number of recent terminal jobs kept for output lookups. */
-const MAX_RECENT_TERMINAL = 20;
+const MAX_RECENT_TERMINAL = 100;
 
 /** Remove a terminal job from the background jobs map and update counters. */
 function removeJob(state: TauState, job: BackgroundJob): void {
@@ -236,6 +604,408 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     }
 }
 
+// ─── Job output formatting (grep/tail/head) ──────────────────────────
+
+/**
+ * Parameters for formatJobOutput.
+ */
+export interface FormatJobOutputParams {
+    text: string;
+    grepPattern?: string;
+    headCount?: number;
+    tailCount?: number;
+}
+
+/**
+ * Result of formatJobOutput.
+ */
+export interface FormatJobOutputResult {
+    /** The formatted text output (numbered lines, hints footer). */
+    text: string;
+    /** Total number of matched lines before applying head/tail slice. */
+    totalLines: number;
+    /** Whether the input was truncated (content starts with "...[truncated"). */
+    isTruncated: boolean;
+}
+
+/**
+ * Filter lines by grep pattern, apply head/tail slicing, and format with
+ * line numbers and hints footer. Used by jobs(action="output") and exposed
+ * for unit testing.
+ *
+ * - If grepPattern is set, only matching lines are included.
+ * - headCount/tailCount slice from the start/end of the filtered set.
+ * - The result includes a hints footer when lines were hidden or truncated.
+ */
+export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputResult {
+    const { text, grepPattern, headCount, tailCount } = params;
+
+    // Filter lines (by grep or all)
+    const lines = text.split("\n");
+    let matched: { line: string; num: number }[];
+
+    if (!grepPattern) {
+        matched = lines.map((l, i) => ({ line: l, num: i + 1 }));
+    } else {
+        let re: RegExp;
+        try {
+            re = new RegExp(grepPattern, "i");
+        } catch {
+            return {
+                text: `(grep error: invalid regex /${grepPattern}/i)`,
+                totalLines: 0,
+                isTruncated: false,
+            };
+        }
+        matched = lines
+            .map((l, i) => ({ line: l, num: i + 1 }))
+            .filter(({ line }) => re.test(line));
+    }
+
+    const totalLines = matched.length;
+
+    if (matched.length === 0) {
+        const text = grepPattern
+            ? `(no lines matching /${grepPattern}/i)`
+            : "(no lines)";
+        return { text, totalLines, isTruncated: false };
+    }
+
+    if (headCount !== undefined) matched = matched.slice(0, headCount);
+    if (tailCount !== undefined) matched = matched.slice(-tailCount);
+
+    const isTruncated = text.startsWith("...[truncated");
+
+    // Format with line numbers
+    const body = matched
+        .map(({ line, num }) => `${String(num).padStart(4, " ")}: ${line}`)
+        .join("\n");
+
+    // Build hints footer
+    const hints: string[] = [];
+    if (matched.length < totalLines) {
+        const hidden = totalLines - matched.length;
+        hints.push(`${hidden} more line${hidden !== 1 ? "s" : ""}`);
+    }
+    if (isTruncated) {
+        hints.push("output was truncated");
+    }
+
+    let result = body;
+    if (hints.length > 0) {
+        const suggestion = !grepPattern ? " or grep='pattern' to search" : "";
+        result += `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`;
+    }
+
+    return { text: result, totalLines, isTruncated };
+}
+
+/**
+ * Count outstanding (still-running) jobs for a cosmetic suffix in
+ * completion notifications. Uses `process.kill(pid, 0)` as a quick
+ * liveness check — the signal 0 test returns successfully for running
+ * processes without actually sending a signal. EACCES/EPERM from
+ * permission errors on other platforms are treated as "running" since
+ * they indicate the process exists. This is cosmetic only; job state
+ * correctness is managed via the close handler.
+ */
+function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
+    const count = Array.from(state.backgroundJobs.values()).filter((j) => {
+        if (j.id === excludeJobId) return false;
+        if (j.status !== "running") return false;
+        try {
+            if (j.pid) process.kill(j.pid, 0);
+            return true;
+        } catch {
+            // ESRCH = no such process, EACCES/EPERM = exists but can't signal
+            return false;
+        }
+    }).length;
+    return count > 0 ? ` (${count} jobs outstanding)` : "";
+}
+
+/**
+/**
+ * Batch state for job-completion notifications.
+ * Completions that fire close together are aggregated into one message
+ * so the agent doesn't get re-awoken for every individual job.
+ */
+
+const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
+const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
+
+type CompletionBatchItem = {
+    job: BackgroundJob;
+    duration: string;
+    emoji: string;
+};
+
+const completionBatch: {
+    jobs: CompletionBatchItem[];
+    timer?: NodeJS.Timeout;
+    startTime: number;   // timestamp of the first job in the current batch
+    pi?: ExtensionAPI;
+    state?: TauState;
+} = { jobs: [], startTime: 0 };
+
+type PendingCompletionDelivery = {
+    jobs: CompletionBatchItem[];
+    pi: ExtensionAPI;
+    state: TauState;
+};
+
+const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
+let completionAgentBusy = false;
+
+/** Count currently running background jobs (excluding any completed/failed/killed). */
+function countOutstandingJobs(state: TauState): number {
+    return Array.from(state.backgroundJobs.values()).filter(
+        (j) => j.status === "running"
+    ).length;
+}
+
+function flushCompletionBatch(): void {
+    const batch = completionBatch.jobs.splice(0);
+    const pi = completionBatch.pi!;
+    const state = completionBatch.state!;
+    completionBatch.timer = undefined;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+
+    if (batch.length === 0) return;
+
+    // Suppress successful completions to avoid wasted LLM turns — UNLESS
+    // one of the jobs has linked callbacks (meaning the agent explicitly
+    // asked to be reminded) OR a linked callback fired while the job was
+    // still running (meaning a progress check was delivered but the agent
+    // still wants the final completion notification). In either case,
+    // deliver the notification (which cancels any remaining linked callbacks).
+    // Failed completions are always delivered.
+    if (!hasFailedCompletion(batch)) {
+        const hasLinked = batch.some(
+            (j) =>
+                hasLinkedCallbacksForJob(j.job.id) ||
+                j.job.wantsCompletionNotification
+        );
+        if (!hasLinked) return;
+    }
+
+    queueCompletionDelivery(batch, pi, state);
+}
+
+function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
+    return jobs.some((j) => j.job.status !== "completed");
+}
+
+function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchItem[] {
+    const unconsumedFailed = jobs.filter(
+        (j) => j.job.status !== "completed" && !j.job.outputConsumed
+    );
+    const unconsumedCompleted = jobs.filter(
+        (j) => j.job.status === "completed" && !j.job.outputConsumed
+    );
+
+    if (unconsumedFailed.length === 0 && unconsumedCompleted.length === 0) {
+        return [];
+    }
+
+    const failedIds = new Set(unconsumedFailed.map((j) => j.job.id));
+    const completedIds = new Set(unconsumedCompleted.map((j) => j.job.id));
+
+    return jobs.filter(
+        (j) => completedIds.has(j.job.id) || failedIds.has(j.job.id)
+    );
+}
+
+/** Best-effort GPU utilization snapshot at the time a job completes. */
+function readGpuSnapshot(): string | null {
+	try {
+		const entries = readdirSync("/sys/class/drm");
+		const lines: string[] = [];
+		for (const entry of entries) {
+			if (!entry.startsWith("card") || entry.includes("-")) continue;
+			try {
+				const busy = parseInt(
+					readFileSync(`/sys/class/drm/${entry}/device/gpu_busy_percent`, "utf-8").trim(),
+					10
+				);
+				let temp = "";
+				try {
+					const hwmons = readdirSync("/sys/class/hwmon");
+					for (const hw of hwmons) {
+						try {
+							const name = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
+							if (name === "amdgpu" || name === "i915") {
+								const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
+								temp = ` ${(t / 1000).toFixed(0)}C`;
+								break;
+							}
+						} catch {}
+					}
+				} catch {}
+				lines.push(`${entry}: ${busy}%${temp}`);
+			} catch {}
+		}
+		return lines.length > 0 ? lines.join(", ") : null;
+	} catch {
+		return null;
+	}
+}
+
+function deliverCompletionNotification(delivery: PendingCompletionDelivery): void {
+    const batch = pruneConsumedCompletions(delivery.jobs);
+    if (batch.length === 0) return;
+
+    const { pi, state } = delivery;
+    const outstandingCount = countOutstandingJobs(state);
+    const suffix =
+        outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
+
+    if (batch.length === 1) {
+        const { job, duration, emoji } = batch[0];
+        const exitLine =
+            job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
+
+        // Best-effort GPU snapshot at completion time
+        const gpuLine = readGpuSnapshot();
+        const resourceInfo = gpuLine
+            ? `\nGPU: ${gpuLine}`
+            : "";
+
+        pi.sendMessage(
+            {
+                customType: "job-completion",
+                content:
+                    `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
+                    `Command: ${job.command}\nOutput: ${job.logPath}${resourceInfo}`,
+                display: true,
+                details: {
+                    jobId: job.id,
+                    status: job.status,
+                    exitCode: job.exitCode,
+                    duration,
+                    command: job.command,
+                    logPath: job.logPath,
+                    outstandingJobs: outstandingCount,
+                },
+            },
+            { deliverAs: "followUp", triggerTurn: true }
+        );
+        return;
+    }
+
+    const completed = batch.filter((j) => j.job.status === "completed");
+    const failed = batch.filter((j) => j.job.status !== "completed");
+    const parts: string[] = [];
+    if (completed.length > 0) parts.push(`${completed.length} completed`);
+    if (failed.length > 0) parts.push(`${failed.length} failed`);
+
+    const header = `🏁 ${parts.join(", ")}${suffix}`;
+    const lines = batch.map(
+        (j) =>
+            `  ${j.emoji} ${j.job.id} ${j.job.status} (${j.duration})${
+                j.job.exitCode !== undefined ? `, exit ${j.job.exitCode}` : ""
+            }`
+    );
+    const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
+
+    const gpuLine = readGpuSnapshot();
+    const resourceInfo = gpuLine
+        ? `\nGPU: ${gpuLine}`
+        : "";
+
+    pi.sendMessage(
+        {
+            customType: "job-completion",
+            content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}${resourceInfo}`,
+            display: true,
+            details: {
+                batch: batch.map((b) => ({
+                    jobId: b.job.id,
+                    status: b.job.status,
+                    exitCode: b.job.exitCode,
+                    duration: b.duration,
+                    command: b.job.command,
+                    logPath: b.job.logPath,
+                })),
+                outstandingJobs: outstandingCount,
+            },
+        },
+        { deliverAs: "followUp", triggerTurn: true }
+    );
+}
+
+function flushPendingCompletionDeliveries(): void {
+    if (completionAgentBusy) return;
+    while (pendingCompletionDeliveries.length > 0) {
+        const delivery = pendingCompletionDeliveries.shift();
+        if (delivery) deliverCompletionNotification(delivery);
+    }
+}
+
+function queueCompletionDelivery(
+    jobs: CompletionBatchItem[],
+    pi: ExtensionAPI,
+    state: TauState
+): void {
+    const jobsToDeliver = pruneConsumedCompletions(jobs);
+    if (jobsToDeliver.length === 0) return;
+
+    // Cancel linked callbacks for all delivered jobs — we're about to
+    // send the result to the agent, so remind callbacks are now stale.
+    for (const { job } of jobsToDeliver) {
+        cancelCallbacksForJob(job.id);
+    }
+    pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
+    flushPendingCompletionDeliveries();
+}
+
+/**
+ * Remove a job's pending completion notification from the debounced batch.
+ * Called when the agent cancels callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearJobFromCompletionBatch(jobId: string): void {
+    const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
+    if (idx !== -1) {
+        completionBatch.jobs.splice(idx, 1);
+        if (completionBatch.jobs.length === 0) {
+            if (completionBatch.timer) {
+                clearTimeout(completionBatch.timer);
+                completionBatch.timer = undefined;
+            }
+            completionBatch.pi = undefined;
+            completionBatch.state = undefined;
+        }
+    }
+
+    for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
+        const delivery = pendingCompletionDeliveries[i];
+        delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
+        if (!hasFailedCompletion(delivery.jobs)) {
+            pendingCompletionDeliveries.splice(i, 1);
+        }
+    }
+}
+
+/**
+ * Clear all pending completion notifications from the debounced batch.
+ * Called when the agent cancels all callbacks — no point sending stale
+ * notifications for jobs the agent has already acknowledged.
+ */
+export function clearAllCompletionBatches(): void {
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+        completionBatch.timer = undefined;
+    }
+    completionBatch.jobs.length = 0;
+    completionBatch.startTime = 0;
+    completionBatch.pi = undefined;
+    completionBatch.state = undefined;
+    pendingCompletionDeliveries.length = 0;
+}
+
 /** Send a structured completion notification to the agent. */
 export function notifyCompletion(
     job: BackgroundJob,
@@ -243,40 +1013,50 @@ export function notifyCompletion(
     pi: ExtensionAPI,
     ctx: UiContext
 ): void {
-    if (job.outputConsumed) {
-        removeJob(state, job);
-        return;
-    }
+    // If the job was already silenced (killed by watchdog, tool, etc.),
+    // skip notification entirely — the killing path already sent one.
+    if (job.outputConsumed) return;
+
+    // Linked callbacks (remindDelay) are NOT cancelled here — delivery
+    // is deferred to flushCompletionBatch which decides whether to
+    // suppress (no linked callbacks) or deliver (linked callbacks
+    // present for any job in the batch).
+
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
-    const statusText = `Background ${job.id} ${job.status} (${duration})`;
-    const exitCodeText =
-        job.exitCode !== undefined ? `\nExit code: ${job.exitCode}` : "";
 
-    ctx.ui.notify(statusText, job.status === "completed" ? "success" : "error");
-
-    pi.sendMessage(
-        {
-            customType: "job-completion",
-            content:
-                `${emoji} ${statusText}\n` +
-                `Command: ${job.command}\n` +
-                `Output: ${job.logPath}${exitCodeText}`,
-            display: true,
-            details: {
-                jobId: job.id,
-                status: job.status,
-                exitCode: job.exitCode,
-                duration,
-                command: job.command,
-                logPath: job.logPath,
-            },
-        },
-        { deliverAs: "followUp", triggerTurn: true }
+    // Toast notification fires immediately for each job
+    ctx.ui.notify(
+        `${emoji} ${job.id} ${job.status} (${duration})`,
+        job.status === "completed" ? "success" : "error"
     );
+
+    // Defer the followUp message into a batch that flushes after a short debounce.
+    // Suffix and outstanding count are computed at flush time from current state,
+    // so they accurately reflect jobs still running outside this batch.
+    completionBatch.jobs.push({ job, duration, emoji });
+    completionBatch.pi = pi;
+    completionBatch.state = state;
+
+    // Sliding-window debounce: each new completion resets the timer, extending
+    // the window to collect near-simultaneous completions into one message.
+    // Cap total delay so the agent never waits longer than BATCH_MAX_DELAY_MS
+    // from the first job in the batch.
+    if (completionBatch.timer) {
+        clearTimeout(completionBatch.timer);
+    } else {
+        completionBatch.startTime = Date.now();
+    }
+    const elapsed = Date.now() - completionBatch.startTime;
+    const delay = Math.min(BATCH_DEBOUNCE_MS, BATCH_MAX_DELAY_MS - elapsed);
+    completionBatch.timer = setTimeout(() => {
+        flushCompletionBatch();
+    }, Math.max(delay, 0));
+    completionBatch.timer.unref();
 
     removeJob(state, job);
 }
+
 
 // ── Background a running foreground process (signal-based) ─────────
 
@@ -318,13 +1098,34 @@ export function registerBackgroundJob(
     }
     state.currentlyRunningToolCallId = null;
 
-    const cancelStall = startStallWatchdog(jobId, command, logPath, pi, () => {
-        if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
-        silenceJobAfterKill(job);
-    });
+    const cancelStall = startStallWatchdog(
+        jobId,
+        command,
+        logPath,
+        pi,
+        state,
+        () => {
+            if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
+            silenceJobAfterKill(job);
+        }
+    );
 
     proc.on("close", (code) => {
         cancelStall();
+        // Update job status before indexing so the sidecar captures final state
+        job.exitCode = code ?? 0;
+        job.status = code === 0 || code === null ? "completed" : "failed";
+        // ctx is ExtensionContext at runtime but typed as UiContext here
+        void indexJobOutputInSidecar(
+            job,
+            ctx as {
+                cwd?: string;
+                sessionManager?: {
+                    getSessionFile?: () => string | null;
+                    getSessionId?: () => string | null;
+                };
+            }
+        );
         markJobTerminal(
             job,
             code === 0 || code === null ? "completed" : "failed",
@@ -332,8 +1133,7 @@ export function registerBackgroundJob(
         );
         clearPendingDecision(state, job);
         notifyCompletion(job, state, pi, ctx);
-        updateWidget(state, ctx);
-    });
+        updateWidget(state, ctx);    });
 
     ctx.ui.notify(`Process backgrounded as ${jobId}`, "info");
     updateWidget(state, ctx);
@@ -387,6 +1187,22 @@ export function registerBackgroundJobs(
     pi: ExtensionAPI,
     state: TauState
 ): void {
+    const eventPi = pi as ExtensionAPI & {
+        on?: (event: string, handler: (...args: unknown[]) => unknown) => void;
+    };
+    eventPi.on?.("agent_start", () => {
+        completionAgentBusy = true;
+    });
+    eventPi.on?.("agent_end", () => {
+        completionAgentBusy = false;
+        flushPendingCompletionDeliveries();
+    });
+    eventPi.on?.("session_shutdown", () => {
+        completionAgentBusy = false;
+        pendingCompletionDeliveries.length = 0;
+        clearAllCompletionBatches();
+    });
+
     // ── Override bash tool ─────────────────────────────────────────────
 
     const originalBashTool = createBashTool(process.cwd());
@@ -398,14 +1214,28 @@ export function registerBackgroundJobs(
             "Execute bash commands with streaming output. Commands that run longer than 2 minutes " +
             "are automatically backgrounded and the agent is asked whether to kill or let them continue. " +
             "Use Ctrl+Shift+B to manually background a running process. " +
-            "Background job output is written to per-session log files.",
+            "Background job output is written to per-session log files. " +
+            "Set backgroundAfter to auto-background after a specific number of seconds.",
         promptSnippet:
             "Execute shell commands (backgroundable with Ctrl+Shift+B)",
         promptGuidelines: [
             "Use bash_bg when you know a command should run in background from the start.",
             "Use the jobs tool with action 'list' to check background job status.",
             "Use the jobs tool with action 'output' to read a background job's output file.",
+            "Use backgroundAfter to set a custom background-after timeout in seconds.",
         ],
+        parameters: Type.Object({
+            command: Type.String({
+                description: "Bash command to execute",
+            }),
+            backgroundAfter: Type.Optional(
+                Type.Number({
+                    description:
+                        "Background the command after this many seconds (default: auto, ~2 minutes). " +
+                        "The command continues running in the background; use jobs/attach to monitor it.",
+                })
+            ),
+        }),
 
         async execute(
             toolCallId,
@@ -519,14 +1349,14 @@ export function registerBackgroundJobs(
                 });
             }
 
-            // Start timeout timer
+            // Start timeout timer (background-after timer, not a kill timeout)
             const timer = startTimeoutTimer(
                 triggerBackground,
                 command,
                 state,
                 toolCallId,
-                typeof params.timeout === "number"
-                    ? params.timeout * 1_000
+                typeof params.backgroundAfter === "number"
+                    ? params.backgroundAfter * 1_000
                     : undefined
             );
 
@@ -573,7 +1403,12 @@ export function registerBackgroundJobs(
 
                 // Command completed quickly — return result
                 if (initialResult !== null) {
+                    // Clean up foreground job registration
                     state.backgroundJobs.delete(jobId);
+                    state.runningProcesses.delete(toolCallId);
+                    if (state.currentlyRunningToolCallId === toolCallId) {
+                        state.currentlyRunningToolCallId = null;
+                    }
                     const output = await readFile(logPath, "utf-8").catch(
                         () => ""
                     );
@@ -620,18 +1455,23 @@ export function registerBackgroundJobs(
                         ctx
                     );
 
+                    // Remove stale foreground entry created earlier — same process,
+                    // separate job ID that would otherwise stay in state forever.
+                    state.backgroundJobs.delete(jobId);
+
                     state.pendingDecisionJobId = job.id;
 
                     const duration = formatDuration(
-                        typeof params.timeout === "number"
-                            ? params.timeout * 1_000
+                        typeof params.backgroundAfter === "number"
+                            ? params.backgroundAfter * 1_000
                             : DEFAULT_TIMEOUT_MS
                     );
+                    const bgSuffix = outstandingJobsSuffix(state, job.id);
                     pi.sendMessage(
                         {
                             customType: "bg-timeout",
                             content:
-                                `⏰ Command timed out after ${duration} and has been backgrounded as ${job.id}.\n` +
+                                `⏰ Command timed out after ${duration} and has been backgrounded as ${job.id}${bgSuffix}.\n` +
                                 `Command: ${command}\n` +
                                 `PID: ${job.pid}\n` +
                                 `Output so far: ${job.logPath}\n\n` +
@@ -639,7 +1479,7 @@ export function registerBackgroundJobs(
                                 `- decision "check": inspect the output first\n` +
                                 `- decision "keep": let it continue running\n` +
                                 `- decision "kill": terminate it\n\n` +
-                                `Do NOT use jobs action "attach" on this job — it will block indefinitely.`,
+                                `Use jobs action "attach" with a timeout to monitor its progress with periodic updates.`,
                             display: true,
                             details: {
                                 jobId: job.id,
@@ -707,13 +1547,24 @@ export function registerBackgroundJobs(
         name: "bash_bg",
         label: "Background Bash",
         description:
-            "Run a bash command in background immediately. Output is written to a per-session log file. " +
-            "Use the jobs tool to check status and read output.",
+            "Run a bash command in background immediately. Output streams to a log file in real-time " +
+            "and can be queried with the jobs tool (output, grep, head/tail) while the job is still running. " +
+            "Use the jobs tool to check status and read output. " +
+            "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
+            "and is searchable via context_search, context_list, and context_get. " +
+            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both.",
         promptSnippet:
-            "Run bash command in background without blocking conversation",
+            "Run bash command in background immediately" +
+            " (supports kill deadline and inline reminder)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
+            "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
+            "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
+            "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
+            "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
+                "Use context_search with tool_name='bash_bg' to find past job output, " +
+                "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
         ],
         parameters: Type.Object({
             command: Type.String({
@@ -722,6 +1573,27 @@ export function registerBackgroundJobs(
             notify: Type.Optional(
                 Type.Boolean({
                     description: "Notify when complete (default: true)",
+                })
+            ),
+            timeout: Type.Optional(
+                Type.Number({
+                    description:
+                        "Kill deadline in seconds. If the job runs longer than this, it is terminated. " +
+                        "Use when a command must finish within a time bound.",
+                })
+            ),
+            remindDelay: Type.Optional(
+                Type.String({
+                    description:
+                        'Schedule a reminder callback after this duration (e.g. "5m", "30s", "2h"). ' +
+                        "The reminder auto-cancels if the job completes before it fires.",
+                })
+            ),
+            remindMessage: Type.Optional(
+                Type.String({
+                    description:
+                        'Message for the reminder callback (default: "check on <command>"). ' +
+                        "Only used when remindDelay is set.",
                 })
             ),
         }),
@@ -745,7 +1617,7 @@ export function registerBackgroundJobs(
                     pi,
                     ctx,
                     (jobId, command, logPath) =>
-                        startStallWatchdog(jobId, command, logPath, pi, () => {
+                        startStallWatchdog(jobId, command, logPath, pi, state, () => {
                             killTmuxJob(
                                 state.backgroundJobs.get(jobId) ??
                                     ({
@@ -811,18 +1683,54 @@ export function registerBackgroundJobs(
                 params.command,
                 logPath,
                 pi,
+                state,
                 () => {
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                     silenceJobAfterKill(job);
                 }
             );
 
+            // ── Kill deadline timeout ──────────────────────────────────
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            if (typeof params.timeout === "number" && params.timeout > 0) {
+                killTimer = setTimeout(() => {
+                    if (proc.pid && job.status === "running") {
+                        killProcessGroup(proc.pid, "SIGTERM");
+                        job.status = "killed";
+                        // Don't silence — let notifyCompletion send the notification
+                    }
+                }, params.timeout * 1_000);
+                killTimer.unref();
+            }
+
+            // ── Inline reminder ───────────────────────────────────────
+            let reminderId: string | undefined;
+            if (params.remindDelay) {
+                const msg =
+                    params.remindMessage ??
+                    `check on: ${params.command.slice(0, 80)}`;
+                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
+                if (rid) reminderId = rid;
+            }
+
             proc.on("close", (code) => {
                 cancelStall();
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(
                     job,
                     code === 0 || code === null ? "completed" : "failed",
                     code ?? 0
+                );
+                void indexJobOutputInSidecar(
+                    job,
+                    ctx as {
+                        cwd?: string;
+                        sessionManager?: {
+                            getSessionFile?: () => string | null;
+                            getSessionId?: () => string | null;
+                        };
+                    }
                 );
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
@@ -831,7 +1739,19 @@ export function registerBackgroundJobs(
 
             proc.on("error", () => {
                 cancelStall();
+                if (killTimer) clearTimeout(killTimer);
+                killTimer = undefined;
                 markJobTerminal(job, "failed");
+                void indexJobOutputInSidecar(
+                    job,
+                    ctx as {
+                        cwd?: string;
+                        sessionManager?: {
+                            getSessionFile?: () => string | null;
+                            getSessionId?: () => string | null;
+                        };
+                    }
+                );
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
@@ -839,11 +1759,24 @@ export function registerBackgroundJobs(
 
             updateWidget(state, ctx);
 
+            // Build summary line for reminders / timeout
+            let extra = "";
+            if (killTimer) {
+                extra += `\nKill deadline: ${params.timeout}s`;
+            }
+            if (reminderId) {
+                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
+            }
+
             return {
                 content: [
                     {
                         type: "text" as const,
-                        text: `Started background job ${jobId}\nCommand: ${params.command}\nPID: ${proc.pid}\nOutput: ${logPath}`,
+                        text:
+                            `Started background job ${jobId}\n` +
+                            `Command: ${params.command}\n` +
+                            `PID: ${proc.pid}\n` +
+                            `Output: ${logPath}${extra}`,
                     },
                 ],
                 details: undefined,
@@ -857,13 +1790,28 @@ export function registerBackgroundJobs(
         name: "jobs",
         label: "Background Jobs",
         description:
-            "List, inspect, kill, or attach to background jobs. Output is read from disk files.",
+            "List, inspect, kill, or attach to background jobs. Output is read from disk files. " +
+            "Jobs(attach) is non-blocking — it polls the job periodically and streams progress " +
+            "updates to the agent. The agent can abort at any time, and a configurable timeout " +
+            "(default 10 min) prevents indefinite blocking. " +
+            "Output accumulates in the log file in real-time — you can query it while the job is running. " +
+            "For completed jobs not found in memory, output(action) falls back to the context sidecar. " +
+            "Use output(action) with grep/tail/head to search and filter accumulated output.",
         promptSnippet: "Manage background jobs (list/output/kill/attach)",
         promptGuidelines: [
             "Use jobs with action 'list' to see all background jobs.",
-            "Use jobs with action 'output' to read a job's output from its log file.",
-            "Use jobs with action 'kill' to terminate a running background job.",
-            "Use jobs with action 'attach' to wait for a running job and get its final output.",
+            "Use jobs with action 'output' to read a job's accumulated output (works while running).",
+            "Use jobs with action 'output' grep='pattern' to search for matching lines in the output.",
+            "Use jobs with action 'output' head=50 to show the first 50 lines (default: tail=10).",
+            "Use jobs with action 'output' tail=15 to show the last 15 matching lines, the default.",
+            "Use jobs with action 'kill' to terminate a running background job (also cancels linked reminders).",
+            "Use jobs with action 'attach' to monitor a running job with progress polling; " +
+                "attach is safe to use — it will not block indefinitely (has a timeout).",
+            "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
+                "default is 600 (10 minutes).",
+            "When jobs(output) hides lines or truncates, it will suggest grep='pattern' automatically — " +
+                "prefer grep over bash for searching large output.",
+            "For searching across past or indexed job output, use context_search with tool_name='bash_bg'.",
         ],
         parameters: Type.Object({
             action: StringEnum(["list", "output", "kill", "attach"] as const, {
@@ -874,10 +1822,42 @@ export function registerBackgroundJobs(
                     description: "Job ID for output/kill/attach",
                 })
             ),
+            grep: Type.Optional(
+                Type.String({
+                    description:
+                        "JavaScript regex pattern for action=output (case-insensitive). " +
+                        "Only lines matching the pattern are returned, with line numbers. " +
+                        "Examples: 'error|fail', '^\\d+', 'timeout.*exit'.",
+                })
+            ),
+            head: Type.Optional(
+                Type.Number({
+                    description:
+                        "Show at most this many matching lines (from the start). " +
+                        "Applied after grep filter.",
+                    minimum: 1,
+                })
+            ),
+            tail: Type.Optional(
+                Type.Number({
+                    description:
+                        "Show at most this many matching lines (from the end). " +
+                        "Default: 10 if neither head nor tail is given. " +
+                        "Applied after grep filter.",
+                    minimum: 1,
+                })
+            ),
             wait: Type.Optional(
                 Type.Boolean({
                     description:
                         "For attach: wait for completion (default true)",
+                })
+            ),
+            timeout: Type.Optional(
+                Type.Number({
+                    description:
+                        "For attach: max seconds to wait before returning partial output " +
+                        "(default 600 = 10 minutes)",
                 })
             ),
         }),
@@ -914,23 +1894,90 @@ export function registerBackgroundJobs(
                 case "output": {
                     if (!params.jobId)
                         throw new Error("jobId is required for action=output");
+
+                    const grepPattern = params.grep;
+                    const headCount = params.head;
+                    const tailCount = params.tail;
+
+                    // Try the in-memory job first
                     const job = lookupJob(state, params.jobId);
-                    if (!job) throw new Error(`Job not found: ${params.jobId}`);
-                    const output = getTmuxContext(job)
-                        ? await readTmuxOutput(job, MAX_OUTPUT_PREVIEW_CHARS)
-                        : await readOutputTail(
-                              job.logPath,
-                              MAX_OUTPUT_PREVIEW_CHARS
-                          );
-                    return {
-                        content: [
-                            {
-                                type: "text" as const,
-                                text: `Output for ${job.id} (${job.status})\nLog: ${job.logPath}\n\n${output}`,
-                            },
-                        ],
-                        details: undefined,
-                    };
+                    if (job) {
+                        const output = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        // Agent has seen this terminal job's output —
+                        // suppress completion notification and cancel reminds.
+                        if (job.status !== "running") {
+                            job.outputConsumed = true;
+                            cancelCallbacksForJob(job.id);
+                        }
+                        const formatted = formatJobOutput({
+                            text: output,
+                            grepPattern,
+                            headCount,
+                            tailCount,
+                        });
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Output for ${job.id} (${job.status})${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\nLog: ${job.logPath}\n\n${formatted}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    // Fall back to sidecar for completed jobs (persists across sessions)
+                    const sidecarOutput = await readJobOutputFromSidecar(
+                        params.jobId
+                    );
+                    if (sidecarOutput) {
+                        const formatted = formatJobOutput({
+                            text: sidecarOutput,
+                            grepPattern,
+                            headCount,
+                            tailCount,
+                        });
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Output for ${params.jobId} (from sidecar)${
+                                        grepPattern
+                                            ? `, grep "${grepPattern}"`
+                                            : ""
+                                    }${
+                                        headCount !== undefined
+                                            ? `, head=${headCount}`
+                                            : ""
+                                    }${
+                                        tailCount !== undefined
+                                            ? `, tail=${tailCount}`
+                                            : ""
+                                    }\n\n${formatted}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    throw new Error(
+                        `Job not found: ${params.jobId}. It may have been cleaned up.`
+                    );
                 }
 
                 case "kill": {
@@ -969,70 +2016,142 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
 
+                    // If already done or wait=false, return output immediately
                     const waitForCompletion = params.wait ?? true;
-                    const skipWait =
-                        state.pendingDecisionJobId === job.id &&
-                        job.status === "running";
+                    if (job.status !== "running" || !waitForCompletion) {
+                        const output = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        job.outputConsumed = true;
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        job.status !== "running"
+                                            ? `Attach finished for ${job.id}. Status: ${job.status}\nLog: ${job.logPath}\n\n${output}`
+                                            : `Job ${job.id} (${job.status})\nLog: ${job.logPath}\n\n${output}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
 
-                    if (
-                        job.status === "running" &&
-                        waitForCompletion &&
-                        !skipWait
-                    ) {
-                        if (!job.donePromise) createJobDonePromise(job);
+                    // Ensure donePromise exists
+                    if (!job.donePromise) createJobDonePromise(job);
 
-                        // For direct-spawn jobs, check if OS process is already dead.
-                        // Tmux jobs (pid === -1) skip this check — completion is
-                        // detected via the exit-code sentinel file.
-                        if (job.pid > 0) {
-                            try {
-                                process.kill(job.pid, 0);
-                            } catch {
-                                markJobTerminal(job, "failed");
-                            }
+                    const POLL_INTERVAL_MS = 5_000;
+                    const MAX_ATTACH_MS = (params.timeout ?? 600) * 1_000;
+                    const deadline = Date.now() + MAX_ATTACH_MS;
+
+                    // Non-blocking poll loop with progress updates.
+                    // Polls periodically; exits promptly when the job completes
+                    // (via donePromise race), the signal is aborted, or the
+                    // timeout expires.
+                    while (job.status === "running") {
+                        // Check abort signal
+                        if (signal?.aborted) {
+                            break;
                         }
 
+                        // Check timeout
+                        if (Date.now() >= deadline) {
+                            break;
+                        }
+
+
+                        // Check timeout
+                        if (Date.now() >= deadline) {
+                            break;
+                        }
+
+                        // Read latest output
+                        const tail = await readOutputTail(
+                            job.logPath,
+                            MAX_OUTPUT_PREVIEW_CHARS
+                        );
+                        const runtime = formatDuration(
+                            Date.now() - job.startTime
+                        );
+                        const timeLeft = Math.round(
+                            (deadline - Date.now()) / 1000
+                        );
+
+                        // Send progress update to agent
                         onUpdate?.({
                             content: [
                                 {
                                     type: "text" as const,
-                                    text: `Attaching to ${job.id} (${job.status})...`,
+                                    text:
+                                        `Attaching to ${job.id} (running ${runtime}, ` +
+                                        `${timeLeft}s timeout remaining)...\n\n${tail}`,
                                 },
                             ],
                             details: undefined,
                         });
 
-                        // Race completion against abort so Esc cancels the attach
-                        if (signal && !signal.aborted) {
-                            const abortPromise = new Promise<void>(
-                                (resolve) => {
-                                    signal.addEventListener(
-                                        "abort",
-                                        () => resolve(),
-                                        {
-                                            once: true,
-                                        }
-                                    );
-                                }
-                            );
-                            await Promise.race([job.donePromise, abortPromise]);
-                        } else {
-                            await job.donePromise;
-                        }
+                        // Wait for either the next poll interval or job completion
+                        await Promise.race([
+                            new Promise<void>((resolve) =>
+                                setTimeout(resolve, POLL_INTERVAL_MS)
+                            ),
+                            job.donePromise,
+                        ]);
                     }
 
-                    const output = getTmuxContext(job)
-                        ? await readTmuxOutput(job, MAX_OUTPUT_PREVIEW_CHARS)
-                        : await readOutputTail(
-                              job.logPath,
-                              MAX_OUTPUT_PREVIEW_CHARS
-                          );
+                    // Read final output
+                    const output = await readOutputTail(
+                        job.logPath,
+                        MAX_OUTPUT_PREVIEW_CHARS
+                    );
                     job.outputConsumed = true;
+
+                    if (signal?.aborted) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `Attach aborted for ${job.id}. ` +
+                                        `Job is still running.\n` +
+                                        `Log: ${job.logPath}\n\n${output}`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
+                    if (Date.now() >= deadline) {
+                        const runtime = formatDuration(
+                            Date.now() - job.startTime
+                        );
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `⚠️ Attach timed out after ${MAX_ATTACH_MS / 1000}s ` +
+                                        `for ${job.id}. Job is still running ` +
+                                        `(${runtime}).\n` +
+                                        `PID: ${job.pid}\n` +
+                                        `Log: ${job.logPath}\n\n${output}\n\n` +
+                                        `Use jobs(output) to check again, ` +
+                                        `or jobs(kill) to terminate.`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+
                     return {
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Attach finished for ${job.id}. Status: ${job.status}\nLog: ${job.logPath}\n\n${output}`,
+                                text:
+                                    `Attach finished for ${job.id}. ` +
+                                    `Status: ${job.status}\n` +
+                                    `Log: ${job.logPath}\n\n${output}`,
                             },
                         ],
                         details: undefined,
@@ -1052,7 +2171,7 @@ export function registerBackgroundJobs(
         promptSnippet: "Decide on a timed-out background job",
         promptGuidelines: [
             "Use job_decide with decision 'keep' to let the job continue running in the background.",
-            "Use job_decide with decision 'kill' to terminate the job.",
+            "Use job_decide with decision 'kill' to terminate the job (also cancels linked reminders).",
             "Use job_decide with decision 'check' to see the job's current output before deciding.",
         ],
         parameters: Type.Object({
@@ -1115,12 +2234,16 @@ export function registerBackgroundJobs(
                     };
                 }
                 case "check": {
-                    const output = getTmuxContext(job)
-                        ? await readTmuxOutput(job, MAX_OUTPUT_PREVIEW_CHARS)
-                        : await readOutputTail(
-                              job.logPath,
-                              MAX_OUTPUT_PREVIEW_CHARS
-                          );
+                    const output = await readOutputTail(
+                        job.logPath,
+                        MAX_OUTPUT_PREVIEW_CHARS
+                    );
+                    // Agent has seen this terminal job's output —
+                    // suppress completion notification and cancel reminds.
+                    if (job.status !== "running") {
+                        job.outputConsumed = true;
+                        cancelCallbacksForJob(job.id);
+                    }
                     return {
                         content: [
                             {
@@ -1134,6 +2257,25 @@ export function registerBackgroundJobs(
             }
         },
     });
+
+    // Wire completion-batch cancellation into state so the callbacks module
+    // can suppress stale job-completion notifications when cancelling reminders.
+    state.cancelCompletionBatchForJob = clearJobFromCompletionBatch;
+    state.cancelAllCompletionBatches = clearAllCompletionBatches;
+    state._flushCompletionBatch = flushCompletionBatch;
+
+    // Inject guidance about bash_bg + remindDelay into the remind tool.
+    // This belongs here (the bg module) rather than hardcoded in callbacks.ts
+    // because it's guidance about bg workflow, cross-cutting two tools.
+    (pi as ExtensionAPI & {
+        registerToolPromptGuidelines: (toolName: string, guidelines: string[]) => void;
+    }).registerToolPromptGuidelines("remind", [
+        "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
+            "the callback auto-cancels when the job completes.",
+        "When you do use manual remind() to check on a running job, pass the jobId parameter " +
+            "so the callback auto-cancels when the job completes or is killed.",
+        "Use manual remind() only for standalone reminders that aren't linked to a job.",
+    ]);
 }
 
 // ─── Tmux foreground execution ──────────────────────────────────────
@@ -1340,7 +2482,7 @@ async function executeTmuxForeground(
             state.currentlyRunningToolCallId = null;
 
             // Start stall watchdog
-            startStallWatchdog(jobId, command, logPath, pi, () => {
+            startStallWatchdog(jobId, command, logPath, pi, state, () => {
                 killTmuxJob(job);
             });
 
