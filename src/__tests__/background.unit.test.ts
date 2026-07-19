@@ -8,6 +8,8 @@ import {
     notifyCompletion,
     clearJobFromCompletionBatch,
     clearAllCompletionBatches,
+    chunkText,
+    formatJobOutput,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
 import { TauState } from "../state.ts";
@@ -1008,5 +1010,195 @@ void describe("clearJobFromCompletionBatch", () => {
         clearAllCompletionBatches();
         // Should not throw
         clearJobFromCompletionBatch("job-nonexistent");
+    });
+});
+
+// ─── chunkText —──────────────────────────────────────────────────────
+
+void describe("chunkText", () => {
+    const sid = "ctx_bg_test";
+
+    void it("returns a single chunk for small text (< 4 KiB)", () => {
+        const text = "Hello world\nThis is a small text";
+        const chunks = chunkText(text, sid);
+        assert.equal(chunks.length, 1);
+        assert.equal(chunks[0].sourceId, sid);
+        assert.equal(chunks[0].ordinal, 1);
+        assert.ok(chunks[0].byteCount < 4096);
+    });
+
+    void it("preserves content in the chunk", () => {
+        const text = "Hello world";
+        const chunks = chunkText(text, sid);
+        assert.equal(chunks.length, 1);
+        assert.equal(chunks[0].content, text);
+    });
+
+    void it("assigns sequential ordinals and stable ids for multiple chunks", () => {
+        // Two paragraphs that fit together (small) should yield 1 chunk
+        // For ordinals > 1 we need large enough text to force splitting
+        const bigPara = "x".repeat(3000);
+        const text = `${bigPara}\n\n${bigPara}`;
+        const chunks = chunkText(text, sid);
+        assert.ok(chunks.length >= 2, "should produce at least 2 chunks");
+        assert.equal(chunks[0].ordinal, 1);
+        assert.equal(chunks[1].ordinal, 2);
+        assert.ok(chunks[0].id.endsWith("_0001"));
+        assert.ok(chunks[1].id.endsWith("_0002"));
+    });
+
+    void it("extracts first non-empty line as title", () => {
+        const chunks = chunkText("line1\nline2", sid);
+        assert.equal(chunks[0].title, "line1");
+    });
+
+    void it("uses '(empty)' title when no non-empty lines exist", () => {
+        const chunks = chunkText("\n\n  \n", sid);
+        assert.equal(chunks[0].title, "(empty)");
+    });
+
+    void it("returns empty chunk for empty string", () => {
+        const chunks = chunkText("", sid);
+        assert.equal(chunks.length, 1);
+        assert.equal(chunks[0].content, "");
+    });
+
+    void it("splits large paragraph (> 4 KiB) by lines", () => {
+        const line = "x".repeat(200);
+        const para = Array.from({ length: 50 }, (_, i) => `${line} ${i}`).join("\n");
+        // ~50 * (200+2) = ~10100 bytes — well over 4 KiB
+        const chunks = chunkText(para, sid);
+        assert.ok(chunks.length >= 2, "should split large paragraph");
+        assert.ok(chunks[0].byteCount <= 4096, "each chunk should be <= 4 KiB");
+        for (const c of chunks) {
+            assert.ok(
+                c.byteCount <= 4096,
+                `chunk ${c.ordinal} exceeds 4 KiB (${c.byteCount})`
+            );
+        }
+    });
+
+    void it("splits multiple small paragraphs into separate chunks only when combined > 4 KiB", () => {
+        // Two paragraphs that are small individually but large together
+        const largeLine = "x".repeat(3000);
+        const text = `${largeLine}\n\n${largeLine}`;
+        const chunks = chunkText(text, sid);
+        // Each paragraph is ~3 KiB, combined ~6 KiB > 4 KiB, so 2 chunks
+        assert.equal(chunks.length, 2);
+        assert.ok(chunks[0].byteCount <= 4096);
+        assert.ok(chunks[1].byteCount <= 4096);
+    });
+
+    void it("handles paragraphs whose content fits under boundary together", () => {
+        const small = "x".repeat(1000);
+        const text = `${small}\n\n${small}`;
+        // Combined ~2 KiB < 4 KiB — single chunk
+        const chunks = chunkText(text, sid);
+        assert.equal(chunks.length, 1);
+    });
+
+    void it("counts byteCount correctly per chunk", () => {
+        const text = "Hello world";
+        const chunks = chunkText(text, sid);
+        assert.equal(chunks[0].byteCount, Buffer.byteLength(text, "utf8"));
+    });
+});
+
+// ─── formatJobOutput —────────────────────────────────────────────────
+
+void describe("formatJobOutput", () => {
+    const sample = ["line 1", "line 2", "line 3", "line 4", "line 5"].join("\n");
+
+    void it("returns all lines without grep/head/tail", () => {
+        const r = formatJobOutput({ text: sample });
+        assert.equal(r.totalLines, 5);
+        assert.ok(!r.isTruncated);
+        assert.ok(r.text.includes("   1: line 1"));
+        assert.ok(r.text.includes("   5: line 5"));
+    });
+
+    void it("filters lines by grep pattern", () => {
+        const text = ["apple", "banana", "cherry", "date", "elderberry"].join("\n");
+        // 'a' matches apple, banana, date
+        const r = formatJobOutput({ text, grepPattern: "a" });
+        assert.equal(r.totalLines, 3);
+        assert.ok(r.text.includes("apple"));
+        assert.ok(r.text.includes("banana"));
+        assert.ok(r.text.includes("date"));
+        assert.ok(!r.text.includes("cherry"));
+    });
+
+    void it("returns (no lines matching) for grep with no matches", () => {
+        const r = formatJobOutput({ text: sample, grepPattern: "zzz" });
+        assert.equal(r.totalLines, 0);
+        assert.ok(r.text.includes("no lines matching"));
+    });
+
+    void it("handles invalid grep regex gracefully", () => {
+        const r = formatJobOutput({ text: sample, grepPattern: "[" });
+        assert.equal(r.totalLines, 0);
+        assert.ok(r.text.includes("grep error"));
+    });
+
+    void it("respects head parameter", () => {
+        const r = formatJobOutput({ text: sample, headCount: 2 });
+        assert.equal(r.totalLines, 5);
+        assert.ok(r.text.includes("   1: line 1"));
+        assert.ok(r.text.includes("   2: line 2"));
+        assert.ok(!r.text.includes("   3: line 3"));
+    });
+
+    void it("respects tail parameter", () => {
+        const r = formatJobOutput({ text: sample, tailCount: 2 });
+        assert.equal(r.totalLines, 5);
+        assert.ok(r.text.includes("   4: line 4"));
+        assert.ok(r.text.includes("   5: line 5"));
+        assert.ok(!r.text.includes("   1: line 1"));
+    });
+
+    void it("combines head and tail", () => {
+        const r = formatJobOutput({
+            text: sample,
+            headCount: 3,
+            tailCount: 2,
+        });
+        // tail is applied after head, so we get last 2 of first 3
+        assert.equal(r.totalLines, 5);
+        assert.ok(r.text.includes("   2: line 2"));
+        assert.ok(r.text.includes("   3: line 3"));
+        assert.ok(!r.text.includes("   1: line 1"));
+        assert.ok(!r.text.includes("   4: line 4"));
+    });
+
+    void it("shows hints footer when lines are hidden", () => {
+        const r = formatJobOutput({ text: sample, headCount: 2 });
+        assert.ok(r.text.includes("more lines"));
+        assert.ok(r.text.includes("head=N or tail=N"));
+    });
+
+    void it("shows hints footer when output is truncated", () => {
+        const r = formatJobOutput({
+            text: "...[truncated\n" + sample,
+            headCount: 2,
+        });
+        assert.ok(r.isTruncated);
+        assert.ok(r.text.includes("output was truncated"));
+    });
+
+    void it("returns (no lines) for empty text without grep", () => {
+        const r = formatJobOutput({ text: "" });
+        assert.equal(r.totalLines, 1); // one empty line
+        // Should still show the empty line
+        assert.ok(r.text.includes("   1:"));
+    });
+
+    void it("isTruncated is true when text starts with ...[truncated", () => {
+        const r = formatJobOutput({ text: "...[truncated output here" });
+        assert.ok(r.isTruncated);
+    });
+
+    void it("isTruncated is false for normal text", () => {
+        const r = formatJobOutput({ text: "normal output" });
+        assert.ok(!r.isTruncated);
     });
 });

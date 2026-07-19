@@ -170,7 +170,7 @@ export async function readJobOutputFromSidecar(jobId: string): Promise<string | 
 /**
  * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
  */
-function chunkText(
+export function chunkText(
     text: string,
     sourceId: string
 ): {
@@ -591,6 +591,102 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     if (state.recentTerminalJobs.length > MAX_RECENT_TERMINAL) {
         state.recentTerminalJobs.shift();
     }
+}
+
+// ─── Job output formatting (grep/tail/head) ──────────────────────────
+
+/**
+ * Parameters for formatJobOutput.
+ */
+export interface FormatJobOutputParams {
+    text: string;
+    grepPattern?: string;
+    headCount?: number;
+    tailCount?: number;
+}
+
+/**
+ * Result of formatJobOutput.
+ */
+export interface FormatJobOutputResult {
+    /** The formatted text output (numbered lines, hints footer). */
+    text: string;
+    /** Total number of matched lines before applying head/tail slice. */
+    totalLines: number;
+    /** Whether the input was truncated (content starts with "...[truncated"). */
+    isTruncated: boolean;
+}
+
+/**
+ * Filter lines by grep pattern, apply head/tail slicing, and format with
+ * line numbers and hints footer. Used by jobs(action="output") and exposed
+ * for unit testing.
+ *
+ * - If grepPattern is set, only matching lines are included.
+ * - headCount/tailCount slice from the start/end of the filtered set.
+ * - The result includes a hints footer when lines were hidden or truncated.
+ */
+export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputResult {
+    const { text, grepPattern, headCount, tailCount } = params;
+
+    // Filter lines (by grep or all)
+    const lines = text.split("\n");
+    let matched: { line: string; num: number }[];
+
+    if (!grepPattern) {
+        matched = lines.map((l, i) => ({ line: l, num: i + 1 }));
+    } else {
+        let re: RegExp;
+        try {
+            re = new RegExp(grepPattern, "i");
+        } catch {
+            return {
+                text: `(grep error: invalid regex /${grepPattern}/i)`,
+                totalLines: 0,
+                isTruncated: false,
+            };
+        }
+        matched = lines
+            .map((l, i) => ({ line: l, num: i + 1 }))
+            .filter(({ line }) => re.test(line));
+    }
+
+    const totalLines = matched.length;
+
+    if (matched.length === 0) {
+        const text = grepPattern
+            ? `(no lines matching /${grepPattern}/i)`
+            : "(no lines)";
+        return { text, totalLines, isTruncated: false };
+    }
+
+    if (headCount !== undefined) matched = matched.slice(0, headCount);
+    if (tailCount !== undefined) matched = matched.slice(-tailCount);
+
+    const isTruncated = text.startsWith("...[truncated");
+
+    // Format with line numbers
+    const body = matched
+        .map(({ line, num }) => `${String(num).padStart(4, " ")}: ${line}`)
+        .join("\n");
+
+    // Build hints footer
+    const hints: string[] = [];
+    if (matched.length < totalLines) {
+        const hidden = totalLines - matched.length;
+        hints.push(`${hidden} more line${hidden !== 1 ? "s" : ""}`);
+    }
+    if (isTruncated) {
+        hints.push("output was truncated");
+    }
+
+    let result = body;
+    if (hints.length > 0) {
+        const suggestion = !grepPattern ? " or grep='pattern' to search" : "";
+        result += `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`;
+    }
+
+    return { text: result, totalLines, isTruncated };
 }
 
 /**
@@ -1722,80 +1818,8 @@ export function registerBackgroundJobs(
                         throw new Error("jobId is required for action=output");
 
                     const grepPattern = params.grep;
-                    const headCount =
-                        params.head ??
-                        (params.tail !== undefined ? undefined : undefined);
-                    const tailCount =
-                        params.tail ??
-                        (params.head !== undefined ? undefined : 10);
-
-                    // Helper: return matching lines (or all lines if no grep),
-                    // each with a 1-based line number
-                    function filterLines(
-                        text: string
-                    ): { line: string; num: number }[] {
-                        const lines = text.split("\n");
-                        if (!grepPattern) {
-                            return lines.map((l, i) => ({
-                                line: l,
-                                num: i + 1,
-                            }));
-                        }
-                        let re: RegExp;
-                        try {
-                            re = new RegExp(grepPattern, "i");
-                        } catch {
-                            throw new Error(
-                                `Invalid grep regex: ${grepPattern}`
-                            );
-                        }
-                        return lines
-                            .map((l, i) => ({ line: l, num: i + 1 }))
-                            .filter(({ line }) => re!.test(line));
-                    }
-
-                    // Build the final text from filtered + head/tail
-                    function formatLines(
-                        matched: { line: string; num: number }[],
-                        originalCount?: number,
-                        truncated?: boolean
-                    ): string {
-                        if (matched.length === 0) {
-                            return grepPattern
-                                ? `(no lines matching /${grepPattern}/i)`
-                                : "(no lines)";
-                        }
-                        const result = matched
-                            .map(
-                                ({ line, num }) =>
-                                    `${String(num).padStart(4, " ")}: ${line}`
-                            )
-                            .join("\n");
-                        // Build hints footer
-                        const hints: string[] = [];
-                        if (
-                            originalCount !== undefined &&
-                            matched.length < originalCount
-                        ) {
-                            const hidden = originalCount - matched.length;
-                            hints.push(
-                                `${hidden} more line${hidden !== 1 ? "s" : ""}`
-                            );
-                        }
-                        if (truncated) {
-                            hints.push("output was truncated");
-                        }
-                        if (hints.length > 0) {
-                            const suggestion = !grepPattern
-                                ? " or grep='pattern' to search"
-                                : "";
-                            return (
-                                result +
-                                `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`
-                            );
-                        }
-                        return result;
-                    }
+                    const headCount = params.head;
+                    const tailCount = params.tail;
 
                     // Try the in-memory job first
                     const job = lookupJob(state, params.jobId);
@@ -1810,18 +1834,12 @@ export function registerBackgroundJobs(
                             job.outputConsumed = true;
                             cancelCallbacksForJob(job.id);
                         }
-                        let matched = filterLines(output);
-                        const total = matched.length;
-                        if (headCount !== undefined)
-                            matched = matched.slice(0, headCount);
-                        if (tailCount !== undefined)
-                            matched = matched.slice(-tailCount);
-                        const isTruncated = output.startsWith("...[truncated");
-                        const formatted = formatLines(
-                            matched,
-                            total,
-                            isTruncated
-                        );
+                        const formatted = formatJobOutput({
+                            text: output,
+                            grepPattern,
+                            headCount,
+                            tailCount,
+                        });
                         return {
                             content: [
                                 {
@@ -1850,19 +1868,12 @@ export function registerBackgroundJobs(
                         params.jobId
                     );
                     if (sidecarOutput) {
-                        let matched = filterLines(sidecarOutput);
-                        const total = matched.length;
-                        if (headCount !== undefined)
-                            matched = matched.slice(0, headCount);
-                        if (tailCount !== undefined)
-                            matched = matched.slice(-tailCount);
-                        const isTruncated =
-                            sidecarOutput.startsWith("...[truncated");
-                        const formatted = formatLines(
-                            matched,
-                            total,
-                            isTruncated
-                        );
+                        const formatted = formatJobOutput({
+                            text: sidecarOutput,
+                            grepPattern,
+                            headCount,
+                            tailCount,
+                        });
                         return {
                             content: [
                                 {
