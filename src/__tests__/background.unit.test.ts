@@ -1,8 +1,12 @@
-import { describe, it } from "node:test";
+import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
     registerBackgroundJobs,
+    notifyCompletion,
     clearPendingDecision,
+    clearAllCompletionBatches,
+    formatJobOutput,
+    getOutputMetadata,
     lookupJob,
     startTimeoutTimer,
 } from "../features/background.ts";
@@ -11,6 +15,7 @@ import { TauState } from "../state.ts";
 import type { BackgroundJob, RunningProcess } from "../types.ts";
 import { createJobDonePromise } from "../utils.ts";
 import { silenceJobAfterKill } from "../features/background.ts";
+import { notifyTmuxCompletion } from "../features/bash-tmux.ts";
 
 /** Helper to create a BackgroundJob with all required fields. */
 function makeJob(
@@ -262,6 +267,132 @@ void describe("clearPendingDecision", () => {
 });
 
 // ─── jobs kill ──────────────────────────────────────────────────────────
+
+void describe("jobs output — structured details", () => {
+    void it("normalizes empty and newline-terminated output", () => {
+        assert.deepEqual(getOutputMetadata(""), {
+            totalLines: 0,
+            truncated: false,
+            empty: true,
+            error: false,
+        });
+        assert.equal(getOutputMetadata(" \n\t").empty, true);
+        assert.equal(formatJobOutput({ text: " \n\t" }).empty, true);
+        assert.equal(formatJobOutput({ text: "one\n" }).totalLines, 1);
+        assert.equal(formatJobOutput({ text: "one\ntwo\n" }).totalLines, 2);
+        assert.equal(
+            formatJobOutput({ text: "...[truncated]\none\n" }).truncated,
+            true
+        );
+        assert.equal(
+            formatJobOutput({
+                text: "...[truncated]\none\n",
+                grepPattern: "missing",
+            }).truncated,
+            true
+        );
+        const noMatch = formatJobOutput({
+            text: "one\ntwo",
+            grepPattern: "missing",
+        });
+        assert.equal(noMatch.totalLines, 0);
+        assert.equal(noMatch.empty, true);
+        const invalid = formatJobOutput({ text: "one", grepPattern: "[" });
+        assert.equal(invalid.error, true);
+        assert.equal(invalid.empty, false);
+    });
+
+    void it("returns empty metadata for an empty log", async () => {
+        const { unlinkSync, writeFileSync } = await import("node:fs");
+        const logPath = "/tmp/pi-bg-job-details-empty.log";
+        writeFileSync(logPath, "");
+        const state = new TauState();
+        state.backgroundJobs.set(
+            "job-details-empty",
+            makeJob({ id: "job-details-empty", logPath })
+        );
+        try {
+            const result = await captureJobsTool(state).execute(
+                "tc-details-empty",
+                { action: "output", jobId: "job-details-empty" },
+                null,
+                null,
+                null
+            );
+            const details = result.details as Record<string, unknown>;
+            assert.equal(details.totalLines, 0);
+            assert.equal(details.empty, true);
+            assert.equal(details.error, false);
+        } finally {
+            unlinkSync(logPath);
+        }
+    });
+
+    void it("marks a missing log as an output error", async () => {
+        const state = new TauState();
+        state.backgroundJobs.set(
+            "job-details-missing",
+            makeJob({
+                id: "job-details-missing",
+                status: "completed",
+                logPath: "/tmp/pi-bg-job-details-missing.log",
+            })
+        );
+        const result = await captureJobsTool(state).execute(
+            "tc-details-missing",
+            { action: "output", jobId: "job-details-missing" },
+            null,
+            null,
+            null
+        );
+        const details = result.details as Record<string, unknown>;
+        assert.equal(details.empty, true);
+        assert.equal(details.error, true);
+    });
+
+    void it("returns line counts and lifecycle metadata without parsing text", async () => {
+        const { unlinkSync, writeFileSync } = await import("node:fs");
+        const logPath = "/tmp/pi-bg-job-details-1.log";
+        writeFileSync(logPath, "first\nsecond\nthird\n");
+        const state = new TauState();
+        state.backgroundJobs.set(
+            "job-details-1",
+            makeJob({
+                id: "job-details-1",
+                status: "completed",
+                exitCode: 0,
+                logPath,
+                outputIndexPromise: Promise.resolve({
+                    sourceId: "src-details-1",
+                    chunkIds: ["src-details-1_0001"],
+                }),
+            })
+        );
+
+        try {
+            const result = await captureJobsTool(state).execute(
+                "tc-details-1",
+                { action: "output", jobId: "job-details-1", head: 1 },
+                null,
+                null,
+                null
+            );
+            const details = result.details as Record<string, unknown>;
+            assert.equal(details.jobId, "job-details-1");
+            assert.equal(details.status, "completed");
+            assert.equal(details.exitCode, 0);
+            assert.equal(details.totalLines, 3);
+            assert.equal(details.truncated, false);
+            assert.equal(details.empty, false);
+            assert.equal(details.error, false);
+            assert.equal(details.logPath, logPath);
+            assert.equal(details.sourceId, "src-details-1");
+            assert.deepEqual(details.chunkIds, ["src-details-1_0001"]);
+        } finally {
+            unlinkSync(logPath);
+        }
+    });
+});
 
 void describe("jobs kill — outputConsumed", () => {
     void it("sets outputConsumed when killing a running job", async () => {
@@ -757,235 +888,389 @@ function mockProc(
     return ee;
 }
 
-void describe("registerBackgroundJob — proc close cleanup", () => {
-    void it("removes job from backgroundJobs map when process exits", async () => {
-        // We need registerBackgroundJob exported to test this directly.
-        // This test will fail at import time until the function is exported.
-        const { registerBackgroundJob: _rbg } =
-            await import("../features/background.ts");
+void describe(
+    "registerBackgroundJob — proc close cleanup",
+    { concurrency: 1 },
+    () => {
+        afterEach(() => {
+            // Completion notifications are debounced into a module-level batch;
+            // the unref'd debounce timer never fires between fast tests, so drain
+            // it explicitly to avoid cross-test contamination.
+            clearAllCompletionBatches();
+        });
 
-        const state = new TauState();
-        const proc = mockProc(-77777);
+        void it("removes job from backgroundJobs map when process exits", async () => {
+            // We need registerBackgroundJob exported to test this directly.
+            // This test will fail at import time until the function is exported.
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
 
-        const pi = {
-            registerTool() {},
-            sendMessage() {},
-        } as never;
+            const state = new TauState();
+            const proc = mockProc(-77777);
 
-        const ctx = {
-            ui: {
-                notify() {},
-                setWidget() {},
-                setStatus() {},
-                theme: { fg: () => "" },
-            },
-        } as never;
+            const pi = {
+                registerTool() {},
+                sendMessage() {},
+            } as never;
 
-        const job = _rbg(
-            proc,
-            "/tmp/test-bg-job.log",
-            "echo hello",
-            "tc-bg-1",
-            state,
-            pi,
-            ctx
-        );
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
 
-        // Job should be in the map
-        assert.equal(state.backgroundJobs.has(job.id), true);
-        assert.equal(job.status, "running");
+            const job = _rbg(
+                proc,
+                "/tmp/test-bg-job.log",
+                "echo hello",
+                "tc-bg-1",
+                state,
+                pi,
+                ctx
+            );
 
-        // Simulate process exit
-        proc.emitClose(0);
+            // Job should be in the map
+            assert.equal(state.backgroundJobs.has(job.id), true);
+            assert.equal(job.status, "running");
 
-        // After close: job should be cleaned up
-        assert.equal(
-            state.backgroundJobs.has(job.id),
-            false,
-            "job must be removed from backgroundJobs after proc closes"
-        );
-        assert.equal(
-            job.status,
-            "completed",
-            "job status must be updated to completed"
-        );
-    });
+            // Simulate process exit
+            proc.emitClose(0);
 
-    void it("marks job as failed on non-zero exit", async () => {
-        const { registerBackgroundJob: _rbg } =
-            await import("../features/background.ts");
+            // After close: job should be cleaned up
+            assert.equal(
+                state.backgroundJobs.has(job.id),
+                false,
+                "job must be removed from backgroundJobs after proc closes"
+            );
+            assert.equal(
+                job.status,
+                "completed",
+                "job status must be updated to completed"
+            );
+        });
 
-        const state = new TauState();
-        const proc = mockProc(-77778);
+        void it("marks job as failed on non-zero exit", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
 
-        const pi = {
-            registerTool() {},
-            sendMessage() {},
-        } as never;
+            const state = new TauState();
+            const proc = mockProc(-77778);
 
-        const ctx = {
-            ui: {
-                notify() {},
-                setWidget() {},
-                setStatus() {},
-                theme: { fg: () => "" },
-            },
-        } as never;
+            const pi = {
+                registerTool() {},
+                sendMessage() {},
+            } as never;
 
-        const job = _rbg(
-            proc,
-            "/tmp/test-bg-job-fail.log",
-            "exit 1",
-            "tc-bg-2",
-            state,
-            pi,
-            ctx
-        );
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
 
-        proc.emitClose(1);
+            const job = _rbg(
+                proc,
+                "/tmp/test-bg-job-fail.log",
+                "exit 1",
+                "tc-bg-2",
+                state,
+                pi,
+                ctx
+            );
 
-        assert.equal(
-            job.status,
-            "failed",
-            "job status must be failed on non-zero exit"
-        );
-        assert.equal(job.exitCode, 1, "exit code must be recorded");
-        assert.equal(
-            state.backgroundJobs.has(job.id),
-            false,
-            "failed job must also be removed from backgroundJobs"
-        );
-    });
+            proc.emitClose(1);
 
-    void it("resolves donePromise when process exits", async () => {
-        const { registerBackgroundJob: _rbg } =
-            await import("../features/background.ts");
+            assert.equal(
+                job.status,
+                "failed",
+                "job status must be failed on non-zero exit"
+            );
+            assert.equal(job.exitCode, 1, "exit code must be recorded");
+            assert.equal(
+                state.backgroundJobs.has(job.id),
+                false,
+                "failed job must also be removed from backgroundJobs"
+            );
+        });
 
-        const state = new TauState();
-        const proc = mockProc(-77779);
+        void it("resolves donePromise when process exits", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
 
-        const pi = {
-            registerTool() {},
-            sendMessage() {},
-        } as never;
+            const state = new TauState();
+            const proc = mockProc(-77779);
 
-        const ctx = {
-            ui: {
-                notify() {},
-                setWidget() {},
-                setStatus() {},
-                theme: { fg: () => "" },
-            },
-        } as never;
+            const pi = {
+                registerTool() {},
+                sendMessage() {},
+            } as never;
 
-        const job = _rbg(
-            proc,
-            "/tmp/test-bg-done.log",
-            "echo done",
-            "tc-bg-3",
-            state,
-            pi,
-            ctx
-        );
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
 
-        assert.ok(job.donePromise, "donePromise must exist");
+            const job = _rbg(
+                proc,
+                "/tmp/test-bg-done.log",
+                "echo done",
+                "tc-bg-3",
+                state,
+                pi,
+                ctx
+            );
 
-        // donePromise should resolve when proc closes
-        const promise = job.donePromise;
-        proc.emitClose(0);
-        await promise; // Should resolve, not hang
+            assert.ok(job.donePromise, "donePromise must exist");
 
-        assert.equal(job.status, "completed");
-    });
+            // donePromise should resolve when proc closes
+            const promise = job.donePromise;
+            proc.emitClose(0);
+            await promise; // Should resolve, not hang
 
-    void it("notifies agent of completion", async () => {
-        const { registerBackgroundJob: _rbg } =
-            await import("../features/background.ts");
+            assert.equal(job.status, "completed");
+        });
 
-        const state = new TauState();
-        const proc = mockProc(-77780);
-        const sentMessages: unknown[] = [];
+        void it("notifies agent of failed completion, suppresses plain success", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
 
-        const pi = {
-            registerTool() {},
-            sendMessage(msg: unknown) {
-                sentMessages.push(msg);
-            },
-        } as never;
+            const state = new TauState();
+            // Wire state._flushCompletionBatch via the registration path so the
+            // test can flush the debounced completion batch deterministically.
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const proc = mockProc(-77780);
+            const sentMessages: unknown[] = [];
 
-        const ctx = {
-            ui: {
-                notify() {},
-                setWidget() {},
-                setStatus() {},
-                theme: { fg: () => "" },
-            },
-        } as never;
+            const pi = {
+                registerTool() {},
+                sendMessage(msg: unknown) {
+                    sentMessages.push(msg);
+                },
+            } as never;
 
-        const job = _rbg(
-            proc,
-            "/tmp/test-bg-notify.log",
-            "echo notify",
-            "tc-bg-4",
-            state,
-            pi,
-            ctx
-        );
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
 
-        proc.emitClose(0);
+            // Successful completions are debounced AND suppressed when no linked
+            // callback wants the final notification — flush the batch to prove it.
+            const successJob = _rbg(
+                proc,
+                "/tmp/test-bg-notify.log",
+                "echo notify",
+                "tc-bg-4",
+                state,
+                pi,
+                ctx
+            );
+            proc.emitClose(0);
+            await successJob.outputIndexPromise;
+            state._flushCompletionBatch?.();
+            assert.equal(
+                sentMessages.length,
+                0,
+                "plain successful completion must be suppressed"
+            );
 
-        assert.equal(
-            sentMessages.length,
-            1,
-            "must send one completion notification"
-        );
-        const msg = sentMessages[0] as { customType: string; content: string };
-        assert.equal(msg.customType, "job-completion");
-        assert.ok(msg.content.includes(job.id));
-    });
+            // Failed completions are always delivered (one message, flushed).
+            const job2 = _rbg(
+                proc,
+                "/tmp/test-bg-notify-fail.log",
+                "exit 1",
+                "tc-bg-4b",
+                state,
+                pi,
+                ctx
+            );
+            proc.emitClose(1);
+            await job2.outputIndexPromise;
+            state._flushCompletionBatch?.();
+            assert.equal(
+                sentMessages.length,
+                1,
+                "failed completion must send one notification"
+            );
+            const msg = sentMessages[0] as {
+                customType: string;
+                content: string;
+            };
+            assert.equal(msg.customType, "job-completion");
+            assert.ok(msg.content.includes(job2.id));
+        });
 
-    void it("increments completedJobCount after cleanup", async () => {
-        const { registerBackgroundJob: _rbg } =
-            await import("../features/background.ts");
+        void it("waits for output indexing before delivering completion metadata", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    registerToolPromptGuidelines() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const job = makeJob({
+                id: "job-indexed-completion",
+                status: "failed",
+                exitCode: 1,
+                wantsCompletionNotification: true,
+                sourceId: "src-indexed-completion",
+                chunkIds: ["src-indexed-completion_0001"],
+                outputIndexPromise: Promise.resolve({
+                    sourceId: "src-indexed-completion",
+                    chunkIds: ["src-indexed-completion_0001"],
+                }),
+            });
+            state.backgroundJobs.set(job.id, job);
 
-        const state = new TauState();
-        const proc = mockProc(-77781);
+            notifyCompletion(job, state, pi, ctx);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            state._flushCompletionBatch?.();
 
-        const pi = {
-            registerTool() {},
-            sendMessage() {},
-        } as never;
+            assert.equal(sentMessages.length, 1);
+            const message = sentMessages[0] as {
+                details: { sourceId?: string; chunkIds?: string[] };
+            };
+            assert.equal(message.details.sourceId, "src-indexed-completion");
+            assert.deepEqual(message.details.chunkIds, [
+                "src-indexed-completion_0001",
+            ]);
+        });
 
-        const ctx = {
-            ui: {
-                notify() {},
-                setWidget() {},
-                setStatus() {},
-                theme: { fg: () => "" },
-            },
-        } as never;
+        void it("waits for tmux output indexing and includes source IDs", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: { notify() {} },
+            } as never;
+            let release!: () => void;
+            const ready = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            const job = makeJob({
+                id: "tmux-indexed-completion",
+                status: "completed",
+            });
+            job.outputIndexPromise = ready.then(() => {
+                job.sourceId = "src-tmux-completion";
+                job.chunkIds = ["src-tmux-completion_0001"];
+                return {
+                    sourceId: job.sourceId,
+                    chunkIds: job.chunkIds,
+                };
+            });
+            state.backgroundJobs.set(job.id, job);
 
-        assert.equal(state.completedJobCount, 0);
+            const notification = notifyTmuxCompletion(job, state, pi, ctx);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.equal(sentMessages.length, 0);
+            assert.equal(state.backgroundJobs.has(job.id), true);
 
-        _rbg(
-            proc,
-            "/tmp/test-bg-counter.log",
-            "echo count",
-            "tc-bg-5",
-            state,
-            pi,
-            ctx
-        );
+            release();
+            await notification;
+            assert.equal(sentMessages.length, 1);
+            const message = sentMessages[0] as {
+                details: { sourceId?: string; chunkIds?: string[] };
+            };
+            assert.equal(message.details.sourceId, "src-tmux-completion");
+            assert.deepEqual(message.details.chunkIds, [
+                "src-tmux-completion_0001",
+            ]);
+            assert.equal(state.backgroundJobs.has(job.id), false);
+        });
 
-        proc.emitClose(0);
+        void it("increments completedJobCount after cleanup", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
 
-        assert.equal(
-            state.completedJobCount,
-            1,
-            "completedJobCount must increment"
-        );
-    });
-});
+            const state = new TauState();
+            const proc = mockProc(-77781);
+
+            const pi = {
+                registerTool() {},
+                sendMessage() {},
+            } as never;
+
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+
+            assert.equal(state.completedJobCount, 0);
+
+            _rbg(
+                proc,
+                "/tmp/test-bg-counter.log",
+                "echo count",
+                "tc-bg-5",
+                state,
+                pi,
+                ctx
+            );
+
+            proc.emitClose(0);
+
+            assert.equal(
+                state.completedJobCount,
+                1,
+                "completedJobCount must increment"
+            );
+        });
+    }
+);
 
 // ─── bash tool — foreground completion cleanup ──────────────────────
 
@@ -1008,6 +1293,7 @@ function captureBashTool(state: TauState) {
             if (tool.name === "bash") captured = tool as typeof captured;
         },
         registerCommand() {},
+        registerToolPromptGuidelines() {},
         sendMessage() {},
     } as never;
 
@@ -1100,6 +1386,42 @@ void describe("jobs attach — dead process detection", () => {
 
 // ─── jobs attach — abort signal ────────────────────────────────────────
 
+void describe("jobs attach — timeout metadata", () => {
+    void it("returns timedOut metadata without waiting a full poll interval", async () => {
+        const state = new TauState();
+        const logPath = "/tmp/pi-bg-job-timeout-1.log";
+        const { writeFileSync, unlinkSync } = await import("node:fs");
+        writeFileSync(logPath, "still running\n");
+        const job = makeJob({
+            id: "job-timeout-1",
+            pid: process.pid,
+            status: "running",
+            logPath,
+            toolCallId: "tc-attach-timeout",
+        });
+        createJobDonePromise(job);
+        state.backgroundJobs.set(job.id, job);
+        const tool = captureJobsTool(state);
+        const started = Date.now();
+        try {
+            const result = await tool.execute(
+                "tc-attach-timeout",
+                { action: "attach", jobId: job.id, wait: true, timeout: 0.01 },
+                null,
+                null,
+                null
+            );
+            const details = result.details as Record<string, unknown>;
+            assert.equal(details.timedOut, true);
+            assert.equal(details.empty, false);
+            assert.equal(details.error, false);
+            assert.ok(Date.now() - started < 1_000);
+        } finally {
+            unlinkSync(logPath);
+        }
+    });
+});
+
 void describe("jobs attach — abort signal", () => {
     void it("returns promptly when abort signal fires", async () => {
         const state = new TauState();
@@ -1147,6 +1469,11 @@ void describe("jobs attach — abort signal", () => {
             attachResult.content[0].text.includes("job-abort-1"),
             "attach must return the job's output after abort"
         );
+        const details = attachResult.details as Record<string, unknown>;
+        assert.equal(details.totalLines, 1);
+        assert.equal(details.empty, false);
+        assert.equal(details.error, false);
+        assert.equal(details.timedOut, false);
     });
 });
 

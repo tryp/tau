@@ -6,7 +6,7 @@
  * - checkToolPermission plan mode write restrictions
  */
 
-import { describe, it, mock } from "node:test";
+import { describe, it, mock, type Mock } from "node:test";
 import assert from "node:assert/strict";
 import { isSafePlanCommand } from "../features/permissions/bash.ts";
 import { isPlanFilePath } from "../features/plan-file.ts";
@@ -17,7 +17,6 @@ import {
 import type {
     ToolCallEvent,
     ExtensionContext,
-    ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { TauState } from "../state.ts";
 
@@ -41,10 +40,7 @@ void describe("isSafePlanCommand — cd in SAFE_PATTERNS", () => {
     });
 
     void it("allows cd && grep chain", () => {
-        assert.equal(
-            isSafePlanCommand('cd /path && grep -rn "foo" .'),
-            true
-        );
+        assert.equal(isSafePlanCommand('cd /path && grep -rn "foo" .'), true);
     });
 
     void it("allows cd && ls chain", () => {
@@ -56,10 +52,7 @@ void describe("isSafePlanCommand — cd in SAFE_PATTERNS", () => {
     });
 
     void it("allows cd && head chain", () => {
-        assert.equal(
-            isSafePlanCommand("cd /path && head -20 file.txt"),
-            true
-        );
+        assert.equal(isSafePlanCommand("cd /path && head -20 file.txt"), true);
     });
 
     void it("allows cd pipe pwd", () => {
@@ -75,10 +68,7 @@ void describe("isSafePlanCommand — cd in SAFE_PATTERNS", () => {
     });
 
     void it("allows cd && git diff", () => {
-        assert.equal(
-            isSafePlanCommand("cd /path && git diff HEAD~1"),
-            true
-        );
+        assert.equal(isSafePlanCommand("cd /path && git diff HEAD~1"), true);
     });
 
     void it("allows cd && ls | grep pipe chain", () => {
@@ -89,10 +79,7 @@ void describe("isSafePlanCommand — cd in SAFE_PATTERNS", () => {
     });
 
     void it("allows cd && wc chain", () => {
-        assert.equal(
-            isSafePlanCommand("cd /path && wc -l file.txt"),
-            true
-        );
+        assert.equal(isSafePlanCommand("cd /path && wc -l file.txt"), true);
     });
 
     void it("allows cd && find chain", () => {
@@ -139,10 +126,7 @@ void describe("isSafePlanCommand — cd in SAFE_PATTERNS", () => {
     });
 
     void it("blocks cd && npm install", () => {
-        assert.equal(
-            isSafePlanCommand("cd /path && npm install foo"),
-            false
-        );
+        assert.equal(isSafePlanCommand("cd /path && npm install foo"), false);
     });
 
     // ── cat > heredoc — common stuck pattern ──────────────────────
@@ -243,8 +227,8 @@ void describe("PLAN_MODE_TIMEOUT_MS", () => {
  */
 function testableCancelPlanMode(
     state: TauState,
-    setActiveTools: mock.Mock<(...args: unknown[]) => unknown>,
-    appendEntry: mock.Mock<(...args: unknown[]) => unknown>
+    setActiveTools: Mock<(...args: unknown[]) => unknown>,
+    appendEntry: Mock<(...args: unknown[]) => unknown>
 ): void {
     const previousMode = state.planPreviousMode ?? "allow";
     state.permissionMode = previousMode;
@@ -405,11 +389,7 @@ void describe("isPlanFilePath", () => {
 
     void it("returns false for empty path", () => {
         assert.equal(
-            isPlanFilePath(
-                "",
-                "/session",
-                "2026-07-26T12-00-00-test-plan"
-            ),
+            isPlanFilePath("", "/session", "2026-07-26T12-00-00-test-plan"),
             false
         );
     });
@@ -480,24 +460,14 @@ void describe("checkToolPermission — plan mode", () => {
         const event = makeWriteEvent(
             "/session/plans/2026-07-26T12-00-00-test-plan.md"
         );
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
     void it("blocks write to a non-plan file", async () => {
         const state = makePlanState();
         const event = makeWriteEvent("/src/main.ts");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
         assert.match(
             result.reason ?? "",
@@ -509,12 +479,7 @@ void describe("checkToolPermission — plan mode", () => {
     void it("blocks write to another file in plans dir", async () => {
         const state = makePlanState();
         const event = makeWriteEvent("/session/plans/other-plan.md");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 
@@ -525,24 +490,14 @@ void describe("checkToolPermission — plan mode", () => {
         const event = makeEditEvent(
             "/session/plans/2026-07-26T12-00-00-test-plan.md"
         );
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
     void it("blocks edit to a non-plan file", async () => {
         const state = makePlanState();
         const event = makeEditEvent("/src/main.ts");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 
@@ -551,36 +506,21 @@ void describe("checkToolPermission — plan mode", () => {
     void it("allows cd && grep in plan mode", async () => {
         const state = makePlanState();
         const event = makeBashEvent('cd /path && grep -rn "foo" .');
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
     void it("allows cd && ls in plan mode", async () => {
         const state = makePlanState();
         const event = makeBashEvent("cd /path && ls -la");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
     void it("blocks cd && rm in plan mode", async () => {
         const state = makePlanState();
         const event = makeBashEvent("cd /path && rm -rf *");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 
@@ -589,12 +529,7 @@ void describe("checkToolPermission — plan mode", () => {
         const event = makeBashEvent(
             "cat > /session/plans/plan.md <<'EOF'\ncontent\nEOF"
         );
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 
@@ -638,24 +573,14 @@ void describe("checkToolPermission — plan mode", () => {
     void it("allows write outside plan mode", async () => {
         const state = makePlanState({ mode: "allow" });
         const event = makeWriteEvent("/src/main.ts");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
     void it("allows edit outside plan mode", async () => {
         const state = makePlanState({ mode: "allow" });
         const event = makeEditEvent("/src/main.ts");
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, false);
     });
 
@@ -666,12 +591,7 @@ void describe("checkToolPermission — plan mode", () => {
         const event = makeWriteEvent(
             "/session/plans/2026-07-26T12-00-00-test-plan.md"
         );
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 
@@ -680,12 +600,7 @@ void describe("checkToolPermission — plan mode", () => {
         const event = makeWriteEvent(
             "/session/plans/2026-07-26T12-00-00-test-plan.md"
         );
-        const result = await checkToolPermission(
-            event,
-            state,
-            "/",
-            makeCtx()
-        );
+        const result = await checkToolPermission(event, state, "/", makeCtx());
         assert.equal(result.block, true);
     });
 });

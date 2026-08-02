@@ -6,371 +6,46 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+    closeSync,
+    existsSync,
+    mkdirSync,
+    openSync,
+    readFileSync,
+    readdirSync,
+    statSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { createHash, randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { dirname } from "node:path";
 
 // ─── Context sidecar integration ────────────────────────────────────
 
-/**
- * Hard cap on stored output per job (bytes).
- */
-const SIDECAR_MAX_BYTES = 512 * 1024;
+import {
+    findJobSourceDetailsInSidecar,
+    findJobSourceIdInSidecar,
+    indexJobOutputInSidecar,
+    purgeSidecar,
+    readJobOutputDetailsFromSidecar,
+    readJobOutputFromSidecar,
+    searchSidecarSources,
+    trackJobOutputIndex,
+} from "./sidecar.ts";
 
-/** Default age (days) for purging sidecar entries at startup. */
-const SIDECAR_PURGE_AGE_DAYS = 10;
+export {
+    findJobSourceDetailsInSidecar,
+    findJobSourceIdInSidecar,
+    indexJobOutputInSidecar,
+    purgeSidecar,
+    readJobOutputDetailsFromSidecar,
+    readJobOutputFromSidecar,
+    searchSidecarSources,
+    trackJobOutputIndex,
+};
 
-/**
- * Build the path to the context sidecar's SQLite database.
- */
-function sidecarDbPath(): string {
-    const agentDir =
-        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-    return join(agentDir, "context.db");
-}
-
-/**
- * Purge sidecar entries older than `ageDays` days. Runs at startup to
- * prevent unbounded growth. Scoped to bash_bg entries since that's what
- * pi-tau owns.
- */
-export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return;
-
-    const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
-
-    try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-        });
-        try {
-            // Select IDs to delete so we can log the count
-            const toDelete = db
-                .prepare(
-                    `SELECT id FROM context_sources
-                     WHERE tool_name = 'bash_bg'
-                       AND created_at < ?`
-                )
-                .all(cutoff) as { id: string }[];
-
-            if (toDelete.length === 0) {
-                return;
-            }
-
-            // Delete chunks first (FTS triggers fire properly), then sources.
-            // Use chunked batches to keep the WAL manageable.
-            const ids = toDelete.map((r) => r.id);
-            const batchSize = 100;
-            for (let i = 0; i < ids.length; i += batchSize) {
-                const batch = ids.slice(i, i + batchSize);
-                const placeholders = batch.map(() => "?").join(",");
-
-                db.prepare(
-                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
-                ).run(...batch);
-
-                db.prepare(
-                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
-                ).run(...batch);
-            }
-
-            // VACUUM to reclaim free pages (fast at startup — no concurrent
-            // readers). For DBs with thousands of old entries this may take
-            // ~100-500ms; acceptable at startup where overall init time is
-            // dominated by model loading, not DB maintenance.
-            db.prepare("VACUUM").run();
-
-            // Minimal logging — visible in pi startup output
-            console.error(
-                `[tau] purged ${toDelete.length} sidecar entries older than ${ageDays} days, ` +
-                `VACUUM reclaimed freed space`
-            );
-        } finally {
-            db.close();
-        }
-    } catch (err) {
-        console.error(
-            `[tau] sidecar purge failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-    }
-}
-
-/**
- * Look up a completed job's output from the context sidecar by job ID.
- * Returns the concatenated chunk content, or null if not found.
- */
-export async function readJobOutputFromSidecar(jobId: string): Promise<string | null> {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return null;
-
-    try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-        });
-        try {
-            // Check if the source table exists
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) {
-                return null;
-            }
-
-            // Find source by jobId in input_summary, also get input_summary
-            // for the log path reference.
-            const source = db
-                .prepare(
-                    `SELECT id, input_summary FROM context_sources
-                     WHERE tool_name = 'bash_bg'
-                       AND json_extract(input_summary, '$.jobId') = ?
-                     LIMIT 1`
-                )
-                .get(jobId) as { id: string; input_summary: string } | undefined;
-
-            if (!source) {
-                return null;
-            }
-
-            // Extract logPath from input_summary for the reference line
-            let logPathRef = "";
-            try {
-                const summary = JSON.parse(source.input_summary);
-                if (summary.logPath) {
-                    logPathRef = `Log: ${summary.logPath}\n\n`;
-                }
-            } catch {
-                // old records may lack logPath; skip
-            }
-
-            // Read all chunks for this source, ordered by ordinal
-            const chunks = db
-                .prepare(
-                    `SELECT content FROM context_chunks
-                     WHERE source_id = ?
-                     ORDER BY ordinal ASC`
-                )
-                .all(source.id) as { content: string }[];
-
-            if (chunks.length === 0) return null;
-            return logPathRef + chunks.map((c) => c.content).join("\n\n");
-        } finally {
-            db.close();
-        }
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
- */
-export function chunkText(
-    text: string,
-    sourceId: string
-): {
-    id: string;
-    sourceId: string;
-    ordinal: number;
-    title: string;
-    content: string;
-    byteCount: number;
-}[] {
-    const paragraphs = text.split(/\n{2,}/);
-    const chunks: string[] = [];
-    let current = "";
-    const targetBytes = 4096;
-
-    for (const paragraph of paragraphs) {
-        if (Buffer.byteLength(paragraph, "utf8") > targetBytes) {
-            if (current) chunks.push(current);
-            // Split large paragraph by lines
-            for (const line of paragraph.split("\n")) {
-                const next = current ? `${current}\n${line}` : line;
-                if (Buffer.byteLength(next, "utf8") <= targetBytes) {
-                    current = next;
-                } else {
-                    if (current) chunks.push(current);
-                    current = line;
-                }
-            }
-            current = "";
-            continue;
-        }
-        const next = current ? `${current}\n\n${paragraph}` : paragraph;
-        if (Buffer.byteLength(next, "utf8") > targetBytes && current) {
-            chunks.push(current);
-            current = paragraph;
-        } else {
-            current = next;
-        }
-    }
-    if (current) chunks.push(current);
-    if (chunks.length === 0) chunks.push(text);
-
-    return chunks.map((content, index) => ({
-        id: `${sourceId}_${String(index + 1).padStart(4, "0")}`,
-        sourceId,
-        ordinal: index + 1,
-        title:
-            content
-                .split("\n")
-                .find((l) => l.trim())
-                ?.trim() ?? "(empty)",
-        content,
-        byteCount: Buffer.byteLength(content, "utf8"),
-    }));
-}
-
-/**
- * Build a short preview from the first content lines.
- */
-function makePreview(text: string): string {
-    const lines = text.split("\n");
-    const previewLines = lines.slice(0, 40);
-    let result = previewLines.join("\n");
-    if (Buffer.byteLength(result, "utf8") > 4096) {
-        result = Buffer.from(result, "utf8").subarray(0, 4096).toString("utf8");
-    }
-    if (lines.length > 40) result += "\n...";
-    return result;
-}
-
-/**
- * Index a completed job's output into the context sidecar SQLite database.
- *
- * Writes directly to the sidecar's context.db using the same schema so that
- * context_search / context_get / context_list can find the data.  Skips
- * silently if the DB or the sidecar tables don't exist (sidecar not loaded).
- *
- * Only stores output exceeding ~24 KiB / 300 lines to avoid bloating the
- * index with trivial results (matching the sidecar's own filtering).
- */
-export async function indexJobOutputInSidecar(
-    job: BackgroundJob,
-    ctx: {
-        cwd?: string;
-        sessionManager?: {
-            getSessionFile?: () => string | null;
-            getSessionId?: () => string | null;
-        };
-    }
-): Promise<void> {
-    try {
-        const text = await readFile(job.logPath, "utf-8").catch(() => "");
-        if (!text) return;
-
-        // Check output size before indexing
-        const bytes = Buffer.byteLength(text, "utf8");
-        const lines = text.split("\n").length;
-        if (bytes > SIDECAR_MAX_BYTES) return;
-
-        const sessionId =
-            ctx?.sessionManager?.getSessionFile?.() ??
-            ctx?.sessionManager?.getSessionId?.() ??
-            null;
-        const projectPath = ctx?.cwd ?? process.cwd();
-
-        const dbPath = sidecarDbPath();
-        if (!existsSync(dbPath)) {
-            // Sidecar not installed or never initialized — skip
-            return;
-        }
-
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-        });
-
-        try {
-            // Check if the source table exists (sidecar schema applied)
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) {
-                return;
-            }
-
-            // Dedup: skip if exact content hash already exists for this project
-            const contentHash = createHash("sha256").update(text).digest("hex");
-            const existing = db
-                .prepare(
-                    "SELECT id FROM context_sources WHERE content_hash = ? AND (project_path = ? OR project_path IS NULL) LIMIT 1"
-                )
-                .get(contentHash, projectPath);
-            if (existing) {
-                // Update returned byte count on the existing record
-                db.prepare(
-                    "UPDATE context_sources SET returned_byte_count = returned_byte_count + ? WHERE id = ?"
-                ).run(bytes, existing.id);
-                return;
-            }
-
-            // Generate a unique source ID matching the sidecar's format
-            const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
-            const createdAt = Date.now();
-            const preview = makePreview(text);
-            const previewBytes = Buffer.byteLength(preview, "utf8");
-            const inputSummary = JSON.stringify({
-                command: job.command,
-                jobId: job.id,
-                exitCode: job.exitCode,
-                status: job.status,
-                logPath: job.logPath,
-            });
-
-            // Insert source record
-            db.prepare(
-                `INSERT INTO context_sources
-                 (id, session_id, project_path, tool_name, input_summary,
-                  created_at, byte_count, line_count, content_hash,
-                  preview_byte_count, returned_byte_count)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-            ).run(
-                sourceId,
-                sessionId,
-                projectPath,
-                "bash_bg",
-                inputSummary,
-                createdAt,
-                bytes,
-                lines,
-                contentHash,
-                previewBytes
-            );
-
-            // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
-            const chunks = chunkText(text, sourceId);
-            const insertChunk = db.prepare(
-                `INSERT INTO context_chunks
-                 (id, source_id, ordinal, title, content, byte_count)
-                 VALUES (?, ?, ?, ?, ?, ?)`
-            );
-
-            for (const chunk of chunks) {
-                insertChunk.run(
-                    chunk.id,
-                    chunk.sourceId,
-                    chunk.ordinal,
-                    chunk.title,
-                    chunk.content,
-                    chunk.byteCount
-                );
-            }
-        } finally {
-            db.close();
-        }
-    } catch {
-        // DB unavailable or schema mismatch — skip silently
-    }
-}
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type {
+    AgentToolResult,
+    AgentToolUpdateCallback,
+} from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
     createBashTool,
@@ -378,8 +53,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
-import { cancelCallbacksForJob, hasLinkedCallbacksForJob, scheduleJobReminder } from "./callbacks.ts";
-import type { BackgroundJob, RunningProcess, UiContext } from "../types.ts";
+import {
+    cancelCallbacksForJob,
+    hasLinkedCallbacksForJob,
+    scheduleJobReminder,
+} from "./callbacks.ts";
+import type {
+    BackgroundJob,
+    JobOutputIndex,
+    JobResultDetails,
+    RunningProcess,
+    UiContext,
+} from "../types.ts";
 import {
     DEFAULT_TIMEOUT_MS,
     MAX_LOG_BYTES,
@@ -405,10 +90,9 @@ import {
     getTmuxContext,
     killTmuxJob,
     pollTmuxCompletion,
-    readTmuxOutput,
     spawnBackgroundTmux,
-    spawnForegroundTmux,
     notifyTmuxCompletion,
+    spawnForegroundTmux,
 } from "./bash-tmux.ts";
 import { captureOutput } from "../tmux.ts";
 
@@ -619,13 +303,52 @@ export interface FormatJobOutputParams {
 /**
  * Result of formatJobOutput.
  */
-export interface FormatJobOutputResult {
+export interface OutputMetadata {
+    /** Number of retained/matched lines before head/tail slicing. */
+    totalLines: number;
+    /** Whether the input already contained a truncation marker. */
+    truncated: boolean;
+    /** Whether there is no meaningful output. */
+    empty: boolean;
+    /** Whether reading or formatting the output failed. */
+    error: boolean;
+}
+
+export interface FormatJobOutputResult extends OutputMetadata {
     /** The formatted text output (numbered lines, hints footer). */
     text: string;
-    /** Total number of matched lines before applying head/tail slice. */
-    totalLines: number;
-    /** Whether the input was truncated (content starts with "...[truncated"). */
+    /** Backward-compatible alias for `truncated`. */
     isTruncated: boolean;
+}
+
+function outputLines(text: string): string[] {
+    if (
+        text.length === 0 ||
+        text === "(no output)" ||
+        text === "(no output yet)"
+    )
+        return [];
+    const lines = text.split("\n");
+    // A final newline terminates the last line; it does not create an
+    // additional empty output line.
+    if (lines.at(-1) === "") lines.pop();
+    return lines;
+}
+
+/** Derive machine-readable metadata from raw output without formatting it. */
+export function getOutputMetadata(text: string, error = false): OutputMetadata {
+    const emptyPlaceholder =
+        text === "(no output)" || text === "(no output yet)";
+    const lines = outputLines(emptyPlaceholder ? "" : text);
+    return {
+        totalLines: lines.length,
+        truncated: text.startsWith("...[truncated"),
+        empty:
+            emptyPlaceholder ||
+            text.length === 0 ||
+            !lines.some((line) => line.trim().length > 0),
+        error,
+    };
 }
 
 /**
@@ -637,11 +360,14 @@ export interface FormatJobOutputResult {
  * - headCount/tailCount slice from the start/end of the filtered set.
  * - The result includes a hints footer when lines were hidden or truncated.
  */
-export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputResult {
+export function formatJobOutput(
+    params: FormatJobOutputParams
+): FormatJobOutputResult {
     const { text, grepPattern, headCount, tailCount } = params;
 
     // Filter lines (by grep or all)
-    const lines = text.split("\n");
+    const inputMetadata = getOutputMetadata(text);
+    const lines = outputLines(text);
     let matched: { line: string; num: number }[];
 
     if (!grepPattern) {
@@ -654,6 +380,9 @@ export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputR
             return {
                 text: `(grep error: invalid regex /${grepPattern}/i)`,
                 totalLines: 0,
+                truncated: inputMetadata.truncated,
+                empty: false,
+                error: true,
                 isTruncated: false,
             };
         }
@@ -668,13 +397,20 @@ export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputR
         const text = grepPattern
             ? `(no lines matching /${grepPattern}/i)`
             : "(no lines)";
-        return { text, totalLines, isTruncated: false };
+        return {
+            text,
+            totalLines,
+            truncated: inputMetadata.truncated,
+            empty: true,
+            error: false,
+            isTruncated: false,
+        };
     }
 
     if (headCount !== undefined) matched = matched.slice(0, headCount);
     if (tailCount !== undefined) matched = matched.slice(-tailCount);
 
-    const isTruncated = text.startsWith("...[truncated");
+    const metadata = inputMetadata;
 
     // Format with line numbers
     const body = matched
@@ -687,7 +423,7 @@ export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputR
         const hidden = totalLines - matched.length;
         hints.push(`${hidden} more line${hidden !== 1 ? "s" : ""}`);
     }
-    if (isTruncated) {
+    if (metadata.truncated) {
         hints.push("output was truncated");
     }
 
@@ -697,7 +433,60 @@ export function formatJobOutput(params: FormatJobOutputParams): FormatJobOutputR
         result += `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`;
     }
 
-    return { text: result, totalLines, isTruncated };
+    return {
+        text: result,
+        totalLines,
+        truncated: metadata.truncated,
+        empty: metadata.empty,
+        error: false,
+        isTruncated: metadata.truncated,
+    };
+}
+
+function jobDetails(
+    job: BackgroundJob,
+    overrides: Partial<JobResultDetails> = {}
+): JobResultDetails {
+    return {
+        jobId: job.id,
+        status: job.status,
+        exitCode: job.exitCode,
+        logPath: job.logPath,
+        sourceId: job.sourceId,
+        chunkIds: job.chunkIds,
+        ...overrides,
+    };
+}
+
+async function sourceDetailsForJob(
+    job: BackgroundJob
+): Promise<JobOutputIndex | undefined> {
+    if (job.outputIndexPromise) {
+        const indexed = await job.outputIndexPromise;
+        if (indexed) return indexed;
+    }
+    if (job.sourceId) {
+        return { sourceId: job.sourceId, chunkIds: job.chunkIds ?? [] };
+    }
+    return findJobSourceDetailsInSidecar(job.id) ?? undefined;
+}
+
+function outputDetails(
+    job: BackgroundJob,
+    metadata: OutputMetadata,
+    source?: JobOutputIndex,
+    overrides: Partial<JobResultDetails> = {}
+): JobResultDetails {
+    return jobDetails(job, {
+        ...metadata,
+        sourceId: source?.sourceId,
+        chunkIds: source?.chunkIds,
+        ...overrides,
+    });
+}
+
+function outputReadFailed(job: BackgroundJob, output: string): boolean {
+    return output === "(no output yet)" && !existsSync(job.logPath);
 }
 
 /**
@@ -731,7 +520,7 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
  * so the agent doesn't get re-awoken for every individual job.
  */
 
-const BATCH_DEBOUNCE_MS = 2000;   // sliding window: each new completion resets this
+const BATCH_DEBOUNCE_MS = 2000; // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
 
 type CompletionBatchItem = {
@@ -743,7 +532,7 @@ type CompletionBatchItem = {
 const completionBatch: {
     jobs: CompletionBatchItem[];
     timer?: NodeJS.Timeout;
-    startTime: number;   // timestamp of the first job in the current batch
+    startTime: number; // timestamp of the first job in the current batch
     pi?: ExtensionAPI;
     state?: TauState;
 } = { jobs: [], startTime: 0 };
@@ -756,6 +545,9 @@ type PendingCompletionDelivery = {
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 let completionAgentBusy = false;
+// Invalidates asynchronous indexing callbacks after a batch is cleared.
+let completionBatchGeneration = 0;
+const suppressedCompletionJobIds = new Set<string>();
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -798,7 +590,9 @@ function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
     return jobs.some((j) => j.job.status !== "completed");
 }
 
-function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchItem[] {
+function pruneConsumedCompletions(
+    jobs: CompletionBatchItem[]
+): CompletionBatchItem[] {
     const unconsumedFailed = jobs.filter(
         (j) => j.job.status !== "completed" && !j.job.outputConsumed
     );
@@ -820,40 +614,60 @@ function pruneConsumedCompletions(jobs: CompletionBatchItem[]): CompletionBatchI
 
 /** Best-effort GPU utilization snapshot at the time a job completes. */
 function readGpuSnapshot(): string | null {
-	try {
-		const entries = readdirSync("/sys/class/drm");
-		const lines: string[] = [];
-		for (const entry of entries) {
-			if (!entry.startsWith("card") || entry.includes("-")) continue;
-			try {
-				const busy = parseInt(
-					readFileSync(`/sys/class/drm/${entry}/device/gpu_busy_percent`, "utf-8").trim(),
-					10
-				);
-				let temp = "";
-				try {
-					const hwmons = readdirSync("/sys/class/hwmon");
-					for (const hw of hwmons) {
-						try {
-							const name = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
-							if (name === "amdgpu" || name === "i915") {
-								const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
-								temp = ` ${(t / 1000).toFixed(0)}C`;
-								break;
-							}
-						} catch {}
-					}
-				} catch {}
-				lines.push(`${entry}: ${busy}%${temp}`);
-			} catch {}
-		}
-		return lines.length > 0 ? lines.join(", ") : null;
-	} catch {
-		return null;
-	}
+    try {
+        const entries = readdirSync("/sys/class/drm");
+        const lines: string[] = [];
+        for (const entry of entries) {
+            if (!entry.startsWith("card") || entry.includes("-")) continue;
+            try {
+                const busy = parseInt(
+                    readFileSync(
+                        `/sys/class/drm/${entry}/device/gpu_busy_percent`,
+                        "utf-8"
+                    ).trim(),
+                    10
+                );
+                let temp = "";
+                try {
+                    const hwmons = readdirSync("/sys/class/hwmon");
+                    for (const hw of hwmons) {
+                        try {
+                            const name = readFileSync(
+                                `/sys/class/hwmon/${hw}/name`,
+                                "utf-8"
+                            ).trim();
+                            if (name === "amdgpu" || name === "i915") {
+                                const t = parseInt(
+                                    readFileSync(
+                                        `/sys/class/hwmon/${hw}/temp1_input`,
+                                        "utf-8"
+                                    ).trim(),
+                                    10
+                                );
+                                temp = ` ${(t / 1000).toFixed(0)}C`;
+                                break;
+                            }
+                        } catch {
+                            /* hwmon read failed — ignore */
+                        }
+                    }
+                } catch {
+                    /* gpu busy read failed — ignore */
+                }
+                lines.push(`${entry}: ${busy}%${temp}`);
+            } catch {
+                /* card entry read failed — ignore */
+            }
+        }
+        return lines.length > 0 ? lines.join(", ") : null;
+    } catch {
+        return null;
+    }
 }
 
-function deliverCompletionNotification(delivery: PendingCompletionDelivery): void {
+function deliverCompletionNotification(
+    delivery: PendingCompletionDelivery
+): void {
     const batch = pruneConsumedCompletions(delivery.jobs);
     if (batch.length === 0) return;
 
@@ -869,9 +683,7 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
 
         // Best-effort GPU snapshot at completion time
         const gpuLine = readGpuSnapshot();
-        const resourceInfo = gpuLine
-            ? `\nGPU: ${gpuLine}`
-            : "";
+        const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
         pi.sendMessage(
             {
@@ -887,6 +699,8 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
                     duration,
                     command: job.command,
                     logPath: job.logPath,
+                    sourceId: job.sourceId,
+                    chunkIds: job.chunkIds,
                     outstandingJobs: outstandingCount,
                 },
             },
@@ -911,9 +725,7 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
     const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
 
     const gpuLine = readGpuSnapshot();
-    const resourceInfo = gpuLine
-        ? `\nGPU: ${gpuLine}`
-        : "";
+    const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
     pi.sendMessage(
         {
@@ -928,6 +740,8 @@ function deliverCompletionNotification(delivery: PendingCompletionDelivery): voi
                     duration: b.duration,
                     command: b.job.command,
                     logPath: b.job.logPath,
+                    sourceId: b.job.sourceId,
+                    chunkIds: b.job.chunkIds,
                 })),
                 outstandingJobs: outstandingCount,
             },
@@ -967,6 +781,8 @@ function queueCompletionDelivery(
  * notifications for jobs the agent has already acknowledged.
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
+    // The indexing promise may not have queued the job yet.
+    suppressedCompletionJobIds.add(jobId);
     const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
     if (idx !== -1) {
         completionBatch.jobs.splice(idx, 1);
@@ -995,6 +811,8 @@ export function clearJobFromCompletionBatch(jobId: string): void {
  * notifications for jobs the agent has already acknowledged.
  */
 export function clearAllCompletionBatches(): void {
+    completionBatchGeneration++;
+    suppressedCompletionJobIds.clear();
     if (completionBatch.timer) {
         clearTimeout(completionBatch.timer);
         completionBatch.timer = undefined;
@@ -1031,32 +849,44 @@ export function notifyCompletion(
         job.status === "completed" ? "success" : "error"
     );
 
-    // Defer the followUp message into a batch that flushes after a short debounce.
-    // Suffix and outstanding count are computed at flush time from current state,
-    // so they accurately reflect jobs still running outside this batch.
-    completionBatch.jobs.push({ job, duration, emoji });
-    completionBatch.pi = pi;
-    completionBatch.state = state;
+    // Indexing is asynchronous. Queue the completion only after it settles so
+    // sourceId/chunkIds are present in the notification. Cleanup remains
+    // immediate, preserving the lifecycle contract for jobs/attach.
+    const generation = completionBatchGeneration;
+    const enqueue = (): void => {
+        if (
+            generation !== completionBatchGeneration ||
+            job.outputConsumed ||
+            suppressedCompletionJobIds.delete(job.id)
+        )
+            return;
+        completionBatch.jobs.push({ job, duration, emoji });
+        completionBatch.pi = pi;
+        completionBatch.state = state;
 
-    // Sliding-window debounce: each new completion resets the timer, extending
-    // the window to collect near-simultaneous completions into one message.
-    // Cap total delay so the agent never waits longer than BATCH_MAX_DELAY_MS
-    // from the first job in the batch.
-    if (completionBatch.timer) {
-        clearTimeout(completionBatch.timer);
+        // Sliding-window debounce: each new completion resets the timer,
+        // extending the window to collect near-simultaneous completions.
+        if (completionBatch.timer) clearTimeout(completionBatch.timer);
+        else completionBatch.startTime = Date.now();
+        const elapsed = Date.now() - completionBatch.startTime;
+        const delay = Math.min(BATCH_DEBOUNCE_MS, BATCH_MAX_DELAY_MS - elapsed);
+        completionBatch.timer = setTimeout(
+            () => flushCompletionBatch(),
+            Math.max(delay, 0)
+        );
+        completionBatch.timer.unref();
+    };
+
+    if (job.outputIndexPromise) {
+        void job.outputIndexPromise.then(enqueue, enqueue);
     } else {
-        completionBatch.startTime = Date.now();
+        enqueue();
     }
-    const elapsed = Date.now() - completionBatch.startTime;
-    const delay = Math.min(BATCH_DEBOUNCE_MS, BATCH_MAX_DELAY_MS - elapsed);
-    completionBatch.timer = setTimeout(() => {
-        flushCompletionBatch();
-    }, Math.max(delay, 0));
-    completionBatch.timer.unref();
 
+    // Remove from active state immediately; indexing and notification delivery
+    // must not keep jobs/attach waiting for sidecar I/O.
     removeJob(state, job);
 }
-
 
 // ── Background a running foreground process (signal-based) ─────────
 
@@ -1112,28 +942,24 @@ export function registerBackgroundJob(
 
     proc.on("close", (code) => {
         cancelStall();
-        // Update job status before indexing so the sidecar captures final state
-        job.exitCode = code ?? 0;
-        job.status = code === 0 || code === null ? "completed" : "failed";
-        // ctx is ExtensionContext at runtime but typed as UiContext here
-        void indexJobOutputInSidecar(
-            job,
-            ctx as {
-                cwd?: string;
-                sessionManager?: {
-                    getSessionFile?: () => string | null;
-                    getSessionId?: () => string | null;
-                };
-            }
-        );
+        // markJobTerminal must run before anything reads final state: it sets
+        // status/exitCode AND resolves job.donePromise. Setting job.status
+        // manually first would make markJobTerminal early-return and the
+        // donePromise would never resolve — `jobs attach` awaits it and would
+        // hang forever on a completed job.
         markJobTerminal(
             job,
             code === 0 || code === null ? "completed" : "failed",
             code ?? 0
         );
+        // Index after markJobTerminal so the sidecar captures final state.
+        // UiContext now carries cwd/sessionManager (see types.ts) so it
+        // satisfies SidecarContext directly.
+        void trackJobOutputIndex(job, ctx);
         clearPendingDecision(state, job);
         notifyCompletion(job, state, pi, ctx);
-        updateWidget(state, ctx);    });
+        updateWidget(state, ctx);
+    });
 
     ctx.ui.notify(`Process backgrounded as ${jobId}`, "info");
     updateWidget(state, ctx);
@@ -1393,10 +1219,7 @@ export function registerBackgroundJobs(
                 const initialResult = await Promise.race([
                     procResult,
                     new Promise<null>((resolve) => {
-                        const t = setTimeout(
-                            resolve,
-                            2_000
-                        ) as unknown as NodeJS.Timeout;
+                        const t = setTimeout(() => resolve(null), 2_000);
                         t.unref();
                     }),
                 ]);
@@ -1550,7 +1373,7 @@ export function registerBackgroundJobs(
             "Run a bash command in background immediately. Output streams to a log file in real-time " +
             "and can be queried with the jobs tool (output, grep, head/tail) while the job is still running. " +
             "Use the jobs tool to check status and read output. " +
-            "Large output (~24 KiB+) is automatically indexed in the context sidecar SQLite database " +
+            "Completed output is automatically indexed in the context sidecar SQLite database when available " +
             "and is searchable via context_search, context_list, and context_get. " +
             "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both.",
         promptSnippet:
@@ -1562,7 +1385,8 @@ export function registerBackgroundJobs(
             "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
-            "Large output (~24 KiB+) is automatically indexed in the context sidecar. " +
+            "The result details include jobId, status, line metadata, and logPath; terminal output may also include sidecar sourceId/chunkIds.",
+            "Completed output is automatically indexed in the context sidecar when available. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
                 "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
         ],
@@ -1604,7 +1428,7 @@ export function registerBackgroundJobs(
             _signal,
             _onUpdate,
             ctx
-        ): Promise<AgentToolResult<undefined>> {
+        ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             const shouldNotify = params.notify !== false;
 
             // ── Tmux path ─────────────────────────────────────────────
@@ -1617,21 +1441,28 @@ export function registerBackgroundJobs(
                     pi,
                     ctx,
                     (jobId, command, logPath) =>
-                        startStallWatchdog(jobId, command, logPath, pi, state, () => {
-                            killTmuxJob(
-                                state.backgroundJobs.get(jobId) ??
-                                    ({
-                                        id: jobId,
-                                        command,
-                                        pid: -1,
-                                        startTime: Date.now(),
-                                        status: "running",
-                                        logPath,
-                                        toolCallId,
-                                        isBackgrounded: true,
-                                    } satisfies BackgroundJob)
-                            );
-                        })
+                        startStallWatchdog(
+                            jobId,
+                            command,
+                            logPath,
+                            pi,
+                            state,
+                            () => {
+                                killTmuxJob(
+                                    state.backgroundJobs.get(jobId) ??
+                                        ({
+                                            id: jobId,
+                                            command,
+                                            pid: -1,
+                                            startTime: Date.now(),
+                                            status: "running",
+                                            logPath,
+                                            toolCallId,
+                                            isBackgrounded: true,
+                                        } satisfies BackgroundJob)
+                                );
+                            }
+                        )
                 );
 
                 updateWidget(state, ctx);
@@ -1643,7 +1474,11 @@ export function registerBackgroundJobs(
                             text: `Started background job ${job.id}\nCommand: ${params.command}\nOutput: ${job.logPath}`,
                         },
                     ],
-                    details: undefined,
+                    details: {
+                        jobId: job.id,
+                        status: job.status,
+                        logPath: job.logPath,
+                    },
                 };
             }
 
@@ -1722,16 +1557,7 @@ export function registerBackgroundJobs(
                     code === 0 || code === null ? "completed" : "failed",
                     code ?? 0
                 );
-                void indexJobOutputInSidecar(
-                    job,
-                    ctx as {
-                        cwd?: string;
-                        sessionManager?: {
-                            getSessionFile?: () => string | null;
-                            getSessionId?: () => string | null;
-                        };
-                    }
-                );
+                void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
@@ -1742,16 +1568,7 @@ export function registerBackgroundJobs(
                 if (killTimer) clearTimeout(killTimer);
                 killTimer = undefined;
                 markJobTerminal(job, "failed");
-                void indexJobOutputInSidecar(
-                    job,
-                    ctx as {
-                        cwd?: string;
-                        sessionManager?: {
-                            getSessionFile?: () => string | null;
-                            getSessionId?: () => string | null;
-                        };
-                    }
-                );
+                void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
@@ -1765,7 +1582,7 @@ export function registerBackgroundJobs(
                 extra += `\nKill deadline: ${params.timeout}s`;
             }
             if (reminderId) {
-                extra += `\nReminder: ${reminderId} (in ${params.remindIn})`;
+                extra += `\nReminder: ${reminderId} (in ${params.remindDelay})`;
             }
 
             return {
@@ -1779,7 +1596,11 @@ export function registerBackgroundJobs(
                             `Output: ${logPath}${extra}`,
                     },
                 ],
-                details: undefined,
+                details: {
+                    jobId,
+                    status: job.status,
+                    logPath,
+                },
             };
         },
     });
@@ -1804,6 +1625,7 @@ export function registerBackgroundJobs(
             "Use jobs with action 'output' grep='pattern' to search for matching lines in the output.",
             "Use jobs with action 'output' head=50 to show the first 50 lines (default: tail=10).",
             "Use jobs with action 'output' tail=15 to show the last 15 matching lines, the default.",
+            "Output results include structured line/empty/error/truncation metadata; use the returned sourceId or chunkIds with context_get for full indexed output.",
             "Use jobs with action 'kill' to terminate a running background job (also cancels linked reminders).",
             "Use jobs with action 'attach' to monitor a running job with progress polling; " +
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
@@ -1867,8 +1689,8 @@ export function registerBackgroundJobs(
             params,
             signal,
             onUpdate,
-            _ctx
-        ): Promise<AgentToolResult<undefined>> {
+            ctx
+        ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             switch (params.action) {
                 case "list": {
                     const running = Array.from(state.backgroundJobs.values());
@@ -1918,6 +1740,15 @@ export function registerBackgroundJobs(
                             headCount,
                             tailCount,
                         });
+                        const source = await sourceDetailsForJob(job);
+                        const metadata: OutputMetadata = {
+                            totalLines: formatted.totalLines,
+                            truncated: formatted.truncated,
+                            empty: formatted.empty,
+                            error:
+                                formatted.error ||
+                                outputReadFailed(job, output),
+                        };
                         return {
                             content: [
                                 {
@@ -1934,24 +1765,27 @@ export function registerBackgroundJobs(
                                         tailCount !== undefined
                                             ? `, tail=${tailCount}`
                                             : ""
-                                    }\nLog: ${job.logPath}\n\n${formatted}`,
+                                    }\nLog: ${job.logPath}\n\n${formatted.text}`,
                                 },
                             ],
-                            details: undefined,
+                            details: outputDetails(job, metadata, source),
                         };
                     }
 
                     // Fall back to sidecar for completed jobs (persists across sessions)
-                    const sidecarOutput = await readJobOutputFromSidecar(
+                    const sidecarOutput = await readJobOutputDetailsFromSidecar(
                         params.jobId
                     );
                     if (sidecarOutput) {
                         const formatted = formatJobOutput({
-                            text: sidecarOutput,
+                            text: sidecarOutput.text,
                             grepPattern,
                             headCount,
                             tailCount,
                         });
+                        const logLine = sidecarOutput.logPath
+                            ? `\nLog: ${sidecarOutput.logPath}`
+                            : "";
                         return {
                             content: [
                                 {
@@ -1968,10 +1802,20 @@ export function registerBackgroundJobs(
                                         tailCount !== undefined
                                             ? `, tail=${tailCount}`
                                             : ""
-                                    }\n\n${formatted}`,
+                                    }${logLine}\n\n${formatted.text}`,
                                 },
                             ],
-                            details: undefined,
+                            details: {
+                                jobId: params.jobId,
+                                status: "completed",
+                                logPath: sidecarOutput.logPath,
+                                totalLines: formatted.totalLines,
+                                truncated: formatted.truncated,
+                                empty: formatted.empty,
+                                error: formatted.error,
+                                sourceId: sidecarOutput.sourceId,
+                                chunkIds: sidecarOutput.chunkIds,
+                            },
                         };
                     }
 
@@ -2006,7 +1850,11 @@ export function registerBackgroundJobs(
                                     : `Sent SIGTERM to ${job.id} (process group)`,
                             },
                         ],
-                        details: undefined,
+                        details: {
+                            jobId: job.id,
+                            status: job.status,
+                            logPath: job.logPath,
+                        },
                     };
                 }
 
@@ -2023,6 +1871,11 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        const source = await sourceDetailsForJob(job);
+                        const metadata = getOutputMetadata(
+                            output,
+                            outputReadFailed(job, output)
+                        );
                         job.outputConsumed = true;
                         return {
                             content: [
@@ -2034,7 +1887,7 @@ export function registerBackgroundJobs(
                                             : `Job ${job.id} (${job.status})\nLog: ${job.logPath}\n\n${output}`,
                                 },
                             ],
-                            details: undefined,
+                            details: outputDetails(job, metadata, source),
                         };
                     }
 
@@ -2045,21 +1898,41 @@ export function registerBackgroundJobs(
                     const MAX_ATTACH_MS = (params.timeout ?? 600) * 1_000;
                     const deadline = Date.now() + MAX_ATTACH_MS;
 
+                    // Resolve when the caller aborts so the poll wait below
+                    // wakes immediately instead of waiting out the 5s interval.
+                    let abortResolve: () => void = () => {};
+                    const abortPromise = new Promise<void>((resolve) => {
+                        abortResolve = resolve;
+                    });
+                    if (signal?.aborted) abortResolve();
+                    signal?.addEventListener("abort", abortResolve, {
+                        once: true,
+                    });
+
                     // Non-blocking poll loop with progress updates.
                     // Polls periodically; exits promptly when the job completes
-                    // (via donePromise race), the signal is aborted, or the
-                    // timeout expires.
+                    // (via donePromise race), the signal is aborted, a dead PID
+                    // is detected, or the timeout expires.
                     while (job.status === "running") {
                         // Check abort signal
                         if (signal?.aborted) {
                             break;
                         }
 
-                        // Check timeout
-                        if (Date.now() >= deadline) {
-                            break;
+                        // Dead-PID detection: a process that died without
+                        // emitting close (SIGKILL, crash) would otherwise keep
+                        // the job "running" until the attach timeout. Mark it
+                        // terminal so attach returns promptly.
+                        if (job.pid > 0) {
+                            try {
+                                process.kill(job.pid, 0);
+                            } catch {
+                                markJobTerminal(job, "failed");
+                                void trackJobOutputIndex(job, ctx);
+                                clearPendingDecision(state, job);
+                                break;
+                            }
                         }
-
 
                         // Check timeout
                         if (Date.now() >= deadline) {
@@ -2088,23 +1961,43 @@ export function registerBackgroundJobs(
                                         `${timeLeft}s timeout remaining)...\n\n${tail}`,
                                 },
                             ],
-                            details: undefined,
+                            details: {
+                                ...jobDetails(job),
+                                ...getOutputMetadata(
+                                    tail,
+                                    outputReadFailed(job, tail)
+                                ),
+                            },
                         });
 
-                        // Wait for either the next poll interval or job completion
+                        // Wait for the next poll interval, job completion, or abort
+                        const waitMs = Math.max(
+                            0,
+                            Math.min(POLL_INTERVAL_MS, deadline - Date.now())
+                        );
                         await Promise.race([
                             new Promise<void>((resolve) =>
-                                setTimeout(resolve, POLL_INTERVAL_MS)
+                                setTimeout(resolve, waitMs)
                             ),
                             job.donePromise,
+                            abortPromise,
                         ]);
                     }
+
+                    // The poll loop has finished; avoid retaining the signal
+                    // listener for the lifetime of the tool context.
+                    signal?.removeEventListener("abort", abortResolve);
 
                     // Read final output
                     const output = await readOutputTail(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    const metadata = getOutputMetadata(
+                        output,
+                        outputReadFailed(job, output)
+                    );
+                    const source = await sourceDetailsForJob(job);
                     job.outputConsumed = true;
 
                     if (signal?.aborted) {
@@ -2118,11 +2011,13 @@ export function registerBackgroundJobs(
                                         `Log: ${job.logPath}\n\n${output}`,
                                 },
                             ],
-                            details: undefined,
+                            details: outputDetails(job, metadata, source, {
+                                timedOut: false,
+                            }),
                         };
                     }
 
-                    if (Date.now() >= deadline) {
+                    if (Date.now() >= deadline && job.status === "running") {
                         const runtime = formatDuration(
                             Date.now() - job.startTime
                         );
@@ -2140,7 +2035,9 @@ export function registerBackgroundJobs(
                                         `or jobs(kill) to terminate.`,
                                 },
                             ],
-                            details: undefined,
+                            details: outputDetails(job, metadata, source, {
+                                timedOut: true,
+                            }),
                         };
                     }
 
@@ -2154,7 +2051,9 @@ export function registerBackgroundJobs(
                                     `Log: ${job.logPath}\n\n${output}`,
                             },
                         ],
-                        details: undefined,
+                        details: outputDetails(job, metadata, source, {
+                            timedOut: false,
+                        }),
                     };
                 }
             }
@@ -2190,7 +2089,7 @@ export function registerBackgroundJobs(
             _signal,
             _onUpdate,
             _ctx
-        ): Promise<AgentToolResult<undefined>> {
+        ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             const job = lookupJob(state, params.jobId);
             if (!job) {
                 state.pendingDecisionJobId = undefined;
@@ -2201,7 +2100,9 @@ export function registerBackgroundJobs(
                             text: `Job ${params.jobId} not found.`,
                         },
                     ],
-                    details: undefined,
+                    details: {
+                        jobId: params.jobId,
+                    },
                 };
             }
 
@@ -2218,7 +2119,7 @@ export function registerBackgroundJobs(
                     state.pendingDecisionJobId = undefined;
                     return {
                         content: [{ type: "text", text: `Killed ${job.id}.` }],
-                        details: undefined,
+                        details: jobDetails(job),
                     };
                 }
                 case "keep": {
@@ -2230,7 +2131,7 @@ export function registerBackgroundJobs(
                                 text: `Keeping ${job.id} running in the background. Use the jobs tool to check on it later.`,
                             },
                         ],
-                        details: undefined,
+                        details: jobDetails(job),
                     };
                 }
                 case "check": {
@@ -2238,6 +2139,11 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    const metadata = getOutputMetadata(
+                        output,
+                        outputReadFailed(job, output)
+                    );
+                    const source = await sourceDetailsForJob(job);
                     // Agent has seen this terminal job's output —
                     // suppress completion notification and cancel reminds.
                     if (job.status !== "running") {
@@ -2251,7 +2157,7 @@ export function registerBackgroundJobs(
                                 text: `Output of ${job.id}:\n${output}`,
                             },
                         ],
-                        details: undefined,
+                        details: outputDetails(job, metadata, source),
                     };
                 }
             }
@@ -2267,9 +2173,14 @@ export function registerBackgroundJobs(
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts
     // because it's guidance about bg workflow, cross-cutting two tools.
-    (pi as ExtensionAPI & {
-        registerToolPromptGuidelines: (toolName: string, guidelines: string[]) => void;
-    }).registerToolPromptGuidelines("remind", [
+    (
+        pi as ExtensionAPI & {
+            registerToolPromptGuidelines: (
+                toolName: string,
+                guidelines: string[]
+            ) => void;
+        }
+    ).registerToolPromptGuidelines("remind", [
         "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
             "the callback auto-cancels when the job completes.",
         "When you do use manual remind() to check on a running job, pass the jobId parameter " +
@@ -2358,10 +2269,12 @@ async function executeTmuxForeground(
         });
     }
 
-    // Timeout timer
+    // Timeout timer — matches the direct-spawn path: backgroundAfter
+    // overrides the default timeout, so `backgroundAfter=300` actually
+    // backgrounds after 300s instead of the 15s default.
     const timeoutMs =
-        typeof params.timeout === "number"
-            ? params.timeout * 1_000
+        typeof params.backgroundAfter === "number"
+            ? params.backgroundAfter * 1_000
             : DEFAULT_TIMEOUT_MS;
     const timer = setTimeout(() => {
         // Non-interactive (print/`-p`/non-TTY): no agent loop to answer the
@@ -2403,16 +2316,21 @@ async function executeTmuxForeground(
         pollTimer.unref();
     };
 
-    // Completion polling — check the exit-code sentinel
+    // Completion polling — check the exit-code sentinel. Hoisted to function
+    // scope so the backgrounded branch and finally block can clear it: a
+    // leaked interval keeps reading AND unlinking the sentinel file, starving
+    // the 500ms bgPoller of the exit code and leaving the job "running"
+    // forever — which silently defeats the linked-callback auto-cancel.
+    let checkTimer: NodeJS.Timeout | undefined;
     const completionPromise = new Promise<number | null>((resolve) => {
-        const check = setInterval(() => {
+        checkTimer = setInterval(() => {
             const code = checkExitCode(tmuxCtx.exitCodeFile);
             if (code !== undefined) {
-                clearInterval(check);
+                clearInterval(checkTimer);
                 resolve(code);
             }
         }, 200);
-        check.unref();
+        checkTimer.unref();
     });
 
     try {
@@ -2420,10 +2338,7 @@ async function executeTmuxForeground(
         const initialResult = await Promise.race([
             completionPromise,
             new Promise<null>((resolve) => {
-                const t = setTimeout(
-                    resolve,
-                    2_000
-                ) as unknown as NodeJS.Timeout;
+                const t = setTimeout(() => resolve(null), 2_000);
                 t.unref();
             }),
         ]);
@@ -2472,6 +2387,7 @@ async function executeTmuxForeground(
 
         if (raceResult.type === "backgrounded") {
             clearInterval(pollTimer);
+            clearInterval(checkTimer);
             clearTimeout(timer);
             clearTimeout(hintTimer);
             state.runningProcesses.delete(toolCallId);
@@ -2498,7 +2414,8 @@ async function executeTmuxForeground(
                         : "failed",
                     result.exitCode ?? 0
                 );
-                notifyTmuxCompletion(job, state, pi, ctx);
+                void trackJobOutputIndex(job, ctx, "bash_bg");
+                void notifyTmuxCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
             }, 500);
             bgPoller.unref();
@@ -2569,6 +2486,7 @@ async function executeTmuxForeground(
         };
     } finally {
         clearInterval(pollTimer);
+        clearInterval(checkTimer);
         clearTimeout(timer);
         clearTimeout(hintTimer);
     }

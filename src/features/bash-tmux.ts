@@ -29,6 +29,7 @@ import {
     sessionNameForGitRoot,
     spawnInTmux,
 } from "../tmux.ts";
+import { trackJobOutputIndex } from "./sidecar.ts";
 
 /** Per-run directory for exit-code sentinels and output files. */
 function runDirPath(): string {
@@ -288,7 +289,8 @@ export function spawnBackgroundTmux(
                 : "failed",
             result.exitCode ?? 0
         );
-        notifyTmuxCompletion(job, state, pi, ctx);
+        void trackJobOutputIndex(job, ctx, "bash_bg");
+        void notifyTmuxCompletion(job, state, pi, ctx);
     }, 500);
     pollTimer.unref();
 
@@ -299,14 +301,13 @@ export function spawnBackgroundTmux(
  * Send a completion notification for a tmux-backed job.
  * Extracted so the stall watchdog can also trigger it.
  */
-export function notifyTmuxCompletion(
+export async function notifyTmuxCompletion(
     job: BackgroundJob,
     state: TauState,
     pi: ExtensionAPI,
     ctx: UiContext
-): void {
-    if (job.outputConsumed) {
-        // Job was killed — suppress notification and clean up window.
+): Promise<void> {
+    const cleanup = (): void => {
         const tmuxCtx = getTmuxContext(job);
         if (tmuxCtx) killWindow(tmuxCtx.windowId);
         state.backgroundJobs.delete(job.id);
@@ -315,6 +316,19 @@ export function notifyTmuxCompletion(
         state.recentTerminalJobs.push(job);
         if (state.recentTerminalJobs.length > 20)
             state.recentTerminalJobs.shift();
+    };
+
+    if (job.outputConsumed) {
+        // Job was killed — suppress notification and clean up window.
+        cleanup();
+        return;
+    }
+
+    // Keep the job visible until indexing finishes. This makes a completion
+    // notification and an immediate jobs(output) call observe the same IDs.
+    if (job.outputIndexPromise) await job.outputIndexPromise;
+    if (job.outputConsumed) {
+        cleanup();
         return;
     }
 
@@ -344,18 +358,12 @@ export function notifyTmuxCompletion(
                 duration: durationText,
                 command: job.command,
                 logPath: job.logPath,
+                sourceId: job.sourceId,
+                chunkIds: job.chunkIds,
             },
         },
         { deliverAs: "followUp", triggerTurn: true } as never
     );
 
-    // Clean up the tmux window now the command has finished.
-    const tmuxCtx = getTmuxContext(job);
-    if (tmuxCtx) killWindow(tmuxCtx.windowId);
-
-    state.backgroundJobs.delete(job.id);
-    if (job.status === "completed") state.completedJobCount++;
-    if (job.status === "failed") state.failedJobCount++;
-    state.recentTerminalJobs.push(job);
-    if (state.recentTerminalJobs.length > 20) state.recentTerminalJobs.shift();
+    cleanup();
 }

@@ -24,7 +24,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { tmpdir } from "node:os";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
-import type { BackgroundJob } from "../types.ts";
+import type { BackgroundJob, JobResultDetails } from "../types.ts";
 import {
     createJobDonePromise,
     generateJobId,
@@ -39,6 +39,7 @@ import {
     notifyCompletion,
     updateWidget,
 } from "./background.ts";
+import { trackJobOutputIndex } from "./sidecar.ts";
 
 // ─── Context continuity ─────────────────────────────────────────────
 
@@ -158,6 +159,7 @@ export function registerAgentBackground(
             "Use agent_bg for tasks that can run independently without the current conversation.",
             "The background agent gets a summary of the original task and where you left off.",
             "Use the jobs tool to check on progress. You will be notified when it finishes.",
+            "The result details include jobId, status, and logPath; completed output is indexed with sourceId/chunkIds for context-sidecar retrieval when available.",
         ],
         parameters: Type.Object({
             prompt: Type.String({
@@ -177,7 +179,7 @@ export function registerAgentBackground(
             _signal,
             _onUpdate,
             ctx
-        ): Promise<AgentToolResult<undefined>> {
+        ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             if (!isFeatureEnabled(state, "agent-background")) {
                 return {
                     content: [
@@ -255,6 +257,16 @@ export function registerAgentBackground(
 
             // Pipe output to log file
             const logStream = createWriteStream(logPath, { flags: "w" });
+            let logStreamFinish: Promise<void> | undefined;
+            const finishLogStream = (): Promise<void> => {
+                if (!logStreamFinish) {
+                    logStreamFinish = new Promise((resolve) => {
+                        logStream.once("finish", resolve);
+                        logStream.end();
+                    });
+                }
+                return logStreamFinish;
+            };
             proc.stdout?.pipe(logStream, { end: false });
             proc.stderr?.pipe(logStream, { end: false });
 
@@ -277,6 +289,7 @@ export function registerAgentBackground(
                 job.command,
                 logPath,
                 pi,
+                state,
                 () => {
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                     silenceJobAfterKill(job);
@@ -284,14 +297,28 @@ export function registerAgentBackground(
             );
 
             const cleanupFiles = [promptFile];
+            let finalized = false;
 
-            proc.on("close", (code) => {
-                cancelStall();
-                logStream.end();
+            const finalizeAgentJob = (code: number | null, failed = false) => {
+                if (finalized) return;
+                finalized = true;
                 markJobTerminal(
                     job,
-                    code === 0 || code === null ? "completed" : "failed",
-                    code ?? 0
+                    failed || (code !== 0 && code !== null)
+                        ? "failed"
+                        : "completed",
+                    code ?? undefined
+                );
+                // Preserve immediate lifecycle notifications while ensuring
+                // indexing waits until both stdout and stderr have flushed.
+                // Register the shared promise before completion delivery;
+                // the helper waits for both piped streams to flush without
+                // creating a promise that refers to itself.
+                void trackJobOutputIndex(
+                    job,
+                    ctx,
+                    "agent_bg",
+                    finishLogStream()
                 );
                 clearPendingDecision(state, job);
                 notifyCompletion(job, state, pi, ctx);
@@ -303,22 +330,16 @@ export function registerAgentBackground(
                         /* already gone */
                     }
                 }
+            };
+
+            proc.on("close", (code) => {
+                cancelStall();
+                finalizeAgentJob(code);
             });
 
             proc.on("error", () => {
                 cancelStall();
-                logStream.end();
-                markJobTerminal(job, "failed");
-                clearPendingDecision(state, job);
-                notifyCompletion(job, state, pi, ctx);
-                updateWidget(state, ctx);
-                for (const f of cleanupFiles) {
-                    try {
-                        unlinkSync(f);
-                    } catch {
-                        /* already gone */
-                    }
-                }
+                finalizeAgentJob(1, true);
             });
 
             updateWidget(state, ctx);
@@ -337,7 +358,11 @@ export function registerAgentBackground(
                             `Context: ${(conversationBytes / 1024).toFixed(0)} KB / ${contextWindowTokens} tokens`,
                     },
                 ],
-                details: undefined,
+                details: {
+                    jobId,
+                    status: job.status,
+                    logPath,
+                },
             };
         },
     });

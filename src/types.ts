@@ -9,6 +9,29 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 export type JobStatus = "running" | "completed" | "failed" | "killed";
 
+/** Stable identifiers for indexed background-job output. */
+export interface JobOutputIndex {
+    sourceId: string;
+    chunkIds: string[];
+}
+
+/** Machine-readable metadata returned by background job tools. */
+export interface JobResultDetails {
+    jobId?: string;
+    status?: JobStatus;
+    exitCode?: number;
+    logPath?: string;
+    totalLines?: number;
+    truncated?: boolean;
+    empty?: boolean;
+    error?: boolean;
+    timedOut?: boolean;
+    /** Source ID for the job's output in the context sidecar. */
+    sourceId?: string;
+    /** Stable context-sidecar chunk IDs for the indexed output. */
+    chunkIds?: string[];
+}
+
 export interface BackgroundJob {
     id: string;
     command: string;
@@ -32,6 +55,11 @@ export interface BackgroundJob {
      * even though the original linked callback has already been consumed.
      */
     wantsCompletionNotification?: boolean;
+    /** Indexed output identifiers, populated after terminal completion. */
+    sourceId?: string;
+    chunkIds?: string[];
+    /** Resolves when terminal output indexing finishes. */
+    outputIndexPromise?: Promise<JobOutputIndex | undefined>;
     /** Optional triggers that fire async events when conditions are met. */
     triggers?: JobTrigger[];
 }
@@ -45,7 +73,14 @@ export interface BackgroundJob {
  * Time-based values are in seconds (wallTime, cpuTime, ioBlock).
  */
 export interface JobTrigger {
-    type: "outputLines" | "rssKb" | "ioReadBytes" | "ioWriteBytes" | "cpuTime" | "ioBlock" | "wallTime";
+    type:
+        | "outputLines"
+        | "rssKb"
+        | "ioReadBytes"
+        | "ioWriteBytes"
+        | "cpuTime"
+        | "ioBlock"
+        | "wallTime";
     value: number;
     /** Optional label for the agent's callback message. */
     label?: string;
@@ -66,6 +101,13 @@ export interface RunningProcess {
 // ─── Minimal context interfaces ─────────────────────────────────────
 
 export interface UiContext {
+    // Sidecar indexing reads cwd/session identity off the same ctx. Optional
+    // so pure-UI call sites (tests, widget-only paths) stay valid.
+    cwd?: string;
+    sessionManager?: {
+        getSessionFile?: () => string | null | undefined;
+        getSessionId?: () => string | null | undefined;
+    };
     ui: {
         notify(
             message: string,

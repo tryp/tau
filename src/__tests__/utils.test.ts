@@ -1,8 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, utimesSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import {
     formatDuration,
     generateJobId,
@@ -20,7 +20,9 @@ import {
 } from "../utils.ts";
 import type { BackgroundJob } from "../types.ts";
 
-function makeJob(overrides: Partial<BackgroundJob> & { id: string }): BackgroundJob {
+function makeJob(
+    overrides: Partial<BackgroundJob> & { id: string }
+): BackgroundJob {
     return {
         command: "echo hello",
         pid: 42,
@@ -85,11 +87,12 @@ void describe("generateJobId", () => {
 });
 
 void describe("logPathForJob", () => {
-    void it("returns the correct temp path", () => {
-        const TMPDIR = process.env.TMPDIR || "/tmp";
+    void it("returns a path under the user's ~/tmp dir", () => {
+        // logPathForJob deliberately uses ~/tmp (workspace convention for
+        // ephemeral outputs), not $TMPDIR.
         assert.equal(
             logPathForJob("job-1234-5"),
-            `${TMPDIR}/pi-bg-job-1234-5.log`
+            join(homedir(), "tmp", "pi-bg-job-1234-5.log")
         );
     });
 });
@@ -171,7 +174,10 @@ void describe("detectBlockedSleep", () => {
 
     void it("ignores sleep when it is NOT the first command", () => {
         assert.equal(detectBlockedSleep("echo start && sleep 5"), null);
-        assert.equal(detectBlockedSleep("python -c 'import time; time.sleep(5)'"), null);
+        assert.equal(
+            detectBlockedSleep("python -c 'import time; time.sleep(5)'"),
+            null
+        );
     });
 
     void it("handles leading whitespace", () => {
@@ -207,14 +213,22 @@ void describe("isAutoBackgroundAllowed", () => {
 
 void describe("formatJobLine", () => {
     void it("shows running status for foreground job", () => {
-        const job = makeJob({ id: "j-1", startTime: Date.now() - 5_000, isBackgrounded: false });
+        const job = makeJob({
+            id: "j-1",
+            startTime: Date.now() - 5_000,
+            isBackgrounded: false,
+        });
         const line = formatJobLine(job);
         assert.ok(line.startsWith("j-1:"), "should start with job id");
         assert.ok(line.includes("running"), "should show running");
     });
 
     void it("shows running status for backgrounded job", () => {
-        const job = makeJob({ id: "j-2", startTime: Date.now() - 10_000, isBackgrounded: true });
+        const job = makeJob({
+            id: "j-2",
+            startTime: Date.now() - 10_000,
+            isBackgrounded: true,
+        });
         const line = formatJobLine(job);
         assert.ok(line.startsWith("j-2:"), "should start with job id");
         assert.ok(line.includes("running"), "should show running");
@@ -241,13 +255,19 @@ void describe("formatJobLine", () => {
         // Command portion should be max 80
         const colonIdx = line.indexOf(":");
         const cmdPortion = line.slice(colonIdx + 2, line.lastIndexOf(" - "));
-        assert.ok(cmdPortion.length <= 80, `command portion too long: ${cmdPortion.length}`);
+        assert.ok(
+            cmdPortion.length <= 80,
+            `command portion too long: ${cmdPortion.length}`
+        );
     });
 });
 
 void describe("readOutputTailSync", () => {
     void it("returns placeholder for nonexistent file", () => {
-        assert.equal(readOutputTailSync("/nonexistent/path.log", 100), "(no output yet)");
+        assert.equal(
+            readOutputTailSync("/nonexistent/path.log", 100),
+            "(no output yet)"
+        );
     });
 
     void it("returns entire content when under maxChars", () => {
@@ -275,7 +295,7 @@ void describe("markJobTerminal", () => {
 
     void it("marks running job as killed", () => {
         const job = makeJob({ id: "j-3", status: "running" });
-        markJobTerminal(job, "killed", null);
+        markJobTerminal(job, "killed", undefined);
         assert.equal(job.status, "killed");
     });
 });
@@ -305,9 +325,10 @@ void describe("cleanupStaleLogs", () => {
         const oldMtime = new Date(Date.now() - 48 * 60 * 60 * 1000);
         // Touch via utimes
         try {
-            const { utimesSync } = require("node:fs");
             utimesSync(oldFile, oldMtime, oldMtime);
-        } catch { /* skip mtime manipulation on platforms without utimes */ }
+        } catch {
+            /* skip mtime manipulation on platforms without utimes */
+        }
 
         const freshFile = join(testDir, "pi-bg-job-fresh.log");
         writeFileSync(freshFile, "fresh content");

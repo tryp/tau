@@ -1,15 +1,21 @@
 import { describe, it, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
+    findJobSourceDetailsInSidecar,
+    findJobSourceIdInSidecar,
     purgeSidecar,
     readJobOutputFromSidecar,
+    readJobOutputDetailsFromSidecar,
     indexJobOutputInSidecar,
+    searchSidecarSources,
+    trackJobOutputIndex,
 } from "../features/background.ts";
+import { chunkText } from "../features/sidecar.ts";
 import type { BackgroundJob } from "../types.ts";
 
 // ─── Fixture helpers ────────────────────────────────────────────────
@@ -40,13 +46,34 @@ CREATE TABLE IF NOT EXISTS context_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_context_sources_created ON context_sources(created_at);
 CREATE INDEX IF NOT EXISTS idx_context_chunks_source ON context_chunks(source_id, ordinal);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS context_chunks_fts USING fts5(
+  title, content, content='context_chunks', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS context_chunks_ai AFTER INSERT ON context_chunks BEGIN
+  INSERT INTO context_chunks_fts(rowid, title, content)
+  VALUES (new.rowid, new.title, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS context_chunks_ad AFTER DELETE ON context_chunks BEGIN
+  INSERT INTO context_chunks_fts(context_chunks_fts, rowid, title, content)
+  VALUES ('delete', old.rowid, old.title, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS context_chunks_au AFTER UPDATE ON context_chunks BEGIN
+  INSERT INTO context_chunks_fts(context_chunks_fts, rowid, title, content)
+  VALUES ('delete', old.rowid, old.title, old.content);
+  INSERT INTO context_chunks_fts(rowid, title, content)
+  VALUES (new.rowid, new.title, new.content);
+END;
 `;
 
 let tmpDir: string;
 
 /** Create a temp directory for an isolated context.db. */
 function setupTempDir(): string {
-    const dir = join(tmpdir(), `pi-tau-sidecar-test-${randomUUID().slice(0, 8)}`);
+    const dir = join(
+        tmpdir(),
+        `pi-tau-sidecar-test-${randomUUID().slice(0, 8)}`
+    );
     mkdirSync(dir, { recursive: true });
     return dir;
 }
@@ -55,9 +82,7 @@ function setupTempDir(): string {
 function createDb(dir: string): DatabaseSync {
     const dbPath = join(dir, "context.db");
     const db = new DatabaseSync(dbPath, { enableForeignKeyConstraints: true });
-    for (const stmt of SIDECAR_SCHEMA.split(";").filter((s) => s.trim())) {
-        db.prepare(stmt).run();
-    }
+    db.exec(SIDECAR_SCHEMA);
     return db;
 }
 
@@ -170,7 +195,9 @@ void describe("purgeSidecar", () => {
         // Verify source was deleted
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
-            .prepare("SELECT id FROM context_sources WHERE tool_name = 'bash_bg'")
+            .prepare(
+                "SELECT id FROM context_sources WHERE tool_name = 'bash_bg'"
+            )
             .all() as { id: string }[];
         check.close();
         assert.equal(remaining.length, 0);
@@ -196,7 +223,9 @@ void describe("purgeSidecar", () => {
 
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
-            .prepare("SELECT id FROM context_sources WHERE tool_name = 'bash_bg'")
+            .prepare(
+                "SELECT id FROM context_sources WHERE tool_name = 'bash_bg'"
+            )
             .all() as { id: string }[];
         check.close();
         assert.equal(remaining.length, 1);
@@ -220,7 +249,9 @@ void describe("purgeSidecar", () => {
 
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
-            .prepare("SELECT COUNT(*) as cnt FROM context_sources WHERE tool_name = 'bash_bg'")
+            .prepare(
+                "SELECT COUNT(*) as cnt FROM context_sources WHERE tool_name = 'bash_bg'"
+            )
             .get() as { cnt: number };
         check.close();
         assert.equal(remaining.cnt, 0);
@@ -233,7 +264,15 @@ void describe("purgeSidecar", () => {
             `INSERT INTO context_sources
              (id, tool_name, input_summary, created_at, byte_count, line_count, content_hash)
              VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run("other", "lsp", null, Date.now() - 30 * 24 * 60 * 60 * 1000, 50, 2, "hash_other");
+        ).run(
+            "other",
+            "lsp",
+            null,
+            Date.now() - 30 * 24 * 60 * 60 * 1000,
+            50,
+            2,
+            "hash_other"
+        );
         db.close();
 
         purgeSidecar(1);
@@ -286,19 +325,24 @@ void describe("readJobOutputFromSidecar", () => {
     void it("returns concatenated output for a job with chunks", async () => {
         const db = createDb(tmpDir);
         const srcId = insertSource(db, {
-            input_summary: JSON.stringify({ jobId: "job-output-1", logPath: "/tmp/test.log" }),
+            input_summary: JSON.stringify({
+                jobId: "job-output-1",
+                logPath: "/tmp/test.log",
+            }),
         });
-        insertChunk(db, srcId, 1, "line one");
-        insertChunk(db, srcId, 2, "line two");
+        insertChunk(db, srcId, 1, "line one\n");
+        insertChunk(db, srcId, 2, "line two\n");
         insertChunk(db, srcId, 3, "line three");
         db.close();
 
-        const result = await readJobOutputFromSidecar("job-output-1");
-        assert.ok(result !== null);
-        assert.ok(result!.includes("Log: /tmp/test.log"));
-        assert.ok(result!.includes("line one"));
-        assert.ok(result!.includes("line two"));
-        assert.ok(result!.includes("line three"));
+        const details = await readJobOutputDetailsFromSidecar("job-output-1");
+        assert.ok(details !== null);
+        assert.equal(details.logPath, "/tmp/test.log");
+        assert.equal(details.text, "line one\nline two\nline three");
+        assert.equal(
+            await readJobOutputFromSidecar("job-output-1"),
+            details.text
+        );
     });
 
     void it("handles missing logPath gracefully", async () => {
@@ -319,25 +363,22 @@ void describe("readJobOutputFromSidecar", () => {
         const srcId = insertSource(db, {
             input_summary: JSON.stringify({ jobId: "job-ordered" }),
         });
-        insertChunk(db, srcId, 2, "second");
-        insertChunk(db, srcId, 1, "first");
+        insertChunk(db, srcId, 2, "second\n");
+        insertChunk(db, srcId, 1, "first\n");
         insertChunk(db, srcId, 3, "third");
         db.close();
 
         const result = await readJobOutputFromSidecar("job-ordered");
-        assert.ok(result !== null);
-        const withoutLog = result!.replace(/^Log: .*\n\n?/, "");
-        assert.equal(withoutLog, "first\n\nsecond\n\nthird");
+        assert.equal(result, "first\nsecond\nthird");
     });
 });
 
 // ─── indexJobOutputInSidecar tests ──────────────────────────────────
 
-/** Minimal session manager for tests that need it. */
-const noopSessionMgr = {};
-
 void describe("indexJobOutputInSidecar", () => {
-    function testJob(overrides: Partial<BackgroundJob> & { id: string }): BackgroundJob {
+    function testJob(
+        overrides: Partial<BackgroundJob> & { id: string }
+    ): BackgroundJob {
         return {
             command: "echo test",
             pid: 9999,
@@ -373,6 +414,39 @@ void describe("indexJobOutputInSidecar", () => {
         // No throw — pass
     });
 
+    void it("rolls back an incomplete write for an incompatible schema", async () => {
+        const db = new DatabaseSync(join(tmpDir, "context.db"), {});
+        db.exec(`
+            CREATE TABLE context_sources (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                project_path TEXT,
+                tool_name TEXT NOT NULL,
+                input_summary TEXT,
+                created_at INTEGER NOT NULL,
+                byte_count INTEGER NOT NULL,
+                line_count INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                preview_byte_count INTEGER NOT NULL DEFAULT 0,
+                returned_byte_count INTEGER NOT NULL DEFAULT 0
+            )
+        `);
+        db.close();
+
+        const job = testJob({
+            id: "job-incompatible-schema",
+            logPath: writeLog("output before schema failure"),
+        });
+        await indexJobOutputInSidecar(job, { cwd: tmpDir });
+
+        const check = new DatabaseSync(join(tmpDir, "context.db"), {});
+        const count = check
+            .prepare("SELECT COUNT(*) AS count FROM context_sources")
+            .get() as { count: number };
+        check.close();
+        assert.equal(count.count, 0);
+    });
+
     void it("skips empty log files", async () => {
         createDb(tmpDir);
         const job = testJob({ id: "job-empty", logPath: writeLog("") });
@@ -381,17 +455,32 @@ void describe("indexJobOutputInSidecar", () => {
         // Verify nothing was inserted
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const count = check
-            .prepare("SELECT COUNT(*) as cnt FROM context_sources WHERE tool_name = 'bash_bg'")
+            .prepare(
+                "SELECT COUNT(*) as cnt FROM context_sources WHERE tool_name = 'bash_bg'"
+            )
             .get() as { cnt: number };
         check.close();
         assert.equal(count.cnt, 0);
+    });
+
+    void it("chunks long lines without dropping text", () => {
+        const text = "prefix\n" + "x".repeat(5000) + "\ntrailing";
+        const chunks = chunkText(text, "ctx_bg_test");
+        assert.equal(chunks.map((chunk) => chunk.content).join(""), text);
+        assert.ok(chunks.every((chunk) => chunk.byteCount <= 4096));
+        assert.deepEqual(
+            chunks.map((chunk) => chunk.ordinal),
+            chunks.map((_, index) => index + 1)
+        );
     });
 
     void it("indexes a job's output as source + chunks", async () => {
         createDb(tmpDir);
         const output = "hello world\nsecond line\nthird line";
         const job = testJob({ id: "job-index-1", logPath: writeLog(output) });
-        await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        const sourceId = await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        assert.ok(sourceId?.startsWith("ctx_bg_"));
+        assert.equal(findJobSourceIdInSidecar(job.id), sourceId);
 
         // Check source was inserted
         const check = new DatabaseSync(join(tmpDir, "context.db"));
@@ -400,9 +489,17 @@ void describe("indexJobOutputInSidecar", () => {
                 `SELECT id, byte_count, line_count, input_summary
                  FROM context_sources WHERE tool_name = 'bash_bg'`
             )
-            .all() as { id: string; byte_count: number; line_count: number; input_summary: string }[];
+            .all() as {
+            id: string;
+            byte_count: number;
+            line_count: number;
+            input_summary: string;
+        }[];
         assert.equal(sources.length, 1);
-        const summary = JSON.parse(sources[0].input_summary);
+        assert.equal(sources[0].line_count, 3);
+        const summary = JSON.parse(sources[0].input_summary) as {
+            jobId?: string;
+        };
         assert.equal(summary.jobId, "job-index-1");
 
         // Check chunks were inserted
@@ -417,24 +514,141 @@ void describe("indexJobOutputInSidecar", () => {
         check.close();
     });
 
-    void it("deduplicates identical content by updating returned_byte_count", async () => {
+    void it("deduplicates repeated indexing of one job", async () => {
         createDb(tmpDir);
         const output = "some unique output";
         const job = testJob({ id: "job-dedup-1", logPath: writeLog(output) });
 
-        // Index twice
-        await indexJobOutputInSidecar(job, { cwd: tmpDir });
-        await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        const first = await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        const second = await indexJobOutputInSidecar(job, { cwd: tmpDir });
 
-        // Should only have one source
+        assert.equal(first, second);
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const sources = check
-            .prepare("SELECT id, returned_byte_count FROM context_sources WHERE tool_name = 'bash_bg'")
+            .prepare(
+                "SELECT id, returned_byte_count FROM context_sources WHERE tool_name = 'bash_bg'"
+            )
             .all() as { id: string; returned_byte_count: number }[];
         assert.equal(sources.length, 1);
-        // returned_byte_count incremented on dedup hit
-        assert.equal(sources[0].returned_byte_count, Buffer.byteLength(output, "utf8"));
+        // Indexing is internal maintenance, not a context read.
+        assert.equal(sources[0].returned_byte_count, 0);
         check.close();
+    });
+
+    void it("keeps identical output from different jobs separately addressable", async () => {
+        createDb(tmpDir);
+        const output = "identical output from two jobs";
+        const logPath = writeLog(output);
+        const firstJob = testJob({ id: "job-same-output-a", logPath });
+        const secondJob = testJob({ id: "job-same-output-b", logPath });
+
+        const first = await indexJobOutputInSidecar(firstJob, { cwd: tmpDir });
+        const second = await indexJobOutputInSidecar(secondJob, {
+            cwd: tmpDir,
+        });
+
+        assert.ok(first);
+        assert.ok(second);
+        assert.notEqual(first, second);
+        assert.equal(findJobSourceIdInSidecar(firstJob.id), first);
+        assert.equal(findJobSourceIdInSidecar(secondJob.id), second);
+        const details = findJobSourceDetailsInSidecar(secondJob.id);
+        assert.deepEqual(details?.chunkIds.length, 1);
+    });
+
+    void it("searches indexed output with stable source and chunk IDs", async () => {
+        createDb(tmpDir);
+        const job = testJob({
+            id: "job-search",
+            logPath: writeLog("searchable diagnostic output"),
+        });
+        const sourceId = await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        const matches = searchSidecarSources("diagnostic", {
+            toolNames: ["bash_bg"],
+        });
+        assert.equal(matches.length, 1);
+        assert.equal(matches[0].sourceId, sourceId);
+        assert.equal(matches[0].chunkIds.length, 1);
+        assert.equal(matches[0].toolName, "bash_bg");
+
+        const db = new DatabaseSync(join(tmpDir, "context.db"));
+        const ftsMatches = db
+            .prepare(
+                "SELECT rowid FROM context_chunks_fts WHERE context_chunks_fts MATCH ?"
+            )
+            .all("diagnostic");
+        assert.equal(ftsMatches.length, 1);
+        db.close();
+
+        const noMatch = searchSidecarSources("diagnostic", {
+            toolNames: ["agent_bg"],
+        });
+        assert.equal(noMatch.length, 0);
+    });
+
+    void it("tracks source and chunk IDs on the job", async () => {
+        createDb(tmpDir);
+        const job = testJob({ id: "job-track", logPath: writeLog("tracked") });
+        const result = await trackJobOutputIndex(job, { cwd: tmpDir });
+        assert.ok(result);
+        assert.equal(job.sourceId, result.sourceId);
+        assert.deepEqual(job.chunkIds, result.chunkIds);
+        assert.equal(job.outputIndexPromise !== undefined, true);
+    });
+
+    void it("reuses a concurrent indexing promise for one job", async () => {
+        createDb(tmpDir);
+        const job = testJob({
+            id: "job-track-once",
+            logPath: writeLog("tracked once"),
+        });
+        const first = trackJobOutputIndex(job, { cwd: tmpDir });
+        const second = trackJobOutputIndex(job, { cwd: tmpDir });
+        assert.equal(first, second);
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+        assert.ok(firstResult);
+        assert.deepEqual(secondResult, firstResult);
+
+        const db = new DatabaseSync(join(tmpDir, "context.db"));
+        const count = db
+            .prepare(
+                "SELECT COUNT(*) AS count FROM context_sources WHERE json_extract(input_summary, '$.jobId') = ?"
+            )
+            .get("job-track-once") as { count: number };
+        assert.equal(count.count, 1);
+        db.close();
+    });
+
+    void it("waits for output readiness without creating a promise cycle", async () => {
+        createDb(tmpDir);
+        const output = "agent output after stream flush";
+        const job = testJob({
+            id: "job-ready-gate",
+            logPath: writeLog(output),
+        });
+        let release!: () => void;
+        const ready = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const tracked = trackJobOutputIndex(
+            job,
+            { cwd: tmpDir },
+            "agent_bg",
+            ready
+        );
+        release();
+        const result = await tracked;
+        assert.ok(result);
+        assert.equal(await readJobOutputFromSidecar(job.id), output);
+    });
+
+    void it("round-trips output larger than one chunk without inserted separators", async () => {
+        createDb(tmpDir);
+        const output = `${"x".repeat(5000)}\nfinal line`;
+        const job = testJob({ id: "job-roundtrip", logPath: writeLog(output) });
+        await indexJobOutputInSidecar(job, { cwd: tmpDir });
+        const details = await readJobOutputDetailsFromSidecar("job-roundtrip");
+        assert.equal(details?.text, output);
     });
 
     void it("preserves session_id and project_path in source record", async () => {
@@ -457,9 +671,31 @@ void describe("indexJobOutputInSidecar", () => {
             .prepare(
                 "SELECT session_id, project_path FROM context_sources WHERE tool_name = 'bash_bg'"
             )
-            .get() as { session_id: string | null; project_path: string | null };
+            .get() as {
+            session_id: string | null;
+            project_path: string | null;
+        };
         assert.equal(row.session_id, "/sessions/test-session.jsonl");
         assert.equal(row.project_path, tmpDir);
+        check.close();
+    });
+
+    void it("indexes with a custom tool_name (agent_bg)", async () => {
+        createDb(tmpDir);
+        const output = "agent background output";
+        const logPath = writeLog(output);
+        const job = testJob({ id: "job-agent-1", logPath });
+
+        await indexJobOutputInSidecar(job, { cwd: tmpDir }, "agent_bg");
+
+        const check = new DatabaseSync(join(tmpDir, "context.db"));
+        const row = check
+            .prepare(
+                "SELECT tool_name FROM context_sources WHERE tool_name = 'agent_bg'"
+            )
+            .get() as { tool_name: string } | undefined;
+        assert.ok(row, "agent_bg source should be inserted");
+        assert.equal(row.tool_name, "agent_bg");
         check.close();
     });
 });
