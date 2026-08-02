@@ -19,6 +19,13 @@ import type { PermissionMode } from "./permissions/types.js";
 import { modeStatusText, modeColour } from "./permissions/index.js";
 import { planIdFromSession, createPlanFile } from "./plan-file.ts";
 import { NORMAL_MODE_TOOLS } from "../utils.ts";
+import { PLAN_MODE_ACTIVE_TOOLS } from "./plan-tools.ts";
+
+/**
+ * Auto-exit plan mode after 30 minutes of inactivity.
+ * Prevents sessions getting stuck in plan mode indefinitely.
+ */
+export const PLAN_MODE_TIMEOUT_MS = 30 * 60 * 1000;
 
 function updatePlanStatus(state: TauState, ctx: ExtensionContext): void {
     if (state.permissionMode === "plan") {
@@ -39,6 +46,8 @@ export function togglePlanMode(
         state.permissionMode = previousMode;
         state.planSlug = undefined;
         state.planPreviousMode = undefined;
+        state.planReviewPending = false;
+        state.planEnteredAt = undefined;
         pi.setActiveTools(NORMAL_MODE_TOOLS);
 
         if (ctx.hasUI) {
@@ -60,17 +69,9 @@ export function togglePlanMode(
         state.planPreviousMode = state.permissionMode;
         state.permissionMode = "plan";
         state.planSlug = planId;
-        pi.setActiveTools([
-            "read",
-            "bash",
-            "grep",
-            "find",
-            "ls",
-            "questionnaire",
-            "task",
-            "enter_plan_mode",
-            "exit_plan_mode",
-        ]);
+        state.planReviewPending = false;
+        state.planEnteredAt = Date.now();
+        pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
 
         if (ctx.hasUI) {
             const colour = modeColour("plan");

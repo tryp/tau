@@ -39,7 +39,8 @@ import {
 import { purgeSidecar, registerBackgroundJobs } from "./features/background.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
-import { registerPlanMode } from "./features/plan-mode.ts";
+import { registerPlanMode, PLAN_MODE_TIMEOUT_MS } from "./features/plan-mode.ts";
+import { cancelPlanMode } from "./features/plan-tools.ts";
 import { getPlanFilePath } from "./features/plan-file.ts";
 import {
     registerTask,
@@ -77,7 +78,10 @@ import { buildStatusBars, readUsageSnapshot } from "./features/quota-bars.ts";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
 import { registerPermissions } from "./features/permissions/commands.js";
-import { registerPlanTools } from "./features/plan-tools.js";
+import {
+    registerPlanTools,
+    PLAN_MODE_ACTIVE_TOOLS,
+} from "./features/plan-tools.js";
 import { registerTauCommand } from "./features/features-register.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
 import { isTmuxAvailable } from "./tmux.ts";
@@ -407,6 +411,27 @@ export default function (pi: ExtensionAPI) {
 
     // Plan-mode: inject context before agent starts
     pi.on("before_agent_start", async (_event, ctx) => {
+        // Auto-exit if plan mode has been active beyond the inactivity timeout
+        if (
+            state.permissionMode === "plan" &&
+            state.planEnteredAt &&
+            Date.now() - state.planEnteredAt > PLAN_MODE_TIMEOUT_MS
+        ) {
+            const planSlug = state.planSlug;
+            cancelPlanMode(pi, state, ctx);
+            return {
+                message: {
+                    customType: "plan-mode-context",
+                    content: `[PLAN MODE AUTO-EXIT]
+Plan mode was automatically disabled after 30 minutes of inactivity.
+
+If you need to continue planning, call enter_plan_mode again.
+Previous plan ID: ${planSlug ?? "(none)"}`,
+                    display: true,
+                },
+            };
+        }
+
         if (state.permissionMode === "plan" && state.planSlug) {
             const sessionDir = ctx.sessionManager.getSessionDir();
             const planPath = getPlanFilePath(sessionDir, state.planSlug);
@@ -421,9 +446,10 @@ export default function (pi: ExtensionAPI) {
 You are in plan mode — a read-only exploration mode for structured planning.
 
 Restrictions:
-- Only read-only tools are available (read, bash, grep, find, ls)
+- Only read-only tools are available (read, bash, grep, find, ls, lsp_*)
 - Bash is restricted to an allowlist of read-only commands
 - The ONLY writable file is the plan file at: ${planPath}
+- The write tool is available but restricted to writing the plan file only
 - The task tool is fully available — use it to structure the implementation
 
 Your job is to:
@@ -433,8 +459,8 @@ Your job is to:
    - Decompose into subtasks with child-of links
    - Add blocks/depends-on links for ordering constraints
    - Tasks without dependency links between them are parallel candidates
-3. Write the narrative plan to ${planPath}
-4. Call exit_plan_mode when the plan is ready for user approval
+3. Use the write tool with path=${planPath} to write the narrative plan
+4. Call exit_plan_mode when the plan is ready for review; follow its review-mode instructions
 
 The plan file should include: Context, Approach, Files to modify,
 Existing code to reuse (with paths), and Verification steps.${taskTree}`,
@@ -591,32 +617,35 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             | {
                   data?: {
                       enabled?: boolean;
+                      planId?: string;
                       slug?: string;
                       previousMode?: import("./features/permissions/types.js").PermissionMode;
+                      enteredAt?: number;
+                      reviewPending?: boolean;
                   };
               }
             | undefined;
 
         if (planModeEntry?.data) {
+            const restoredPlanId =
+                planModeEntry.data.planId ?? planModeEntry.data.slug;
             if (planModeEntry.data.enabled) {
                 state.permissionMode = "plan";
+                state.planSlug = restoredPlanId;
+                state.planPreviousMode = planModeEntry.data.previousMode;
+                state.planReviewPending =
+                    planModeEntry.data.reviewPending ?? false;
+                state.planEnteredAt = planModeEntry.data.enteredAt;
+            } else {
+                state.planSlug = undefined;
+                state.planPreviousMode = undefined;
+                state.planReviewPending = false;
+                state.planEnteredAt = undefined;
             }
-            state.planSlug = planModeEntry.data.slug;
-            state.planPreviousMode = planModeEntry.data.previousMode;
         }
 
         if (state.permissionMode === "plan") {
-            pi.setActiveTools([
-                "read",
-                "bash",
-                "grep",
-                "find",
-                "ls",
-                "questionnaire",
-                "task",
-                "enter_plan_mode",
-                "exit_plan_mode",
-            ]);
+            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
         }
 
         // Restore task state
@@ -627,7 +656,11 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
         // ── Permission state initialisation ────────────────────────
         const permState = await initPermissionState(ctx.cwd);
-        state.permissionMode = permState.mode;
+        // Plan state restored from the CLI flag/session entry is authoritative
+        // for this startup. Do not let the permission-settings default reset
+        // the session back to allow mode after we restored it above.
+        const planModeWasRestored = state.permissionMode === "plan";
+        if (!planModeWasRestored) state.permissionMode = permState.mode;
         state.permissionRules = permState.rules;
         state.permissionAdditionalDirectories = permState.additionalDirectories;
         state.permissionDisableBypass = permState.disableBypass;

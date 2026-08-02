@@ -86,6 +86,10 @@ export class TauState {
     planPreviousMode: PermissionMode | undefined;
     /** Whether the model has called exit_plan_mode and execution is about to start. */
     planExiting = false;
+    /** Whether an agent-driven plan review is awaiting an approve/revise action. */
+    planReviewPending = false;
+    /** Timestamp (Date.now()) when plan mode was entered. Used for auto-exit timeout. */
+    planEnteredAt: number | undefined;
 
     // ── Notifications ────────────────────────────────────────────────
 

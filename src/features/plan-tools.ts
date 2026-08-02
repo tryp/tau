@@ -2,8 +2,8 @@
  * Plan mode tools — enter_plan_mode and exit_plan_mode.
  *
  * These are LLM-callable tools that manage the plan lifecycle.
- * `enter_plan_mode` requires user approval (permission system treats it as "ask").
- * `exit_plan_mode` presents the plan for review and starts execution.
+ * `enter_plan_mode` enters read-only exploration.
+ * `exit_plan_mode` routes review through the configured user or agent flow.
  *
  * Also provides the `/plan` command and plan mode system prompt injection.
  */
@@ -14,10 +14,10 @@ import type {
     ExtensionCommandContext,
     ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
-import { modeStatusText, modeColour } from "./permissions/index.js";
+import { modeStatusText, modeColour } from "./permissions/index.ts";
 import {
     planIdFromTitle,
     planIdFromSession,
@@ -25,6 +25,11 @@ import {
     getPlanFilePath,
     readPlanFile,
 } from "./plan-file.ts";
+import {
+    EXECUTION_MODES,
+    loadPlanPreferences,
+    type ExecutionMode,
+} from "./plan-preferences.ts";
 import { formatTaskTree, countIndependentBranches } from "./task.ts";
 import { captureReload } from "./reload.ts";
 
@@ -40,28 +45,38 @@ const EnterPlanModeParams = Type.Object({
     reason: Type.Optional(
         Type.String({
             description:
-                "Why plan mode is being requested (shown to user for approval).",
+                "Why plan mode is being requested (for review context).",
         })
     ),
 });
 
 const ExitPlanModeParams = Type.Object({
+    action: Type.Optional(
+        StringEnum(["review", "approve", "revise", "cancel"] as const, {
+            description:
+                "Agent review action. First call review, then call approve, revise, or cancel.",
+        })
+    ),
     summary: Type.Optional(
         Type.String({
             description:
                 "Brief summary of what the plan covers (shown in exit notification).",
         })
     ),
+    feedback: Type.Optional(
+        Type.String({
+            description: "Review notes or the reason the plan needs revision.",
+        })
+    ),
+    executionMode: Type.Optional(
+        StringEnum(EXECUTION_MODES, {
+            description:
+                "Execution mode to use after approval. Overrides the configured default.",
+        })
+    ),
 });
 
 // ─── Execution modes ────────────────────────────────────────────────
-
-export type ExecutionMode =
-    | "continue"
-    | "fresh"
-    | "spawn"
-    | "parallel"
-    | "manual";
 
 const EXECUTION_MODE_LABELS: Record<ExecutionMode, string> = {
     continue: "Continue in this session",
@@ -70,6 +85,22 @@ const EXECUTION_MODE_LABELS: Record<ExecutionMode, string> = {
     parallel: "Parallel (dispatch branches)",
     manual: "Manual (read plan when needed)",
 };
+
+/** Tools the agent may use while it plans and reviews without user UI. */
+export const PLAN_MODE_ACTIVE_TOOLS = [
+    "read",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "questionnaire",
+    "task",
+    "subagent",
+    "subagent_wait",
+    "write",
+    "enter_plan_mode",
+    "exit_plan_mode",
+];
 
 // ─── Feature registration ───────────────────────────────────────────
 
@@ -105,20 +136,11 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             // Store previous mode for restoration
             state.planSlug = planId;
             state.planPreviousMode = state.permissionMode;
+            state.planReviewPending = false;
 
             // Switch to plan mode
             state.permissionMode = "plan";
-            pi.setActiveTools([
-                "read",
-                "bash",
-                "grep",
-                "find",
-                "ls",
-                "questionnaire",
-                "task",
-                "enter_plan_mode",
-                "exit_plan_mode",
-            ]);
+            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
 
             // Update status bar
             if (ctx.hasUI) {
@@ -134,6 +156,8 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                 enabled: true,
                 planId,
                 previousMode: state.planPreviousMode,
+                enteredAt: Date.now(),
+                reviewPending: false,
             });
 
             return {
@@ -143,11 +167,13 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                         text:
                             `Entered plan mode. Plan file: ${planPath}\n\n` +
                             `You can now explore the codebase with read-only tools. Build the plan:\n` +
-                            `1. Explore the codebase using read, bash (read-only), grep, find\n` +
-                            `2. Create tasks with the task tool to structure the implementation\n` +
-                            `3. Write the narrative plan to ${planPath}\n` +
-                            `4. Call exit_plan_mode when ready for user review\n\n` +
-                            `Write operations are blocked except for the plan file and task tool.`,
+                            `1. Explore the codebase using read, bash (read-only), grep, find, lsp tools\n` +
+                            `2. Use the subagent tool with planner/reviewer agents when independent planning or review would help\n` +
+                            `3. Create tasks with the task tool to structure the implementation\n` +
+                            `4. Use the write tool (path-restricted to the plan file) to write the narrative plan to:\n` +
+                            `   ${planPath}\n` +
+                            `5. Call exit_plan_mode when the plan is ready for review; review and approve it yourself\n\n` +
+                            `Write operations are blocked except for the plan file (via the write tool).`,
                     },
                 ],
                 details: {
@@ -185,8 +211,9 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
         name: "exit_plan_mode",
         label: "Exit Plan Mode",
         description:
-            "Exit plan mode and present the plan for user review. " +
-            "The user will approve or reject the plan, then choose an execution mode. " +
+            "Exit plan mode and review the plan before execution. " +
+            "In agent review mode, the first call returns the review request to you; " +
+            "then call this tool again with action approve, revise, or cancel. " +
             "Call this when the plan file is complete and the task tree is ready.",
         parameters: ExitPlanModeParams,
 
@@ -214,62 +241,176 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             const planPath = getPlanFilePath(sessionDir, planId);
             const planContent = readPlanFile(sessionDir, planId);
 
-            // Present plan for review
+            // Prepare the plan review request.
             const summary = params.summary ?? "Plan is ready for review.";
             const taskTree =
                 state.tasks.length > 0
                     ? `\n\nTask tree:\n${formatTaskTree(state.tasks)}`
                     : "\n\n(No tasks created during planning)";
-
+            const planContentForReview = planContent ?? "(empty plan file)";
             const reviewMessage = `**Plan Review**\n\n${summary}\n\nPlan file: \`${planPath}\`${taskTree}`;
+            const preferences = loadPlanPreferences(ctx.cwd);
+            const action = params.action ?? "review";
 
-            pi.sendMessage(
-                {
-                    customType: "plan-review",
-                    content: reviewMessage,
-                    display: true,
-                },
-                { triggerTurn: false }
-            );
+            if (preferences.reviewMode === "agent") {
+                if (action === "cancel") {
+                    cancelPlanMode(pi, state, ctx);
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: "Plan mode cancelled. Returned to the previous mode.",
+                            },
+                        ],
+                        details: { action: "exit", cancelled: true },
+                    };
+                }
 
-            // Ask user whether to approve the plan
-            const approved = await ctx.ui.select(
-                "Review plan — approve to proceed?",
-                ["Approve", "Reject (continue planning)", "Cancel plan mode"]
-            );
-
-            if (approved === "Reject (continue planning)") {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "Plan rejected. Continue refining the plan in plan mode.",
+                if (!state.planReviewPending) {
+                    state.planReviewPending = true;
+                    pi.appendEntry("plan-mode", {
+                        enabled: true,
+                        planId,
+                        previousMode: state.planPreviousMode,
+                        enteredAt: state.planEnteredAt,
+                        reviewPending: true,
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text:
+                                    "Agent review required before execution. Review the plan yourself; " +
+                                    "this is not a user prompt. Check scope, file impact, dependencies, " +
+                                    "verification coverage, and whether tasks can safely run in parallel.\n\n" +
+                                    `${reviewMessage}\n\nPlan content:\n${planContentForReview}\n\n` +
+                                    "After answering those review questions, call exit_plan_mode again " +
+                                    "with action=approve to execute, action=revise to continue planning, " +
+                                    "or action=cancel to leave plan mode.",
+                            },
+                        ],
+                        details: {
+                            action: "exit",
+                            reviewRequired: true,
+                            planPath,
+                            planContent: planContentForReview,
                         },
-                    ],
-                    details: { action: "exit", rejected: true },
-                };
+                    };
+                }
+
+                if (action === "revise") {
+                    state.planReviewPending = false;
+                    pi.appendEntry("plan-mode", {
+                        enabled: true,
+                        planId,
+                        previousMode: state.planPreviousMode,
+                        enteredAt: state.planEnteredAt,
+                        reviewPending: false,
+                    });
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text:
+                                    "Plan revision requested. Continue planning and update the plan file." +
+                                    (params.feedback
+                                        ? `\n\nReview notes:\n${params.feedback}`
+                                        : ""),
+                            },
+                        ],
+                        details: { action: "exit", revised: true },
+                    };
+                }
+
+                if (action !== "approve") {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text:
+                                    "A plan review is pending. Call exit_plan_mode with action=approve, " +
+                                    "action=revise, or action=cancel.",
+                            },
+                        ],
+                        details: {
+                            action: "exit",
+                            reviewRequired: true,
+                            planPath,
+                            planContent: planContentForReview,
+                        },
+                    };
+                }
+            } else {
+                // Preserve the interactive review flow for user review mode.
+                pi.sendMessage(
+                    {
+                        customType: "plan-review",
+                        content: reviewMessage,
+                        display: true,
+                    },
+                    { triggerTurn: false }
+                );
+
+                const approved = preferences.autoApprove
+                    ? "Approve"
+                    : await ctx.ui.select("Review plan — approve to proceed?", [
+                          "Approve",
+                          "Reject (continue planning)",
+                          "Cancel plan mode",
+                      ]);
+
+                if (approved === "Reject (continue planning)") {
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: "Plan rejected. Continue refining the plan in plan mode.",
+                            },
+                        ],
+                        details: { action: "exit", rejected: true },
+                    };
+                }
+
+                if (approved === "Cancel plan mode") {
+                    cancelPlanMode(pi, state, ctx);
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: "Plan mode cancelled. Returned to previous mode.",
+                            },
+                        ],
+                        details: { action: "exit", cancelled: true },
+                    };
+                }
             }
 
-            if (approved === "Cancel plan mode") {
-                cancelPlanMode(pi, state, ctx);
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "Plan mode cancelled. Returned to previous mode.",
-                        },
-                    ],
-                    details: { action: "exit", cancelled: true },
-                };
-            }
+            state.planReviewPending = false;
+
+            // The plan file remains on disk for reference, but the active
+            // plan state is no longer needed once execution begins.
+            // Agent-driven plans must not restore an interactive permission
+            // mode: there is no user available to answer those prompts.
+            const previousMode =
+                preferences.reviewMode === "agent"
+                    ? "allow"
+                    : (state.planPreviousMode ?? "allow");
+            state.planSlug = undefined;
+            state.planPreviousMode = undefined;
 
             // ── Approved: choose execution mode ───────────────────
 
-            const execMode = await chooseExecutionMode(ctx, state);
+            const execMode =
+                params.executionMode ??
+                preferences.defaultExecutionMode ??
+                (preferences.reviewMode === "agent"
+                    ? "continue"
+                    : await chooseExecutionMode(ctx, state));
 
-            // Restore previous permission mode
+            // Restore the previous mode for user-reviewed plans, or keep the
+            // agent-driven execution path non-interactive.
             state.planExiting = true;
-            const previousMode = state.planPreviousMode ?? "allow";
+            state.planEnteredAt = undefined;
             state.permissionMode = previousMode;
             pi.setActiveTools(["read", "bash", "edit", "write"]);
 
@@ -340,6 +481,23 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             if (details.cancelled) {
                 return new Text(theme.fg("dim", "⊘ Plan mode cancelled"), 0, 0);
             }
+            if (details.reviewRequired) {
+                return new Text(
+                    theme.fg(
+                        "warning",
+                        "↺ Agent review required — awaiting decision"
+                    ),
+                    0,
+                    0
+                );
+            }
+            if (details.revised) {
+                return new Text(
+                    theme.fg("warning", "↺ Plan revision requested"),
+                    0,
+                    0
+                );
+            }
             const mode = details.executionMode ?? "continue";
             return new Text(
                 theme.fg("success", "✓ ") +
@@ -385,18 +543,10 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
 
                 state.planSlug = planId;
                 state.planPreviousMode = state.permissionMode;
+                state.planReviewPending = false;
+                state.planEnteredAt = Date.now();
                 state.permissionMode = "plan";
-                pi.setActiveTools([
-                    "read",
-                    "bash",
-                    "grep",
-                    "find",
-                    "ls",
-                    "questionnaire",
-                    "task",
-                    "enter_plan_mode",
-                    "exit_plan_mode",
-                ]);
+                pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
 
                 if (ctx.hasUI) {
                     const colour = modeColour("plan");
@@ -410,6 +560,8 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                     enabled: true,
                     planId,
                     previousMode: state.planPreviousMode,
+                    enteredAt: Date.now(),
+                    reviewPending: false,
                 });
 
                 ctx.ui.notify(`Plan mode enabled. Plan file: ${planPath}`);
@@ -467,7 +619,7 @@ async function chooseExecutionMode(
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-function cancelPlanMode(
+export function cancelPlanMode(
     pi: ExtensionAPI,
     state: TauState,
     ctx: ExtensionContext
@@ -477,6 +629,8 @@ function cancelPlanMode(
     state.planSlug = undefined;
     state.planPreviousMode = undefined;
     state.planExiting = false;
+    state.planReviewPending = false;
+    state.planEnteredAt = undefined;
     pi.setActiveTools(["read", "bash", "edit", "write"]);
 
     if (ctx.hasUI) {
@@ -505,6 +659,8 @@ interface PlanToolDetails {
     error?: string;
     rejected?: boolean;
     cancelled?: boolean;
+    reviewRequired?: boolean;
+    revised?: boolean;
     approved?: boolean;
     executionMode?: ExecutionMode;
     planContent?: string;

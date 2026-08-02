@@ -66,6 +66,20 @@ const ASK_PROMPT_TIMEOUT_MS = 60_000;
 // Re-check settings every 60 seconds
 const SETTINGS_RELOAD_INTERVAL_MS = 60_000;
 
+/** Internal planning tools never need a user permission prompt. */
+const PLAN_INTERNAL_TOOLS = new Set([
+    "grep",
+    "find",
+    "glob",
+    "ls",
+    "questionnaire",
+    "task",
+    "subagent",
+    "subagent_wait",
+    "enter_plan_mode",
+    "exit_plan_mode",
+]);
+
 // ─── Permission decision pipeline ────────────────────────────────────
 
 /**
@@ -297,6 +311,33 @@ export async function checkToolPermission(
             return {
                 block: true,
                 reason: "Plan mode: only read-only bash commands are allowed.",
+            };
+        }
+
+        // Read-only planning tools and plan lifecycle tools must not turn an
+        // agent-driven plan into a user permission dialog. Deny rules were
+        // already checked above, so this only bypasses approval prompts.
+        if (
+            PLAN_INTERNAL_TOOLS.has(event.toolName) ||
+            event.toolName.startsWith("lsp_")
+        ) {
+            return { block: false };
+        }
+
+        // Keep the working-directory boundary for reads, but fail closed
+        // instead of prompting when a plan attempts to read outside it.
+        if (toolName === "Read") {
+            const path = String(getPath(event.input));
+            const result = checkReadPermission(
+                state.rules,
+                path,
+                cwd,
+                state.additionalDirectories
+            );
+            if (result.decision === "allow") return { block: false };
+            return {
+                block: true,
+                reason: `Plan mode: reading ${path} is not allowed without an explicit allow rule.`,
             };
         }
     }

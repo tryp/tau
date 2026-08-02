@@ -546,6 +546,7 @@ const DESTRUCTIVE_PATTERNS = [
  * Only these are permitted when plan mode is active.
  */
 const SAFE_PATTERNS = [
+    /^\s*cd\b/,
     /^\s*cat\b/,
     /^\s*head\b/,
     /^\s*tail\b/,

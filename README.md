@@ -39,6 +39,29 @@ Background tasks, notifications, plan mode, presets, and other enhancements for 
 - **Execution tracking** — switch to execution mode to track progress against the plan with `[DONE:n]` tags
 - **Status widget** — shows `📋 3/7` progress in the status bar
 
+Plan approval and execution-mode selectors can be automated in global
+`~/.pi/agent/settings.json` or project `.pi/settings.json`:
+
+```json
+{
+  "tau": {
+    "plan": {
+      "reviewMode": "agent",
+      "defaultExecutionMode": "parallel"
+    }
+  }
+}
+```
+
+`reviewMode` accepts `user` or `agent`. In `agent` mode, the first
+`exit_plan_mode` call returns the review request to the invoking agent. The
+agent must call it again with `action: "approve"`, `"revise"`, or `"cancel"`.
+`defaultExecutionMode` accepts `continue`, `fresh`, `spawn`, `parallel`, or
+`manual`. Project settings override global settings.
+
+`autoApprove` remains supported as a legacy option for `reviewMode: "user"`; it
+skips the user approval selector rather than performing an agent review.
+
 ### Presets
 
 - **Ctrl+Shift+U** — cycle through named presets
