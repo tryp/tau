@@ -135,17 +135,18 @@ function createCallbackHarness() {
     const sentUserMessages: Array<{ content: unknown; options: unknown }> = [];
     const sentMessages: Array<{ message: unknown; options: unknown }> = [];
     const appendedEntries: Array<{ customType: string; data: unknown }> = [];
-    let remindTool:
-        | {
-              execute: (
-                  toolCallId: string,
-                  params: Record<string, unknown>,
-                  signal: unknown,
-                  onUpdate: unknown,
-                  ctx: unknown
-              ) => Promise<{ content: { type: string; text: string }[]; details: unknown }>;
-          }
-        | null = null;
+    let remindTool: {
+        execute: (
+            toolCallId: string,
+            params: Record<string, unknown>,
+            signal: unknown,
+            onUpdate: unknown,
+            ctx: unknown
+        ) => Promise<{
+            content: { type: string; text: string }[];
+            details: unknown;
+        }>;
+    } | null = null;
 
     const pi = {
         on(eventName: string, handler: (event: any, ctx: any) => unknown) {
@@ -203,17 +204,61 @@ void describe("callback delivery while agent is busy", () => {
         await h.invoke("session_start");
 
         const remind = h.getRemindTool();
-        await remind.execute("tc-1", { message: "check test", delay: "0.001s" }, null, null, null);
+        await remind.execute(
+            "tc-1",
+            { message: "check test", delay: "0.001s" },
+            null,
+            null,
+            null
+        );
         await h.invoke("agent_start", { type: "agent_start" });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(h.sentUserMessages.length, 0, "callback should not deliver while agent is busy");
+        assert.equal(
+            h.sentUserMessages.length,
+            0,
+            "callback should not deliver while agent is busy"
+        );
 
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
         assert.equal(h.sentUserMessages.length, 1);
-        assert.match(String(h.sentUserMessages[0].content), /<callback id="cb-1"/);
+        assert.match(
+            String(h.sentUserMessages[0].content),
+            /<callback id="cb-1"/
+        );
+    });
+
+    void it("flushes before an immediately chained agent_start", async () => {
+        const state = new TauState();
+        const h = createCallbackHarness();
+        registerCallbacks(h.pi, state);
+        await h.invoke("session_start");
+
+        const remind = h.getRemindTool();
+        await remind.execute(
+            "tc-1",
+            { message: "check chained turn", delay: "0.001s" },
+            null,
+            null,
+            null
+        );
+        await h.invoke("agent_start", { type: "agent_start" });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Simulate the next turn starting immediately after agent_end. The
+        // callback must be queued during agent_end, not deferred to a timer
+        // that observes the next turn's busy state.
+        await h.invoke("agent_end", { type: "agent_end", messages: [] });
+        await h.invoke("agent_start", { type: "agent_start" });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.equal(h.sentUserMessages.length, 1);
+        assert.match(
+            String(h.sentUserMessages[0].content),
+            /<callback id="cb-1"/
+        );
     });
 
     void it("delivers callback only via sendUserMessage, not via sendMessage (no duplicate)", async () => {
@@ -223,29 +268,54 @@ void describe("callback delivery while agent is busy", () => {
         await h.invoke("session_start");
 
         const remind = h.getRemindTool();
-        await remind.execute("tc-1", { message: "check test", delay: "0.001s" }, null, null, null);
+        await remind.execute(
+            "tc-1",
+            { message: "check test", delay: "0.001s" },
+            null,
+            null,
+            null
+        );
         await h.invoke("agent_start", { type: "agent_start" });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(h.sentUserMessages.length, 0, "callback should not deliver while agent is busy");
-        assert.equal(h.sentMessages.length, 0, "no sendMessage delivery while agent is busy");
+        assert.equal(
+            h.sentUserMessages.length,
+            0,
+            "callback should not deliver while agent is busy"
+        );
+        assert.equal(
+            h.sentMessages.length,
+            0,
+            "no sendMessage delivery while agent is busy"
+        );
 
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
         // Core delivery: exactly one sendUserMessage (the agent notification)
-        assert.equal(h.sentUserMessages.length, 1,
-            "exactly one sendUserMessage for the callback");
-        assert.match(String(h.sentUserMessages[0].content), /<callback id="cb-1"/,
-            "sendUserMessage delivers the callback content");
+        assert.equal(
+            h.sentUserMessages.length,
+            1,
+            "exactly one sendUserMessage for the callback"
+        );
+        assert.match(
+            String(h.sentUserMessages[0].content),
+            /<callback id="cb-1"/,
+            "sendUserMessage delivers the callback content"
+        );
 
         // No duplicate via sendMessage (was the bug)
-        assert.equal(h.sentMessages.length, 0,
-            "no sendMessage delivery — callback is not duplicated");
+        assert.equal(
+            h.sentMessages.length,
+            0,
+            "no sendMessage delivery — callback is not duplicated"
+        );
 
         // Persistence via appendEntry (replaces old sendMessage)
-        assert.ok(h.appendedEntries.length >= 1,
-            "callback is persisted via appendEntry");
+        assert.ok(
+            h.appendedEntries.length >= 1,
+            "callback is persisted via appendEntry"
+        );
         const appended = h.appendedEntries.find(
             (e) => e.customType === "callback"
         );
@@ -259,17 +329,36 @@ void describe("callback delivery while agent is busy", () => {
         await h.invoke("session_start");
 
         const remind = h.getRemindTool();
-        await remind.execute("tc-1", { message: "stale callback", delay: "0.001s" }, null, null, null);
+        await remind.execute(
+            "tc-1",
+            { message: "stale callback", delay: "0.001s" },
+            null,
+            null,
+            null
+        );
         await h.invoke("agent_start", { type: "agent_start" });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        const result = await remind.execute("tc-2", { action: "cancel-all" }, null, null, null);
-        assert.equal(result.content[0]?.text, "Cancelled 1 pending callback(s).");
+        const result = await remind.execute(
+            "tc-2",
+            { action: "cancel-all" },
+            null,
+            null,
+            null
+        );
+        assert.equal(
+            result.content[0]?.text,
+            "Cancelled 1 pending callback(s)."
+        );
 
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(h.sentUserMessages.length, 0, "cancel-all should suppress queued stale callback delivery");
+        assert.equal(
+            h.sentUserMessages.length,
+            0,
+            "cancel-all should suppress queued stale callback delivery"
+        );
     });
 });
 
@@ -296,8 +385,11 @@ void describe("hasLinkedCallbacksForJob", () => {
             null
         );
 
-        assert.equal(hasLinkedCallbacksForJob("job-1-1"), true,
-            "should return true while the linked callback is still pending");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-1-1"),
+            true,
+            "should return true while the linked callback is still pending"
+        );
     });
 
     void it("returns false when the linked callback has fired (original bug condition)", async () => {
@@ -329,8 +421,11 @@ void describe("hasLinkedCallbacksForJob", () => {
         // The callback has fired (cb.fired = true), so hasLinkedCallbacksForJob
         // should return false — this is the condition that led to silent
         // suppression of the completion notification
-        assert.equal(hasLinkedCallbacksForJob("job-1-1"), false,
-            "should return false once the linked callback has fired");
+        assert.equal(
+            hasLinkedCallbacksForJob("job-1-1"),
+            false,
+            "should return false once the linked callback has fired"
+        );
     });
 
     void it("returns false for jobs without any linked callbacks", () => {
@@ -366,8 +461,11 @@ void describe("wantsCompletionNotification flag", () => {
         // Wait for the timer to fire — fireCallback should set the flag
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(job.wantsCompletionNotification, true,
-            "should be true so flushCompletionBatch knows to deliver the completion notification");
+        assert.equal(
+            job.wantsCompletionNotification,
+            true,
+            "should be true so flushCompletionBatch knows to deliver the completion notification"
+        );
     });
 
     void it("is NOT set when a non-linked callback fires", async () => {
@@ -393,8 +491,11 @@ void describe("wantsCompletionNotification flag", () => {
 
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(job.wantsCompletionNotification, undefined,
-            "should remain undefined for non-linked callbacks");
+        assert.equal(
+            job.wantsCompletionNotification,
+            undefined,
+            "should remain undefined for non-linked callbacks"
+        );
     });
 
     void it("is NOT set when the job completes before the callback fires", async () => {
@@ -421,8 +522,11 @@ void describe("wantsCompletionNotification flag", () => {
         // because the job is no longer running
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(job.wantsCompletionNotification, undefined,
-            "should remain undefined when the job completed before the callback");
+        assert.equal(
+            job.wantsCompletionNotification,
+            undefined,
+            "should remain undefined when the job completed before the callback"
+        );
     });
 
     void it("is NOT set when the job is not found in state", async () => {
@@ -478,8 +582,11 @@ void describe("wantsCompletionNotification flag", () => {
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
-        assert.equal(job.wantsCompletionNotification, true,
-            "flag must survive callback delivery so flushCompletionBatch can read it later");
+        assert.equal(
+            job.wantsCompletionNotification,
+            true,
+            "flag must survive callback delivery so flushCompletionBatch can read it later"
+        );
     });
 });
 
@@ -570,7 +677,11 @@ void describe("cancelCallbacksForJob", () => {
 
         const count = cancelCallbacksForJob("job-cancel-a");
 
-        assert.equal(count, 1, "only the callback for job A should be cancelled");
+        assert.equal(
+            count,
+            1,
+            "only the callback for job A should be cancelled"
+        );
         assert.equal(
             hasLinkedCallbacksForJob("job-cancel-a"),
             false,
@@ -598,7 +709,11 @@ void describe("cancelCallbacksForJob", () => {
         const remind = h.getRemindTool();
         await remind.execute(
             "tc-1",
-            { message: "fast check", delay: "0.001s", jobId: "job-cancel-fired" },
+            {
+                message: "fast check",
+                delay: "0.001s",
+                jobId: "job-cancel-fired",
+            },
             null,
             null,
             null
@@ -610,7 +725,11 @@ void describe("cancelCallbacksForJob", () => {
         // so cancel/cancel-all can suppress it before delivery.
         // cancelCallbacksForJob removes it from the map regardless.
         const count = cancelCallbacksForJob("job-cancel-fired");
-        assert.equal(count, 1, "fired callback is still in the map and gets removed");
+        assert.equal(
+            count,
+            1,
+            "fired callback is still in the map and gets removed"
+        );
 
         assert.equal(
             hasLinkedCallbacksForJob("job-cancel-fired"),
@@ -702,7 +821,10 @@ void describe("scheduleJobReminder", () => {
         // scheduleJobReminder should succeed even if the job doesn't exist
         // in state — it's a fire-and-forget linked callback
         const id = scheduleJobReminder("job-ghost", "30s", "ghost check");
-        assert.ok(id, "should create callback regardless of job existence in state");
+        assert.ok(
+            id,
+            "should create callback regardless of job existence in state"
+        );
 
         assert.equal(
             hasLinkedCallbacksForJob("job-ghost"),

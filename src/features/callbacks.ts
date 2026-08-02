@@ -163,7 +163,6 @@ let _readyFlushTimer: ReturnType<typeof setTimeout> | null = null;
  */
 let _pendingCallbacksForMessage: Set<string> | null = null;
 
-
 /**
  * Cancel all pending callbacks linked to a given job ID.
  * Called by the background jobs feature when a job completes or is killed.
@@ -254,57 +253,57 @@ function generateId(): string {
 }
 
 function scheduleCallback(cb: ScheduledCallback): void {
-        callbacks.set(cb.id, cb);
-        const delay = new Date(cb.fireAt).getTime() - Date.now();
+    callbacks.set(cb.id, cb);
+    const delay = new Date(cb.fireAt).getTime() - Date.now();
 
-        if (delay <= 0) {
-            // Already due — fire immediately
-            fireCallback(cb.id);
-            return;
-        }
-
-        cb.timer = setTimeout(() => {
-            fireCallback(cb.id);
-        }, delay);
-
-        // Don't let the timer prevent process exit
-        if (cb.timer && typeof cb.timer === "object") {
-            cb.timer.unref();
-        }
+    if (delay <= 0) {
+        // Already due — fire immediately
+        fireCallback(cb.id);
+        return;
     }
+
+    cb.timer = setTimeout(() => {
+        fireCallback(cb.id);
+    }, delay);
+
+    // Don't let the timer prevent process exit
+    if (cb.timer && typeof cb.timer === "object") {
+        cb.timer.unref();
+    }
+}
 
 /**
  * Read /proc/<pid>/stat and return a one-line resource snapshot.
  * Returns null if /proc is unavailable or the process has exited.
  */
 function readProcSnapshot(pid: number): string | null {
-	try {
-		const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-		const closeParen = stat.lastIndexOf(")");
-		if (closeParen === -1) return null;
-		const parts = stat.slice(closeParen + 2).split(" ");
-		if (parts.length < 22) return null;
+    try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+        const closeParen = stat.lastIndexOf(")");
+        if (closeParen === -1) return null;
+        const parts = stat.slice(closeParen + 2).split(" ");
+        if (parts.length < 22) return null;
 
-		const utime = parseInt(parts[11], 10) || 0;
-		const stime = parseInt(parts[12], 10) || 0;
-		const cutime = parseInt(parts[13], 10) || 0;
-		const cstime = parseInt(parts[14], 10) || 0;
-		const cpuSec = ((utime + stime + cutime + cstime) / 100) * 1000;
-		const rssKb = (parseInt(parts[21], 10) || 0) * 4;
+        const utime = parseInt(parts[11], 10) || 0;
+        const stime = parseInt(parts[12], 10) || 0;
+        const cutime = parseInt(parts[13], 10) || 0;
+        const cstime = parseInt(parts[14], 10) || 0;
+        const cpuSec = ((utime + stime + cutime + cstime) / 100) * 1000;
+        const rssKb = (parseInt(parts[21], 10) || 0) * 4;
 
-		// Prefer VmRSS from /proc/status
-		try {
-			const status = readFileSync(`/proc/${pid}/status`, "utf-8");
-			const vmRss = status.match(/^VmRSS:\s+(\d+)/m);
-			if (vmRss) {
-				const vmRssKb = parseInt(vmRss[1], 10);
-				return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round((vmRssKb || rssKb) / 1024)}MB state=${parts[0]}`;
-			}
-		} catch {}
-		return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round(rssKb / 1024)}MB state=${parts[0]}`;
-	} catch {
-		return null;
-	}
+        // Prefer VmRSS from /proc/status
+        try {
+            const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+            const vmRss = status.match(/^VmRSS:\s+(\d+)/m);
+            if (vmRss) {
+                const vmRssKb = parseInt(vmRss[1], 10);
+                return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round((vmRssKb || rssKb) / 1024)}MB state=${parts[0]}`;
+            }
+        } catch {}
+        return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round(rssKb / 1024)}MB state=${parts[0]}`;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -312,37 +311,52 @@ function readProcSnapshot(pid: number): string | null {
  * Returns null if no GPU data is available.
  */
 function readGpuSnapshot(): string | null {
-	try {
-		const entries = readdirSync("/sys/class/drm");
-		const lines: string[] = [];
-		for (const entry of entries) {
-			if (!entry.startsWith("card") || entry.includes("-")) continue;
-			const deviceDir = `/sys/class/drm/${entry}/device`;
-			try {
-				const busy = parseInt(
-					readFileSync(`${deviceDir}/gpu_busy_percent`, "utf-8").trim(),
-					10
-				);
-				// Try temp
-				let temp = "";
-				try {
-					const hwmons = readdirSync("/sys/class/hwmon");
-					for (const hw of hwmons) {
-						const hwmonDevice = readFileSync(`/sys/class/hwmon/${hw}/name`, "utf-8").trim();
-						if (hwmonDevice === "amdgpu" || hwmonDevice === "i915") {
-							const t = parseInt(readFileSync(`/sys/class/hwmon/${hw}/temp1_input`, "utf-8").trim(), 10);
-							temp = ` ${(t / 1000).toFixed(0)}C`;
-							break;
-						}
-					}
-				} catch {}
-				lines.push(`${entry}: ${busy}%${temp}`);
-			} catch {}
-		}
-		return lines.length > 0 ? lines.join(", ") : null;
-	} catch {
-		return null;
-	}
+    try {
+        const entries = readdirSync("/sys/class/drm");
+        const lines: string[] = [];
+        for (const entry of entries) {
+            if (!entry.startsWith("card") || entry.includes("-")) continue;
+            const deviceDir = `/sys/class/drm/${entry}/device`;
+            try {
+                const busy = parseInt(
+                    readFileSync(
+                        `${deviceDir}/gpu_busy_percent`,
+                        "utf-8"
+                    ).trim(),
+                    10
+                );
+                // Try temp
+                let temp = "";
+                try {
+                    const hwmons = readdirSync("/sys/class/hwmon");
+                    for (const hw of hwmons) {
+                        const hwmonDevice = readFileSync(
+                            `/sys/class/hwmon/${hw}/name`,
+                            "utf-8"
+                        ).trim();
+                        if (
+                            hwmonDevice === "amdgpu" ||
+                            hwmonDevice === "i915"
+                        ) {
+                            const t = parseInt(
+                                readFileSync(
+                                    `/sys/class/hwmon/${hw}/temp1_input`,
+                                    "utf-8"
+                                ).trim(),
+                                10
+                            );
+                            temp = ` ${(t / 1000).toFixed(0)}C`;
+                            break;
+                        }
+                    }
+                } catch {}
+                lines.push(`${entry}: ${busy}%${temp}`);
+            } catch {}
+        }
+        return lines.length > 0 ? lines.join(", ") : null;
+    } catch {
+        return null;
+    }
 }
 
 function buildCallbackMessage(cb: ScheduledCallback): string {
@@ -745,7 +759,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
         const tauState = _tauState;
         if (tauState) {
             for (const [id, cb] of callbacks) {
-                if (cb.linkedJobId && !tauState.backgroundJobs.has(cb.linkedJobId)) {
+                if (
+                    cb.linkedJobId &&
+                    !tauState.backgroundJobs.has(cb.linkedJobId)
+                ) {
                     if (cb.timer) {
                         clearTimeout(cb.timer);
                         cb.timer = undefined;
@@ -769,7 +786,11 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
 
     pi.on("agent_end", async () => {
         _agentBusy = false;
-        scheduleReadyCallbackFlush();
+        // Flush synchronously while the agent-end event is being handled. The
+        // agent loop awaits extension handlers before it drains follow-up
+        // messages, so this queues the callback before an immediate next
+        // agent_start can win the race against a zero-delay timer.
+        flushReadyCallbacks();
     });
 
     pi.on("session_shutdown", async () => {
@@ -815,7 +836,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "until it fires or is explicitly cancelled. It will NOT auto-cancel when a job completes. " +
             "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback. " +
             "When used with jobId, triggers can be subscribed on the running job to fire async events " +
-            'when conditions like outputLines, rssKb, cpuTime, or wallTime are met.',
+            "when conditions like outputLines, rssKb, cpuTime, or wallTime are met.",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -835,7 +856,7 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Pass jobId when you must use manual remind() for a job-related check — " +
                 "this links the callback to the job so it auto-cancels on completion.",
             "Use triggers on remind to subscribe conditions on a running job — " +
-                "e.g., triggers: [{type:\"outputLines\", value: 200}] fires when the log has 200+ lines.",
+                'e.g., triggers: [{type:"outputLines", value: 200}] fires when the log has 200+ lines.',
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -887,7 +908,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                         }),
                         label: Type.Optional(
                             Type.String({
-                                description: "Optional label for the callback message.",
+                                description:
+                                    "Optional label for the callback message.",
                             })
                         ),
                     }),
@@ -1057,17 +1079,28 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                         result += `\nLinked to job: ${params.jobId} (auto-cancels on job completion)`;
 
                         // Let the agent know it can work on other things — the system delivers the callback
-                        result += "\n\nA callback has been registered on this job. You will be notified when it fires or the job completes — no need to poll. In the meantime, you can work on other things.";
+                        result +=
+                            "\n\nA callback has been registered on this job. You will be notified when it fires or the job completes — no need to poll. In the meantime, you can work on other things.";
 
                         // Subscribe triggers on the existing job
                         const triggersRaw = params.triggers;
-                        if (triggersRaw && Array.isArray(triggersRaw) && triggersRaw.length > 0) {
+                        if (
+                            triggersRaw &&
+                            Array.isArray(triggersRaw) &&
+                            triggersRaw.length > 0
+                        ) {
                             const job = state.backgroundJobs.get(params.jobId);
                             if (job && job.status === "running") {
                                 const newTriggers = triggersRaw as JobTrigger[];
-                                job.triggers = [...(job.triggers ?? []), ...newTriggers];
-                                result += `\nSubscribed ${newTriggers.length} trigger(s): ` +
-                                    newTriggers.map((t) => `${t.type}=${t.value}`).join(", ");
+                                job.triggers = [
+                                    ...(job.triggers ?? []),
+                                    ...newTriggers,
+                                ];
+                                result +=
+                                    `\nSubscribed ${newTriggers.length} trigger(s): ` +
+                                    newTriggers
+                                        .map((t) => `${t.type}=${t.value}`)
+                                        .join(", ");
                             } else {
                                 result += `\nWarning: job ${params.jobId} not found or not running — triggers not subscribed`;
                             }
@@ -1084,7 +1117,6 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                         details: undefined,
                     };
                 }
-
             }
         },
     });
