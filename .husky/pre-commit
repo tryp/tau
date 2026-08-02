@@ -1,5 +1,12 @@
 STAGED=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.ts$' | grep -v '\.d\.ts$' || true)
 if [ -n "$STAGED" ]; then
-  node node_modules/.bin/tsc --noEmit
-  node node_modules/.bin/eslint --cache --fix $STAGED
+  # pnpm's node_modules/.bin entries are POSIX shell shims — invoke them as
+  # executables, not via `node` (running node on the shim fails with a
+  # SyntaxError). Both commands must succeed or the commit is blocked; a
+  # failing tsc must not be masked by a succeeding eslint.
+  node_modules/.bin/tsc --noEmit || exit 1
+  node_modules/.bin/eslint --cache --fix $STAGED || exit 1
+  # eslint --fix may have rewritten staged files — re-stage them so the
+  # commit contains the fixed content.
+  git add $STAGED
 fi
