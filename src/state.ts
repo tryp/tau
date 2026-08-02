@@ -64,6 +64,11 @@ export class TauState {
     /** Model context window in tokens. Used by agent_bg to choose fork vs summary. */
     contextWindowTokens?: number;
 
+    // ── Background jobs widget visibility ───────────────────────────
+
+    /** When true, the pill-bar jobs widget above the editor is hidden. */
+    jobsWidgetHidden = true;
+
     // ── Reload bridge ──────────────────────────────────────────────────
 
     /**
@@ -131,6 +136,21 @@ export class TauState {
 
     /** @deprecated Handoff disabled — kept for type compatibility with disabled handoff.ts */
     accessedFilePaths: string[] = [];
+
+    // ── Completion batch hooks (set by background.ts) ────────────────
+
+    /** Remove a single job's pending-completion notification from the debounced batch. */
+    cancelCompletionBatchForJob?: (jobId: string) => void;
+
+    /** Clear all pending-completion notifications from the debounced batch. */
+    cancelAllCompletionBatches?: () => void;
+
+    /**
+     * Test-only: force-flush the completion delivery batch.
+     * Avoids waiting for the real debounce timer (which is .unref()'d and
+     * can't be awaited reliably in test environments).
+     */
+    _flushCompletionBatch?: () => void;
 
     // ── Permissions ─────────────────────────────────────────────────
 

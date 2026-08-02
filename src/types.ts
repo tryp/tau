@@ -25,6 +25,30 @@ export interface BackgroundJob {
     outputConsumed?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
     isBackgrounded: boolean;
+    /**
+     * Set when a linked callback (remindDelay) fires while the job is still
+     * running. Signals that the agent explicitly wanted to be reminded about
+     * this job and should receive the completion notification when it finishes,
+     * even though the original linked callback has already been consumed.
+     */
+    wantsCompletionNotification?: boolean;
+    /** Optional triggers that fire async events when conditions are met. */
+    triggers?: JobTrigger[];
+}
+
+// ─── Job triggers ───────────────────────────────────────────────────
+
+/**
+ * A condition to monitor on a running background job.
+ * When the condition is met, a `bg-trigger` custom event is sent to
+ * the agent and the trigger is deactivated (one-shot).
+ * Time-based values are in seconds (wallTime, cpuTime, ioBlock).
+ */
+export interface JobTrigger {
+    type: "outputLines" | "rssKb" | "ioReadBytes" | "ioWriteBytes" | "cpuTime" | "ioBlock" | "wallTime";
+    value: number;
+    /** Optional label for the agent's callback message. */
+    label?: string;
 }
 
 export interface RunningProcess {
