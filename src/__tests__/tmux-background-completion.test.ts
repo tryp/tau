@@ -179,6 +179,11 @@ void describe(
                     `(got status=${job.status})`
             );
             assert.equal(job.status, "completed");
+            assert.equal(
+                state.pendingDecisionJobId,
+                undefined,
+                "completed tmux jobs must not leave the tool gate blocked"
+            );
         });
     }
 );

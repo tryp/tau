@@ -2414,6 +2414,7 @@ async function executeTmuxForeground(
                         : "failed",
                     result.exitCode ?? 0
                 );
+                clearPendingDecision(state, job);
                 void trackJobOutputIndex(job, ctx, "bash_bg");
                 void notifyTmuxCompletion(job, state, pi, ctx);
                 updateWidget(state, ctx);
