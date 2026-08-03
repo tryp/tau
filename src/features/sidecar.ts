@@ -16,14 +16,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { JobOutputIndex } from "../types.ts";
 
-/** Hard cap on stored output per job (bytes). 4MB covers large GPU benchmark logs. */
-const SIDECAR_MAX_BYTES = 4 * 1024 * 1024;
+/** Inline output limits mirror the context sidecar's baseline capture policy. */
+export const INLINE_CONTEXT_MAX_BYTES = 24 * 1024;
+export const INLINE_CONTEXT_MAX_LINES = 300;
+export const INLINE_FALLBACK_MAX_CHARS = 12_000;
 
 /** Default age (days) for purging sidecar entries at startup. */
 const SIDECAR_PURGE_AGE_DAYS = 10;
 
-/** Tool names this module indexes output for. */
+/** Tool names this module owns for retention/purge. */
 const SIDECAR_TOOL_NAMES = ["bash_bg", "agent_bg"] as const;
+/** Tool names searchable through this adapter, including foreground bash. */
+const SIDECAR_SEARCH_TOOL_NAMES = ["bash", ...SIDECAR_TOOL_NAMES] as const;
 
 /** Context for the indexing call — cwd + session identity. */
 export interface SidecarContext {
@@ -48,6 +52,12 @@ export interface SidecarSourceMatch extends JobOutputIndex {
     toolName: string;
     createdAt: number;
     inputSummary: string;
+}
+
+export interface PreparedInlineOutput {
+    text: string;
+    truncated: boolean;
+    source?: JobOutputIndex;
 }
 
 /**
@@ -128,7 +138,7 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
 }
 
 function sidecarToolListSql(): string {
-    return SIDECAR_TOOL_NAMES.map((tool) => `'${tool}'`).join(",");
+    return SIDECAR_SEARCH_TOOL_NAMES.map((tool) => `'${tool}'`).join(",");
 }
 
 function findJobSourceRow(
@@ -207,7 +217,7 @@ export function searchSidecarSources(
 
     const toolNames = options.toolNames?.length
         ? options.toolNames
-        : SIDECAR_TOOL_NAMES;
+        : SIDECAR_SEARCH_TOOL_NAMES;
     const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
     try {
         const db = new DatabaseSync(dbPath, {
@@ -326,6 +336,202 @@ export async function readJobOutputFromSidecar(
     return (await readJobOutputDetailsFromSidecar(jobId))?.text ?? null;
 }
 
+function isLargeInlineOutput(text: string): boolean {
+    return (
+        Buffer.byteLength(text, "utf8") > INLINE_CONTEXT_MAX_BYTES ||
+        text.split("\n").length > INLINE_CONTEXT_MAX_LINES
+    );
+}
+
+function truncateInlineFallback(text: string): string {
+    if (text.length <= INLINE_FALLBACK_MAX_CHARS) return text;
+    return (
+        `...[truncated, showing last ${INLINE_FALLBACK_MAX_CHARS} chars; ` +
+        "full output was not available in the context sidecar]\n" +
+        text.slice(-INLINE_FALLBACK_MAX_CHARS)
+    );
+}
+
+export function formatSidecarReceipt(
+    toolName: string,
+    source: JobOutputIndex,
+    bytes: number,
+    lines: number
+): string {
+    return [
+        `[context-sidecar] Large ${toolName} output indexed locally`,
+        `Source: ${source.sourceId}`,
+        `Chunks: ${source.chunkIds.length}; original size: ${bytes} bytes, ${lines} lines`,
+        `- Search snippets first: context_search query:"..." source_id:"${source.sourceId}"`,
+        `- Retrieve focused output: context_get source_id:"${source.sourceId}" chunk_id:"${source.chunkIds[0] ?? ""}"`,
+        "- Export full output for offline processing: context_export source_id:" +
+            `"${source.sourceId}"`,
+    ].join("\n");
+}
+
+/**
+ * Try to index output via pi-context's public ContextStore.index_external_output
+ * API when the @spences10/pi-context package is available at runtime. Returns
+ * undefined so the caller can use the direct SQLite fallback when the
+ * package/API is unavailable or errors.
+ *
+ * The API path preserves tool_name, job metadata, session/project scope,
+ * redaction, threshold/max-source behavior, and returns enough source/chunk
+ * details for receipts via the same context.db.
+ */
+interface ContextStoreLike {
+    index_external_output: (input: object) => { source_id?: string } | null;
+}
+interface ContextStoreModule {
+    get_context_store?: (options?: object) => ContextStoreLike;
+}
+
+async function tryIndexViaExternalApi(
+    text: string,
+    job: {
+        id: string;
+        command: string;
+        logPath: string;
+        exitCode?: number;
+        status?: string;
+    },
+    ctx: SidecarContext,
+    toolName: string,
+    dbPath: string
+): Promise<string | undefined> {
+    // Dynamic import — may fail at runtime when the package is not in the
+    // module resolution graph (e.g. pi-context not loaded as an extension).
+    let storeModule: ContextStoreModule | undefined;
+
+    // Strategy 1: try importing via package name (works when pi's runtime
+    // resolver includes pi-context in the module graph). Build the specifier
+    // dynamically to avoid a static TypeScript error for the undeclared dep.
+    try {
+        const parts = ["@spences10", "pi-context", "store"];
+        storeModule = (await import(parts.join("/"))) as ContextStoreModule;
+    } catch {
+        // Fallback: scan known pi installation paths for the package.
+        const home = homedir();
+        const candidates = [
+            join(
+                home,
+                ".pi",
+                "agent",
+                "npm",
+                "node_modules",
+                "@spences10",
+                "pi-context",
+                "dist",
+                "store.js"
+            ),
+            join(
+                home,
+                ".pi",
+                "agent",
+                "local",
+                "pi-context",
+                "dist",
+                "store.js"
+            ),
+        ];
+        for (const storePath of candidates) {
+            try {
+                if (existsSync(storePath)) {
+                    storeModule = (await import(
+                        storePath
+                    )) as ContextStoreModule;
+                    break;
+                }
+            } catch {
+                /* continue */
+            }
+        }
+    }
+    if (!storeModule) return undefined;
+
+    const getContextStore = storeModule.get_context_store;
+    if (typeof getContextStore !== "function") return undefined;
+
+    try {
+        const sessionId =
+            ctx?.sessionManager?.getSessionFile?.() ??
+            ctx?.sessionManager?.getSessionId?.() ??
+            null;
+        const projectPath = ctx?.cwd ?? process.cwd();
+
+        const store = getContextStore({
+            db_path: dbPath,
+            project_path: projectPath,
+            session_id: sessionId,
+        });
+
+        if (typeof store.index_external_output !== "function") return undefined;
+
+        const inputSummary = JSON.stringify({
+            command: job.command,
+            jobId: job.id,
+            exitCode: job.exitCode,
+            status: job.status,
+            logPath: job.logPath,
+        });
+
+        const result = store.index_external_output({
+            text,
+            tool_name: toolName,
+            input_summary: inputSummary,
+            session_id: sessionId,
+            project_path: projectPath,
+            force: true,
+        }) as { source_id?: string } | null | undefined;
+
+        if (result?.source_id) {
+            return result.source_id;
+        }
+    } catch {
+        // API error — fall through to direct DB
+    }
+
+    return undefined;
+}
+
+/**
+ * Index large foreground output before it is returned to the model.
+ * The complete output remains in the log/sidecar; only a compact receipt or
+ * bounded fallback is returned inline.
+ */
+export async function prepareInlineOutput(
+    job: {
+        id: string;
+        command: string;
+        logPath: string;
+        exitCode?: number;
+        status?: string;
+    },
+    ctx: SidecarContext,
+    output: string,
+    toolName = "bash"
+): Promise<PreparedInlineOutput> {
+    if (!isLargeInlineOutput(output)) {
+        return { text: output || "(no output)", truncated: false };
+    }
+
+    const bytes = Buffer.byteLength(output, "utf8");
+    const lines = output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
+    const sourceId = await indexJobOutputInSidecar(job, ctx, toolName);
+    const source = sourceId
+        ? (findJobSourceDetailsInSidecar(job.id) ?? { sourceId, chunkIds: [] })
+        : undefined;
+    if (source) {
+        return {
+            text: formatSidecarReceipt(toolName, source, bytes, lines),
+            truncated: true,
+            source,
+        };
+    }
+
+    return { text: truncateInlineFallback(output), truncated: true };
+}
+
 /**
  * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
  */
@@ -393,11 +599,146 @@ function makePreview(text: string): string {
 }
 
 /**
+ * Direct SQLite indexing fallback — writes job output into the sidecar's
+ * context.db using the same schema that context_search / context_get /
+ * context_list expect. Used when the pi-context external API is unavailable.
+ */
+async function indexViaDirectDb(
+    text: string,
+    job: {
+        id: string;
+        command: string;
+        logPath: string;
+        exitCode?: number;
+        status?: string;
+    },
+    ctx: SidecarContext,
+    toolName: string,
+    dbPath: string
+): Promise<string | undefined> {
+    const bytes = Buffer.byteLength(text, "utf8");
+    const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+    const sessionId =
+        ctx?.sessionManager?.getSessionFile?.() ??
+        ctx?.sessionManager?.getSessionId?.() ??
+        null;
+    const projectPath = ctx?.cwd ?? process.cwd();
+
+    const db = new DatabaseSync(dbPath, {
+        enableForeignKeyConstraints: true,
+    });
+
+    try {
+        // Check if the source table exists (sidecar schema applied)
+        const tableCheck = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
+            )
+            .get();
+        if (!tableCheck) {
+            return;
+        }
+
+        const contentHash = createHash("sha256").update(text).digest("hex");
+        // Deduplicate repeated indexing of the same job, but never merge
+        // two different jobs. A source row carries one jobId, so sharing
+        // it across jobs would make the second job impossible to find.
+        const existing = db
+            .prepare(
+                `SELECT id FROM context_sources
+                 WHERE tool_name = ? AND content_hash = ?
+                   AND (project_path = ? OR project_path IS NULL)
+                   AND json_valid(input_summary)
+                   AND json_extract(input_summary, '$.jobId') = ?
+                 LIMIT 1`
+            )
+            .get(toolName, contentHash, projectPath, job.id) as
+            | { id: string }
+            | undefined;
+        if (existing) {
+            // Re-indexing is internal maintenance, not a context read. Do
+            // not charge these bytes to returned_byte_count; that counter
+            // tracks bytes actually returned by context retrieval.
+            return existing.id;
+        }
+
+        // Keep the source and all chunks atomic. A schema mismatch or FTS
+        // trigger failure must not leave an orphan source that prevents a
+        // later retry from indexing the job.
+        db.exec("BEGIN");
+
+        // Generate a unique source ID matching the sidecar's format
+        const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        const createdAt = Date.now();
+        const preview = makePreview(text);
+        const previewBytes = Buffer.byteLength(preview, "utf8");
+        const inputSummary = JSON.stringify({
+            command: job.command,
+            jobId: job.id,
+            exitCode: job.exitCode,
+            status: job.status,
+            logPath: job.logPath,
+        });
+
+        // Insert source record
+        db.prepare(
+            `INSERT INTO context_sources
+             (id, session_id, project_path, tool_name, input_summary,
+              created_at, byte_count, line_count, content_hash,
+              preview_byte_count, returned_byte_count)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+        ).run(
+            sourceId,
+            sessionId,
+            projectPath,
+            toolName,
+            inputSummary,
+            createdAt,
+            bytes,
+            lines,
+            contentHash,
+            previewBytes
+        );
+
+        // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
+        const chunks = chunkText(text, sourceId);
+        const insertChunk = db.prepare(
+            `INSERT INTO context_chunks
+             (id, source_id, ordinal, title, content, byte_count)
+             VALUES (?, ?, ?, ?, ?, ?)`
+        );
+
+        for (const chunk of chunks) {
+            insertChunk.run(
+                chunk.id,
+                chunk.sourceId,
+                chunk.ordinal,
+                chunk.title,
+                chunk.content,
+                chunk.byteCount
+            );
+        }
+        db.exec("COMMIT");
+        return sourceId;
+    } catch (error) {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // Preserve the original schema or I/O error.
+        }
+        throw error;
+    } finally {
+        db.close();
+    }
+}
+
+/**
  * Index a completed job's output into the context sidecar SQLite database.
  *
- * Writes directly to the sidecar's context.db using the same schema so that
- * context_search / context_get / context_list can find the data.  Skips
- * silently if the DB or the sidecar tables don't exist (sidecar not loaded).
+ * Prefers pi-context's public ContextStore.index_external_output API when the
+ * @spences10/pi-context package is available at runtime. Falls back to a direct
+ * SQLite write using the same schema that context_search / context_get / context_list
+ * expect. Skips silently if the DB or the sidecar tables don't exist.
  *
  * Each non-empty job gets its own source row so the jobId-to-source mapping
  * remains stable even when multiple jobs produce identical output.
@@ -417,129 +758,23 @@ export async function indexJobOutputInSidecar(
         const text = await readFile(job.logPath, "utf-8").catch(() => "");
         if (!text) return;
 
-        // Check output size before indexing
-        const bytes = Buffer.byteLength(text, "utf8");
-        const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-        if (bytes > SIDECAR_MAX_BYTES) return;
-
-        const sessionId =
-            ctx?.sessionManager?.getSessionFile?.() ??
-            ctx?.sessionManager?.getSessionId?.() ??
-            null;
-        const projectPath = ctx?.cwd ?? process.cwd();
-
         const dbPath = sidecarDbPath();
         if (!existsSync(dbPath)) {
-            // Sidecar not installed or never initialized — skip
             return;
         }
 
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-        });
+        // Try pi-context's public external-indexing API first.
+        const apiSourceId = await tryIndexViaExternalApi(
+            text,
+            job,
+            ctx,
+            toolName,
+            dbPath
+        );
+        if (apiSourceId) return apiSourceId;
 
-        try {
-            // Check if the source table exists (sidecar schema applied)
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) {
-                return;
-            }
-
-            const contentHash = createHash("sha256").update(text).digest("hex");
-            // Deduplicate repeated indexing of the same job, but never merge
-            // two different jobs. A source row carries one jobId, so sharing
-            // it across jobs would make the second job impossible to find.
-            const existing = db
-                .prepare(
-                    `SELECT id FROM context_sources
-                     WHERE tool_name = ? AND content_hash = ?
-                       AND (project_path = ? OR project_path IS NULL)
-                       AND json_valid(input_summary)
-                       AND json_extract(input_summary, '$.jobId') = ?
-                     LIMIT 1`
-                )
-                .get(toolName, contentHash, projectPath, job.id) as
-                | { id: string }
-                | undefined;
-            if (existing) {
-                // Re-indexing is internal maintenance, not a context read. Do
-                // not charge these bytes to returned_byte_count; that counter
-                // tracks bytes actually returned by context retrieval.
-                return existing.id;
-            }
-
-            // Keep the source and all chunks atomic. A schema mismatch or FTS
-            // trigger failure must not leave an orphan source that prevents a
-            // later retry from indexing the job.
-            db.exec("BEGIN");
-
-            // Generate a unique source ID matching the sidecar's format
-            const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
-            const createdAt = Date.now();
-            const preview = makePreview(text);
-            const previewBytes = Buffer.byteLength(preview, "utf8");
-            const inputSummary = JSON.stringify({
-                command: job.command,
-                jobId: job.id,
-                exitCode: job.exitCode,
-                status: job.status,
-                logPath: job.logPath,
-            });
-
-            // Insert source record
-            db.prepare(
-                `INSERT INTO context_sources
-                 (id, session_id, project_path, tool_name, input_summary,
-                  created_at, byte_count, line_count, content_hash,
-                  preview_byte_count, returned_byte_count)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-            ).run(
-                sourceId,
-                sessionId,
-                projectPath,
-                toolName,
-                inputSummary,
-                createdAt,
-                bytes,
-                lines,
-                contentHash,
-                previewBytes
-            );
-
-            // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
-            const chunks = chunkText(text, sourceId);
-            const insertChunk = db.prepare(
-                `INSERT INTO context_chunks
-                 (id, source_id, ordinal, title, content, byte_count)
-                 VALUES (?, ?, ?, ?, ?, ?)`
-            );
-
-            for (const chunk of chunks) {
-                insertChunk.run(
-                    chunk.id,
-                    chunk.sourceId,
-                    chunk.ordinal,
-                    chunk.title,
-                    chunk.content,
-                    chunk.byteCount
-                );
-            }
-            db.exec("COMMIT");
-            return sourceId;
-        } catch (error) {
-            try {
-                db.exec("ROLLBACK");
-            } catch {
-                // Preserve the original schema or I/O error.
-            }
-            throw error;
-        } finally {
-            db.close();
-        }
+        // Fallback: direct SQLite write.
+        return await indexViaDirectDb(text, job, ctx, toolName, dbPath);
     } catch {
         // DB unavailable or schema mismatch — skip silently
     }

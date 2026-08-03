@@ -26,6 +26,7 @@ import {
     indexJobOutputInSidecar,
     purgeSidecar,
     readJobOutputDetailsFromSidecar,
+    prepareInlineOutput,
     readJobOutputFromSidecar,
     searchSidecarSources,
     trackJobOutputIndex,
@@ -37,6 +38,7 @@ export {
     indexJobOutputInSidecar,
     purgeSidecar,
     readJobOutputDetailsFromSidecar,
+    prepareInlineOutput,
     readJobOutputFromSidecar,
     searchSidecarSources,
     trackJobOutputIndex,
@@ -1235,14 +1237,28 @@ export function registerBackgroundJobs(
                     const output = await readFile(logPath, "utf-8").catch(
                         () => ""
                     );
+                    const prepared = await prepareInlineOutput(
+                        {
+                            id: jobId,
+                            command,
+                            logPath,
+                            exitCode: initialResult.code ?? undefined,
+                            status:
+                                initialResult.code === 0
+                                    ? "completed"
+                                    : "failed",
+                        },
+                        ctx,
+                        output,
+                        "bash"
+                    );
                     return {
                         content: [
-                            {
-                                type: "text" as const,
-                                text: output || "(no output)",
-                            },
+                            { type: "text" as const, text: prepared.text },
                         ],
-                        details: undefined,
+                        details: prepared.truncated
+                            ? { fullOutputPath: logPath }
+                            : undefined,
                     };
                 }
 
@@ -1336,6 +1352,18 @@ export function registerBackgroundJobs(
                 state.backgroundJobs.delete(jobId);
 
                 const output = await readFile(logPath, "utf-8").catch(() => "");
+                const prepared = await prepareInlineOutput(
+                    {
+                        id: jobId,
+                        command,
+                        logPath,
+                        exitCode: raceResult.code ?? undefined,
+                        status: raceResult.code === 0 ? "completed" : "failed",
+                    },
+                    ctx,
+                    output,
+                    "bash"
+                );
 
                 if (
                     raceResult.code !== 0 &&
@@ -1343,18 +1371,16 @@ export function registerBackgroundJobs(
                     !raceResult.interrupted
                 ) {
                     throw new Error(
-                        output || `Command exited with code ${raceResult.code}`
+                        prepared.text ||
+                            `Command exited with code ${raceResult.code}`
                     );
                 }
 
                 return {
-                    content: [
-                        {
-                            type: "text" as const,
-                            text: output || "(no output)",
-                        },
-                    ],
-                    details: undefined,
+                    content: [{ type: "text" as const, text: prepared.text }],
+                    details: prepared.truncated
+                        ? { fullOutputPath: logPath }
+                        : undefined,
                 };
             } finally {
                 clearInterval(pollTimer);
@@ -2351,6 +2377,18 @@ async function executeTmuxForeground(
                 2000,
                 tmuxCtx.outputFile
             );
+            const prepared = await prepareInlineOutput(
+                {
+                    id: jobId,
+                    command,
+                    logPath,
+                    exitCode: initialResult ?? undefined,
+                    status: initialResult === 0 ? "completed" : "failed",
+                },
+                ctx,
+                output,
+                "bash"
+            );
             // Clean up tmux window. Keep the session alive so the next
             // spawnInTmux call reuses it via new-window instead of creating
             // a fresh session — avoids tmux server state accumulation across
@@ -2359,14 +2397,14 @@ async function executeTmuxForeground(
             killWindow(tmuxCtx.windowId);
             if (initialResult !== 0 && initialResult !== null) {
                 throw new Error(
-                    output || `Command exited with code ${initialResult}`
+                    prepared.text || `Command exited with code ${initialResult}`
                 );
             }
             return {
-                content: [
-                    { type: "text" as const, text: output || "(no output)" },
-                ],
-                details: undefined,
+                content: [{ type: "text" as const, text: prepared.text }],
+                details: prepared.truncated
+                    ? { fullOutputPath: logPath }
+                    : undefined,
             };
         }
 
@@ -2471,19 +2509,33 @@ async function executeTmuxForeground(
             2000,
             tmuxCtx.outputFile
         );
+        const prepared = await prepareInlineOutput(
+            {
+                id: jobId,
+                command,
+                logPath,
+                exitCode: raceResult.code ?? undefined,
+                status: raceResult.code === 0 ? "completed" : "failed",
+            },
+            ctx,
+            output,
+            "bash"
+        );
         killWindow(tmuxCtx.windowId);
         // Session is intentionally kept alive — reuse avoids tmux server
         // state accumulation that causes waitpid deadlocks.
 
         if (raceResult.code !== 0 && raceResult.code !== null) {
             throw new Error(
-                output || `Command exited with code ${raceResult.code}`
+                prepared.text || `Command exited with code ${raceResult.code}`
             );
         }
 
         return {
-            content: [{ type: "text" as const, text: output || "(no output)" }],
-            details: undefined,
+            content: [{ type: "text" as const, text: prepared.text }],
+            details: prepared.truncated
+                ? { fullOutputPath: logPath }
+                : undefined,
         };
     } finally {
         clearInterval(pollTimer);
