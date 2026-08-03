@@ -46,6 +46,11 @@ import { trackJobOutputIndex } from "./sidecar.ts";
 /** Maximum fraction of context window that a forked session can consume. */
 const MAX_CONTEXT_FRACTION = 0.4;
 
+/** Cap on the original user prompt inherited by a background agent. */
+export const ORIGINAL_PROMPT_MAX_CHARS = 6000;
+/** Cap on the last assistant summary inherited by a background agent. */
+export const LAST_SUMMARY_MAX_CHARS = 6000;
+
 /**
  * Choose between fork-and-resume and summary-only.
  * Below MAX_CONTEXT_FRACTION, fork would be safe — the agent has room to continue.
@@ -108,7 +113,9 @@ export function extractLastAssistantSummary(entries: SessionEntry[]): string {
             isContentMessageEntry(entry) &&
             entry.message.role === "assistant"
         ) {
-            return extractTextFromContent(entry.message.content).slice(-2000);
+            return extractTextFromContent(entry.message.content).slice(
+                -LAST_SUMMARY_MAX_CHARS
+            );
         }
     }
     return "";
@@ -120,7 +127,10 @@ export function extractLastAssistantSummary(entries: SessionEntry[]): string {
 export function extractOriginalPrompt(entries: SessionEntry[]): string {
     for (const entry of entries) {
         if (isContentMessageEntry(entry) && entry.message.role === "user") {
-            return extractTextFromContent(entry.message.content).slice(0, 2000);
+            return extractTextFromContent(entry.message.content).slice(
+                0,
+                ORIGINAL_PROMPT_MAX_CHARS
+            );
         }
     }
     return "";

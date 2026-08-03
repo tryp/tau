@@ -12,6 +12,8 @@ import {
     extractLastAssistantSummary,
     extractOriginalPrompt,
     estimateConversationBytes,
+    LAST_SUMMARY_MAX_CHARS,
+    ORIGINAL_PROMPT_MAX_CHARS,
 } from "../features/agent-background.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
@@ -88,11 +90,21 @@ void describe("extractLastAssistantSummary", () => {
         assert.equal(result, "final response with more detail");
     });
 
-    void it("truncates to 2000 characters", () => {
-        const longText = "x".repeat(3000);
+    void it("truncates to LAST_SUMMARY_MAX_CHARS characters", () => {
+        const longText = "x".repeat(LAST_SUMMARY_MAX_CHARS + 2000);
         const entries = [makeMessage("assistant", longText)];
         const result = extractLastAssistantSummary(entries);
-        assert.equal(result.length, 2000);
+        assert.equal(result.length, LAST_SUMMARY_MAX_CHARS);
+        assert.ok(result.endsWith("x".repeat(LAST_SUMMARY_MAX_CHARS)));
+    });
+
+    void it("keeps summary content at the cap boundary", () => {
+        const atCap = "s".repeat(LAST_SUMMARY_MAX_CHARS);
+        const entries = [makeMessage("assistant", atCap)];
+        assert.equal(
+            extractLastAssistantSummary(entries).length,
+            LAST_SUMMARY_MAX_CHARS
+        );
     });
 
     void it("returns empty string when no assistant messages exist", () => {
@@ -124,11 +136,21 @@ void describe("extractOriginalPrompt", () => {
         assert.equal(result, "original prompt");
     });
 
-    void it("truncates to 2000 characters", () => {
-        const longText = "y".repeat(3000);
+    void it("truncates to ORIGINAL_PROMPT_MAX_CHARS characters", () => {
+        const longText = "y".repeat(ORIGINAL_PROMPT_MAX_CHARS + 2000);
         const entries = [makeMessage("user", longText)];
         const result = extractOriginalPrompt(entries);
-        assert.equal(result.length, 2000);
+        assert.equal(result.length, ORIGINAL_PROMPT_MAX_CHARS);
+        assert.ok(result.startsWith("y".repeat(ORIGINAL_PROMPT_MAX_CHARS)));
+    });
+
+    void it("keeps prompt content at the cap boundary", () => {
+        const atCap = "p".repeat(ORIGINAL_PROMPT_MAX_CHARS);
+        const entries = [makeMessage("user", atCap)];
+        assert.equal(
+            extractOriginalPrompt(entries).length,
+            ORIGINAL_PROMPT_MAX_CHARS
+        );
     });
 
     void it("returns empty string when no user messages", () => {
