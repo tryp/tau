@@ -727,6 +727,28 @@ export function discoverContextFiles(
 
 // ─── System prompt formatting ────────────────────────────────────────
 
+/**
+ * Extract paths already injected by pi core as <project_instructions>
+ * (core loads AGENTS.md/CLAUDE.md from cwd ancestors + agent dir).
+ * pi-tau must not inject the same files a second time.
+ */
+function extractInjectedInstructionPaths(systemPrompt: string): Set<string> {
+    const paths = new Set<string>();
+    const re = /<project_instructions\spath="([^"]+)"/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(systemPrompt)) !== null) {
+        const raw = match[1];
+        if (!raw) continue;
+        paths.add(raw);
+        try {
+            paths.add(fs.realpathSync(raw));
+        } catch {
+            // keep the raw path
+        }
+    }
+    return paths;
+}
+
 function formatContextFiles(files: ContextFile[]): string {
     const sections: string[] = [];
 
@@ -788,9 +810,26 @@ export function registerContextFiles(
     pi.on("before_agent_start", async (event) => {
         if (contextFiles.length === 0) return;
 
+        // pi core already injects AGENTS.md/CLAUDE.md it discovered;
+        // skip those paths to avoid double-injection.
+        const alreadyInjected = extractInjectedInstructionPaths(
+            event.systemPrompt ?? ""
+        );
+        const toInject = contextFiles.filter((file) => {
+            if (alreadyInjected.has(file.path)) return false;
+            try {
+                if (alreadyInjected.has(fs.realpathSync(file.path)))
+                    return false;
+            } catch {
+                // keep file when realpath is unavailable
+            }
+            return true;
+        });
+        if (toInject.length === 0) return;
+
         return {
             systemPrompt:
-                event.systemPrompt + "\n\n" + formatContextFiles(contextFiles),
+                event.systemPrompt + "\n\n" + formatContextFiles(toInject),
         };
     });
 }

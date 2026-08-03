@@ -205,4 +205,47 @@ void describe("context-files register + events", () => {
         assert.ok(!result.systemPrompt.includes("internal note"));
         assert.ok(result.systemPrompt.includes("Real content"));
     });
+
+    void it("skips files already injected by pi core", async () => {
+        const agentsPath = path.join(testDir, "AGENTS.md");
+        fs.writeFileSync(
+            agentsPath,
+            "# Root instructions\nAlready injected by core"
+        );
+        fs.writeFileSync(
+            path.join(testDir, ".claude", "rules", "naming.md"),
+            "Use camelCase"
+        );
+
+        const handlers: Record<string, (...args: unknown[]) => unknown> = {};
+        const pi = {
+            on(event: string, handler: (...args: unknown[]) => unknown) {
+                handlers[event] = handler;
+            },
+        } as never;
+
+        registerContextFiles(pi, new TauState(), fakeHome);
+
+        const sessionCtx = {
+            cwd: testDir,
+            ui: { notify: () => {} },
+        } as never;
+        await handlers["session_start"]({}, sessionCtx);
+
+        // Simulate core's <project_context> injection for the same AGENTS.md.
+        const corePrompt =
+            "You are an expert.\n\n<project_context>\n" +
+            `<project_instructions path="${agentsPath}">\n# Root instructions\n</project_instructions>\n` +
+            "</project_context>";
+        const result = (await handlers["before_agent_start"](
+            { systemPrompt: corePrompt },
+            {}
+        )) as { systemPrompt: string } | undefined;
+
+        assert.ok(result);
+        // tau-only file (.claude/rules) is still injected.
+        assert.ok(result.systemPrompt.includes("Use camelCase"));
+        // AGENTS.md content is not injected a second time.
+        assert.ok(!result.systemPrompt.includes("Already injected by core"));
+    });
 });
