@@ -11,7 +11,7 @@ import {
     evaluateTrigger,
     type TriggerAccum,
 } from "../features/trigger-check.ts";
-import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdtempSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -474,6 +474,99 @@ void describe("evaluateTrigger — outputMatch", () => {
         );
         assert.equal(result.met, false);
         assert.ok(result.error, "error should be set for invalid regex");
+    });
+
+    void it("keeps ^ and $ line-anchored with the multiline flag", () => {
+        writeLog([
+            "  ERROR: indented, not at line start",
+            "ERROR at line start",
+        ]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "^ERROR" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.current, 1, "only the line-start match counts");
+    });
+
+    void it("caseSensitive: true fires when the exact case is present", () => {
+        writeLog(["Benchmark COMPLETE"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            {
+                type: "outputMatch",
+                pattern: "Benchmark COMPLETE",
+                caseSensitive: true,
+            },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+    });
+
+    void it("stays pending when the log does not exist yet, then fires once created", () => {
+        const missing = join(tmpDir, "later.log");
+        try {
+            const a = acc();
+            const r1 = evaluateTrigger(
+                { type: "outputMatch", pattern: "ready" },
+                process.pid,
+                missing,
+                a
+            );
+            assert.equal(r1.met, false);
+            assert.equal(r1.error, undefined);
+            assert.equal(a.matchPrevSize, 0, "nothing scanned yet");
+
+            writeFileSync(missing, "server ready\n");
+            const r2 = evaluateTrigger(
+                { type: "outputMatch", pattern: "ready" },
+                process.pid,
+                missing,
+                a
+            );
+            assert.equal(r2.met, true);
+        } finally {
+            try {
+                unlinkSync(missing);
+            } catch {
+                /* already gone */
+            }
+        }
+    });
+
+    void it("bounds the incremental read when a poll sees a huge delta", async () => {
+        const { appendFileSync } = await import("node:fs");
+        writeLog(["start"]);
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputMatch", pattern: "needle" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.met, false);
+
+        // More than the 4 MiB per-poll cap written between polls: the
+        // tail read must still find the pattern at the end, and the scan
+        // offset must advance to the new size.
+        appendFileSync(logPath, "x".repeat(8 * 1024 * 1024) + "needle\n");
+        const r2 = evaluateTrigger(
+            { type: "outputMatch", pattern: "needle" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(
+            r2.met,
+            true,
+            "pattern at the tail of a huge delta must match"
+        );
+        assert.equal(a.matchPrevSize, statSync(logPath).size);
     });
 });
 

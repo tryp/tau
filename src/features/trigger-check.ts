@@ -11,6 +11,14 @@
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import type { JobTrigger } from "../types.ts";
 
+/**
+ * Cap on the per-poll delta read for outputMatch (bytes). A fast writer
+ * can produce a large delta between polls; reading the whole delta would
+ * make memory usage proportional to output rate. When the delta exceeds
+ * the cap, only its tail is read and scanned.
+ */
+const MAX_OUTPUT_MATCH_DELTA = 4 * 1024 * 1024;
+
 // ─── Accumulator ────────────────────────────────────────────────────
 
 export interface TriggerAccum {
@@ -24,12 +32,12 @@ export interface TriggerAccum {
     matchTail: string;
 }
 
-export function makeTriggerAccum(): TriggerAccum {
+export function makeTriggerAccum(jobStartMs = Date.now()): TriggerAccum {
     return {
         prevSize: 0,
         prevLines: 0,
         ioBlockStartMs: undefined,
-        jobStartMs: Date.now(),
+        jobStartMs,
         matchPrevSize: 0,
         matchTail: "",
     };
@@ -207,12 +215,18 @@ export function evaluateTrigger(
                 break;
             }
 
-            const readLen = size - acc.matchPrevSize;
-            const buf = Buffer.alloc(readLen);
+            // Bound the per-poll read: when the delta exceeds the cap, read
+            // only its tail. The scan stays incremental; matches entirely in
+            // the skipped middle of one enormous burst may be missed.
+            let readOffset = acc.matchPrevSize;
+            if (size - acc.matchPrevSize > MAX_OUTPUT_MATCH_DELTA) {
+                readOffset = size - MAX_OUTPUT_MATCH_DELTA;
+            }
+            const buf = Buffer.alloc(size - readOffset);
             const fd = openSync(logPath, "r");
             let bytes: number;
             try {
-                bytes = readSync(fd, buf, 0, readLen, acc.matchPrevSize);
+                bytes = readSync(fd, buf, 0, buf.length, readOffset);
             } finally {
                 closeSync(fd);
             }

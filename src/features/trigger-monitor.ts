@@ -49,7 +49,9 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
  * trigger cannot be evaluated, e.g. an invalid regex pattern).
  *
  * Returns a cancel function. The monitor also stops itself when the job
- * is no longer running or all triggers have fired.
+ * is no longer running or all triggers have fired, clearing
+ * `job.cancelTriggerMonitor` so a later subscription on the same running
+ * job starts a fresh monitor.
  */
 export function startTriggerMonitor(
     job: BackgroundJob,
@@ -58,12 +60,23 @@ export function startTriggerMonitor(
     pollMs: number = TRIGGER_POLL_MS
 ): () => void {
     let cancelled = false;
-    const acc = makeTriggerAccum();
+    // wallTime counts from the job's spawn time, not from when the
+    // monitor started (the monitor is started lazily on subscription).
+    const acc = makeTriggerAccum(job.startTime);
+
+    const stop = (): void => {
+        cancelled = true;
+        clearInterval(timer);
+        // Only clear the job's stored stop fn if it still points at this
+        // monitor, so a newer monitor is never clobbered.
+        if (job.cancelTriggerMonitor === stop) {
+            job.cancelTriggerMonitor = undefined;
+        }
+    };
 
     const timer = setInterval(() => {
         if (cancelled || job.status !== "running") {
-            cancelled = true;
-            clearInterval(timer);
+            stop();
             return;
         }
 
@@ -104,14 +117,31 @@ export function startTriggerMonitor(
         }
         job.triggers = remaining.length > 0 ? remaining : undefined;
         if (job.triggers === undefined) {
-            cancelled = true;
-            clearInterval(timer);
+            stop();
         }
     }, pollMs);
     timer.unref();
 
-    return () => {
-        cancelled = true;
-        clearInterval(timer);
-    };
+    return stop;
+}
+
+/**
+ * Start a trigger monitor for a job if none is active, and return the
+ * active stop function. Jobs may be subscribed to triggers repeatedly
+ * over their lifetime; after a monitor self-stops (one-shot fire or job
+ * completion) this starts a fresh one for the next subscription.
+ *
+ * Returns undefined when no monitor should run (e.g. the job is no
+ * longer running).
+ */
+export function ensureTriggerMonitor(
+    job: BackgroundJob,
+    pi: ExtensionAPI,
+    state: TauState,
+    pollMs: number = TRIGGER_POLL_MS
+): (() => void) | undefined {
+    if (job.cancelTriggerMonitor) return job.cancelTriggerMonitor;
+    if (job.status !== "running") return undefined;
+    job.cancelTriggerMonitor = startTriggerMonitor(job, pi, state, pollMs);
+    return job.cancelTriggerMonitor;
 }

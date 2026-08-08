@@ -13,6 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { TauState } from "../state.ts";
 import type { BackgroundJob, JobTrigger } from "../types.ts";
 import {
+    ensureTriggerMonitor,
     startTriggerMonitor,
     triggerLabel,
 } from "../features/trigger-monitor.ts";
@@ -25,6 +26,7 @@ interface SentMessage {
     customType: string;
     content: string;
     details?: unknown;
+    options?: unknown;
 }
 
 before(() => {
@@ -63,7 +65,7 @@ interface MockMessage {
 
 function makePi(sent: SentMessage[]): ExtensionAPI {
     return {
-        sendMessage(message: MockMessage) {
+        sendMessage(message: MockMessage, options?: unknown) {
             sent.push({
                 customType: message.customType,
                 content:
@@ -71,6 +73,7 @@ function makePi(sent: SentMessage[]): ExtensionAPI {
                         ? message.content
                         : String(message.content),
                 details: message.details,
+                options,
             });
         },
     } as unknown as ExtensionAPI;
@@ -84,6 +87,24 @@ function makeState(job: BackgroundJob): TauState {
 
 const sleep = (ms: number) =>
     new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Poll until a condition holds (positive assertions), with a hard timeout
+ * so timing-dependent monitor tests fail fast instead of hanging or
+ * asserting on a sleep that raced the poll interval.
+ */
+async function waitFor(
+    cond: () => boolean,
+    timeoutMs: number = 2000
+): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!cond()) {
+        if (Date.now() > deadline) {
+            throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+        }
+        await sleep(10);
+    }
+}
 
 // ─── triggerLabel ───────────────────────────────────────────────────
 
@@ -142,9 +163,8 @@ void describe("startTriggerMonitor", () => {
 
             // Append the matching line; next poll fires and removes the trigger.
             writeFileSync(logPath, "startup done\nserver ready\n");
-            await sleep(60);
+            await waitFor(() => sent.length === 1);
 
-            assert.equal(sent.length, 1, "should fire exactly once");
             assert.equal(sent[0].customType, "bg-trigger");
             assert.match(sent[0].content, /server ready/);
             assert.equal(job.triggers, undefined, "trigger should be removed");
@@ -169,8 +189,7 @@ void describe("startTriggerMonitor", () => {
 
         const cancel = startTriggerMonitor(job, pi, makeState(job), 20);
         try {
-            await sleep(60);
-            assert.equal(sent.length, 1, "invalid regex should surface");
+            await waitFor(() => sent.length === 1);
             assert.match(sent[0].content, /invalid regex/);
             assert.equal(job.triggers, undefined);
         } finally {
@@ -209,6 +228,213 @@ void describe("startTriggerMonitor", () => {
 
         const cancel = startTriggerMonitor(job, pi, makeState(job), 20);
         cancel();
+        await sleep(60);
+        assert.equal(sent.length, 0);
+    });
+});
+
+// ─── Lifecycle regressions ─────────────────────────────────────────
+
+void describe("trigger monitor lifecycle", () => {
+    void it("restarts the monitor when new triggers are subscribed after a one-shot fire", async () => {
+        // Regression: the stored cancelTriggerMonitor was never cleared when
+        // the monitor self-stopped, so a later subscription on the same
+        // running job never started a fresh monitor and its triggers were
+        // silently never evaluated.
+        const logPath = join(tmpDir, "resub.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-resub", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [{ type: "outputMatch", pattern: "phase one" }];
+        const c1 = ensureTriggerMonitor(job, pi, state, 20);
+        assert.ok(c1, "first subscription starts a monitor");
+
+        writeFileSync(logPath, "start\nphase one\n");
+        await waitFor(() => sent.length === 1);
+        assert.equal(job.triggers, undefined, "one-shot consumed the trigger");
+        assert.equal(
+            job.cancelTriggerMonitor,
+            undefined,
+            "self-stop must clear the stored monitor"
+        );
+
+        // Re-subscribe on the same still-running job.
+        job.triggers = [{ type: "outputMatch", pattern: "phase two" }];
+        const c2 = ensureTriggerMonitor(job, pi, state, 20);
+        assert.ok(
+            c2,
+            "a fresh monitor must start after the first consumed its triggers"
+        );
+
+        writeFileSync(logPath, "start\nphase one\nphase two\n");
+        await waitFor(() => sent.length === 2);
+        assert.match(sent[1].content, /phase two/);
+        assert.equal(job.triggers, undefined);
+        c2?.();
+    });
+
+    void it("fires each subscribed trigger once and stops when all are consumed", async () => {
+        const logPath = join(tmpDir, "multi.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-multi", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [
+            { type: "outputMatch", pattern: "alpha" },
+            { type: "outputMatch", pattern: "beta" },
+        ];
+        const cancel = ensureTriggerMonitor(job, pi, state, 20);
+        assert.ok(cancel);
+
+        writeFileSync(logPath, "start\nalpha\n");
+        await waitFor(() => sent.length === 1);
+        writeFileSync(logPath, "start\nalpha\nbeta\n");
+        await waitFor(() => sent.length === 2);
+
+        assert.match(sent[0].content, /alpha/);
+        assert.match(sent[1].content, /beta/);
+        assert.equal(
+            job.triggers,
+            undefined,
+            "both one-shot triggers consumed"
+        );
+        cancel();
+    });
+
+    void it("surfaces an invalid pattern without dropping valid triggers", async () => {
+        const logPath = join(tmpDir, "mixed.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-mixed", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [
+            { type: "outputMatch", pattern: "(" },
+            { type: "outputMatch", pattern: "good" },
+        ];
+        ensureTriggerMonitor(job, pi, state, 20);
+
+        await waitFor(() => sent.length === 1);
+        assert.match(sent[0].content, /invalid regex/);
+        assert.equal(
+            job.triggers?.length,
+            1,
+            "valid trigger must remain subscribed"
+        );
+
+        writeFileSync(logPath, "start\ngood\n");
+        await waitFor(() => sent.length === 2);
+        assert.match(sent[1].content, /good/);
+        assert.equal(job.triggers, undefined);
+    });
+
+    void it("measures wallTime from the job start, not the monitor start", async () => {
+        // Regression: the accumulator seeded jobStartMs at monitor start,
+        // so a wallTime trigger subscribed after the job had been running
+        // would fire late. The job's own startTime is the correct base.
+        const logPath = join(tmpDir, "wall.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({
+            id: "job-wall",
+            logPath,
+            startTime: Date.now() - 10_000,
+        });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [{ type: "wallTime", value: 5 }];
+        ensureTriggerMonitor(job, pi, state, 20);
+
+        // Job started 10s ago, threshold 5s: the first poll must fire.
+        await waitFor(() => sent.length === 1);
+        assert.match(sent[0].content, /wallTime=5/);
+    });
+
+    void it("delivers bg-trigger as a follow-up turn with structured details", async () => {
+        const logPath = join(tmpDir, "details.log");
+        writeFileSync(logPath, "server ready\n");
+        const job = makeJob({ id: "job-details", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [{ type: "outputMatch", pattern: "server ready" }];
+        ensureTriggerMonitor(job, pi, state, 20);
+        await waitFor(() => sent.length === 1);
+
+        assert.deepEqual(sent[0].options, {
+            deliverAs: "followUp",
+            triggerTurn: true,
+        });
+        const details = sent[0].details as Record<string, unknown>;
+        assert.equal(details.jobId, job.id);
+        assert.equal(details.triggerType, "outputMatch");
+        assert.equal(details.threshold, "server ready");
+        assert.equal(details.current, 1);
+        assert.equal(details.error, undefined);
+    });
+
+    void it("does not start a second monitor while one is active", async () => {
+        const logPath = join(tmpDir, "single.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-single", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        const c1 = ensureTriggerMonitor(job, pi, state, 20);
+        const c2 = ensureTriggerMonitor(job, pi, state, 20);
+        assert.equal(c1, c2, "both calls must return the same active monitor");
+
+        job.triggers = [{ type: "outputMatch", pattern: "boom" }];
+        writeFileSync(logPath, "start\nboom\n");
+        await waitFor(() => sent.length === 1);
+        c1?.();
+    });
+
+    void it("cancel clears the stored monitor so a later subscription can restart it", async () => {
+        const logPath = join(tmpDir, "cancel-restart.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-cancel-restart", logPath });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        const c1 = ensureTriggerMonitor(job, pi, state, 20);
+        assert.ok(c1);
+        c1();
+        assert.equal(
+            job.cancelTriggerMonitor,
+            undefined,
+            "cancel must clear the stored stop fn"
+        );
+
+        const c2 = ensureTriggerMonitor(job, pi, state, 20);
+        assert.ok(c2, "restart must succeed after cancel");
+        job.triggers = [{ type: "outputMatch", pattern: "later" }];
+        writeFileSync(logPath, "start\nlater\n");
+        await waitFor(() => sent.length === 1);
+        c2?.();
+    });
+
+    void it("does not start a monitor for a job that is no longer running", async () => {
+        const logPath = join(tmpDir, "dead.log");
+        writeFileSync(logPath, "start\n");
+        const job = makeJob({ id: "job-dead", logPath, status: "completed" });
+        const state = makeState(job);
+        const sent: SentMessage[] = [];
+        const pi = makePi(sent);
+
+        job.triggers = [{ type: "outputMatch", pattern: "boom" }];
+        const cancel = ensureTriggerMonitor(job, pi, state, 20);
+        assert.equal(cancel, undefined, "no monitor for a completed job");
         await sleep(60);
         assert.equal(sent.length, 0);
     });

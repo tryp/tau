@@ -32,7 +32,7 @@ import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import type { JobTrigger } from "../types.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
-import { startTriggerMonitor, triggerLabel } from "./trigger-monitor.ts";
+import { ensureTriggerMonitor, triggerLabel } from "./trigger-monitor.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -1136,10 +1136,10 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                                     ...(job.triggers ?? []),
                                     ...newTriggers,
                                 ];
-                                if (!job.cancelTriggerMonitor) {
-                                    job.cancelTriggerMonitor =
-                                        startTriggerMonitor(job, pi, state);
-                                }
+                                // Starts a fresh monitor if the previous
+                                // one self-stopped (one-shot fire) or was
+                                // cancelled; no-op while one is active.
+                                ensureTriggerMonitor(job, pi, state);
                                 result +=
                                     `\nSubscribed ${newTriggers.length} trigger(s): ` +
                                     newTriggers.map(triggerLabel).join(", ");
