@@ -1054,6 +1054,8 @@ export function registerBackgroundJobs(
             "Use the jobs tool with action 'list' to check background job status.",
             "Use the jobs tool with action 'output' to read a background job's output file.",
             "Use backgroundAfter to set a custom background-after timeout in seconds.",
+            "Pass cwd when working in a directory other than the session root (e.g. a git worktree) " +
+                "so the command and the UI location indicator match.",
         ],
         parameters: Type.Object({
             command: Type.String({
@@ -1066,6 +1068,13 @@ export function registerBackgroundJobs(
                         "The command continues running in the background; use jobs/attach to monitor it.",
                 })
             ),
+            cwd: Type.Optional(
+                Type.String({
+                    description:
+                        "Working directory to run the command in (e.g. a git worktree). Defaults to the " +
+                        "session working directory.",
+                })
+            ),
         }),
 
         async execute(
@@ -1075,7 +1084,8 @@ export function registerBackgroundJobs(
             onUpdate,
             ctx
         ): Promise<AgentToolResult<BashToolDetails | undefined>> {
-            const { command } = params;
+            const { command, cwd } = params;
+            const execCwd = cwd ?? ctx.cwd;
 
             // Validate: block sleep >= 2s
             const sleepMatch = detectBlockedSleep(command);
@@ -1113,7 +1123,7 @@ export function registerBackgroundJobs(
             const logFd = openSync(logPath, "w");
             const proc = spawn("bash", ["-c", command], {
                 stdio: ["pipe", logFd, logFd],
-                cwd: ctx.cwd,
+                cwd: execCwd,
                 detached: true,
                 env: { ...process.env },
             });
@@ -1418,11 +1428,20 @@ export function registerBackgroundJobs(
             "Completed output is automatically indexed in the context sidecar when available. " +
                 "Use context_search with tool_name='bash_bg' to find past job output, " +
                 "or context_list with tool_name='bash_bg' to see recent indexed job runs.",
+            "Pass cwd when working in a directory other than the session root (e.g. a git worktree) " +
+                "so the command and the UI location indicator match.",
         ],
         parameters: Type.Object({
             command: Type.String({
                 description: "Command to run in background",
             }),
+            cwd: Type.Optional(
+                Type.String({
+                    description:
+                        "Working directory to run the command in (e.g. a git worktree). Defaults to the " +
+                        "session working directory.",
+                })
+            ),
             notify: Type.Optional(
                 Type.Boolean({
                     description: "Notify when complete (default: true)",
@@ -1464,7 +1483,7 @@ export function registerBackgroundJobs(
             if (state.tmuxAvailable) {
                 const job = spawnBackgroundTmux(
                     params.command,
-                    ctx.cwd,
+                    typeof params.cwd === "string" ? params.cwd : ctx.cwd,
                     toolCallId,
                     state,
                     pi,
@@ -1521,7 +1540,7 @@ export function registerBackgroundJobs(
             const logFd = openSync(logPath, "w");
             const proc = spawn("bash", ["-c", params.command], {
                 stdio: ["pipe", logFd, logFd],
-                cwd: ctx.cwd,
+                cwd: typeof params.cwd === "string" ? params.cwd : ctx.cwd,
                 detached: true,
                 env: { ...process.env },
             });
@@ -2245,7 +2264,8 @@ async function executeTmuxForeground(
     let tmuxCtx: import("./bash-tmux.ts").TmuxJobContext;
 
     try {
-        const result = spawnForegroundTmux(command, ctx.cwd);
+        const execCwd = typeof params.cwd === "string" ? params.cwd : ctx.cwd;
+        const result = spawnForegroundTmux(command, execCwd);
         logPath = result.logPath;
         tmuxCtx = result.tmuxCtx;
     } catch {
