@@ -9,13 +9,13 @@ import {
     getOutputMetadata,
     lookupJob,
     startTimeoutTimer,
+    handleTmuxCompletion,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
 import { TauState } from "../state.ts";
 import type { BackgroundJob, RunningProcess } from "../types.ts";
 import { createJobDonePromise } from "../utils.ts";
 import { silenceJobAfterKill } from "../features/background.ts";
-import { notifyTmuxCompletion } from "../features/bash-tmux.ts";
 
 /** Helper to create a BackgroundJob with all required fields. */
 function makeJob(
@@ -1181,7 +1181,7 @@ void describe(
             ]);
         });
 
-        void it("waits for tmux output indexing and includes source IDs", async () => {
+        void it("suppresses successful tmux completions unless wanted", async () => {
             const state = new TauState();
             const sentMessages: unknown[] = [];
             const pi = {
@@ -1192,17 +1192,80 @@ void describe(
             const ctx = {
                 ui: { notify() {} },
             } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const job = makeJob({
+                id: "tmux-plain-success",
+                status: "completed",
+            });
+            state.backgroundJobs.set(job.id, job);
+
+            handleTmuxCompletion(job, state, pi, ctx, true);
+            state._flushCompletionBatch?.();
+
+            assert.equal(
+                sentMessages.length,
+                0,
+                "plain successful tmux completion must be suppressed"
+            );
+            assert.equal(
+                state.backgroundJobs.has(job.id),
+                false,
+                "job removed from active map immediately"
+            );
+            assert.ok(
+                lookupJob(state, job.id),
+                "job still findable via recent-terminal fallback"
+            );
+        });
+
+        void it("delivers failed tmux completions with source IDs after indexing", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: { notify() {} },
+            } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
             let release!: () => void;
             const ready = new Promise<void>((resolve) => {
                 release = resolve;
             });
             const job = makeJob({
-                id: "tmux-indexed-completion",
-                status: "completed",
+                id: "tmux-failed-indexed",
+                status: "failed",
+                exitCode: 1,
             });
             job.outputIndexPromise = ready.then(() => {
-                job.sourceId = "src-tmux-completion";
-                job.chunkIds = ["src-tmux-completion_0001"];
+                job.sourceId = "src-tmux-failed";
+                job.chunkIds = ["src-tmux-failed_0001"];
                 return {
                     sourceId: job.sourceId,
                     chunkIds: job.chunkIds,
@@ -1210,22 +1273,143 @@ void describe(
             });
             state.backgroundJobs.set(job.id, job);
 
-            const notification = notifyTmuxCompletion(job, state, pi, ctx);
-            await new Promise<void>((resolve) => setImmediate(resolve));
-            assert.equal(sentMessages.length, 0);
-            assert.equal(state.backgroundJobs.has(job.id), true);
+            handleTmuxCompletion(job, state, pi, ctx, true);
+            // Removed from the active map immediately; still findable via
+            // the recent-terminal fallback so jobs(output) sees the same IDs.
+            assert.equal(state.backgroundJobs.has(job.id), false);
+            assert.ok(lookupJob(state, job.id));
 
             release();
-            await notification;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            state._flushCompletionBatch?.();
+
             assert.equal(sentMessages.length, 1);
             const message = sentMessages[0] as {
+                customType: string;
                 details: { sourceId?: string; chunkIds?: string[] };
             };
-            assert.equal(message.details.sourceId, "src-tmux-completion");
+            assert.equal(message.customType, "job-completion");
+            assert.equal(message.details.sourceId, "src-tmux-failed");
             assert.deepEqual(message.details.chunkIds, [
-                "src-tmux-completion_0001",
+                "src-tmux-failed_0001",
             ]);
+        });
+
+        void it("honors notify:false for tmux jobs (no notification, removed)", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: { notify() {} },
+            } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const job = makeJob({
+                id: "tmux-no-notify",
+                status: "completed",
+            });
+            state.backgroundJobs.set(job.id, job);
+
+            handleTmuxCompletion(job, state, pi, ctx, false);
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 0);
             assert.equal(state.backgroundJobs.has(job.id), false);
+            assert.equal(state.completedJobCount, 1);
+        });
+
+        void it("suppresses tmux completion when output consumed before delivery", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: { notify() {} },
+            } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const job = makeJob({
+                id: "tmux-consumed-before-flush",
+                status: "failed",
+                exitCode: 1,
+            });
+            state.backgroundJobs.set(job.id, job);
+
+            handleTmuxCompletion(job, state, pi, ctx, true);
+            // Agent read the output (jobs attach/output) before the debounced
+            // batch flushed — must suppress the follow-up turn even for failures.
+            job.outputConsumed = true;
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 0);
+        });
+
+        void it("delivers successful tmux completion when a remind callback wants it", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: { notify() {} },
+            } as never;
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const job = makeJob({
+                id: "tmux-wants-completion",
+                status: "completed",
+                wantsCompletionNotification: true,
+            });
+            state.backgroundJobs.set(job.id, job);
+
+            handleTmuxCompletion(job, state, pi, ctx, true);
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 1);
+            const message = sentMessages[0] as { content: string };
+            assert.ok(message.content.includes(job.id));
         });
 
         void it("increments completedJobCount after cleanup", async () => {

@@ -93,7 +93,6 @@ import {
     killTmuxJob,
     pollTmuxCompletion,
     spawnBackgroundTmux,
-    notifyTmuxCompletion,
     spawnForegroundTmux,
 } from "./bash-tmux.ts";
 import { captureOutput } from "../tmux.ts";
@@ -288,6 +287,31 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     if (state.recentTerminalJobs.length > MAX_RECENT_TERMINAL) {
         state.recentTerminalJobs.shift();
     }
+}
+
+/**
+ * Finalize a tmux-backed job at completion.
+ *
+ * Routes through the same delivery machinery as the direct-spawn path
+ * (notifyCompletion → debounced batch → success-suppression → busy-deferral
+ * → prune of consumed jobs at delivery), so tmux-backed bash_bg jobs cannot
+ * re-awaken the agent with redundant completion notices. Honors `shouldNotify`
+ * (notify: false → no toast, no batch, no delivery) and always cleans up the
+ * tmux window.
+ */
+export function handleTmuxCompletion(
+    job: BackgroundJob,
+    state: TauState,
+    pi: ExtensionAPI,
+    ctx: UiContext,
+    shouldNotify: boolean
+): void {
+    if (shouldNotify) {
+        notifyCompletion(job, state, pi, ctx);
+    } else {
+        removeJob(state, job);
+    }
+    killTmuxJob(job);
 }
 
 // ─── Job output formatting (grep/tail/head) ──────────────────────────
@@ -1511,6 +1535,10 @@ export function registerBackgroundJobs(
                                 );
                             }
                         ),
+                    // Finalize through the shared completion machinery
+                    // (notifyCompletion + tmux window cleanup).
+                    (job) =>
+                        handleTmuxCompletion(job, state, pi, ctx, shouldNotify),
                     // Refresh the background-jobs widget once the job is
                     // finalized (completion/cleanup), not just at spawn.
                     () => updateWidget(state, ctx)
@@ -2480,7 +2508,7 @@ async function executeTmuxForeground(
                 );
                 clearPendingDecision(state, job);
                 void trackJobOutputIndex(job, ctx, "bash_bg");
-                void notifyTmuxCompletion(job, state, pi, ctx);
+                handleTmuxCompletion(job, state, pi, ctx, true);
                 updateWidget(state, ctx);
             }, 500);
             bgPoller.unref();

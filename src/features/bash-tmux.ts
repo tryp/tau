@@ -260,6 +260,7 @@ export function spawnBackgroundTmux(
         command: string,
         logPath: string
     ) => () => void,
+    onCompletion: (job: BackgroundJob) => void,
     onTerminal?: () => void
 ): BackgroundJob {
     const { tmuxCtx, logPath } = spawnForegroundTmux(command, cwd);
@@ -297,87 +298,19 @@ export function spawnBackgroundTmux(
             result.exitCode ?? 0
         );
         void trackJobOutputIndex(job, ctx, "bash_bg");
+        // Finalize through the shared completion machinery (toast, batch
+        // suppression, busy-deferral, prune of consumed jobs) plus tmux
+        // window cleanup — mirrors the direct-spawn path's notifyCompletion
+        // so tmux-backed jobs cannot re-awaken the agent redundantly.
+        onCompletion(job);
         // Refresh the footer widget only after the job has been finalized
         // (notification + cleanup + counter updates), so it neither shows the
         // completed job as running nor reports stale completed/failed counts.
         // Mirrors the auto-background poller in background.ts. Without this,
         // the background-jobs widget stays frozen at the spawn-time snapshot.
-        void notifyTmuxCompletion(job, state, pi, ctx).finally(() => {
-            onTerminal?.();
-        });
+        onTerminal?.();
     }, 500);
     pollTimer.unref();
 
     return job;
-}
-
-/**
- * Send a completion notification for a tmux-backed job.
- * Extracted so the stall watchdog can also trigger it.
- */
-export async function notifyTmuxCompletion(
-    job: BackgroundJob,
-    state: TauState,
-    pi: ExtensionAPI,
-    ctx: UiContext
-): Promise<void> {
-    const cleanup = (): void => {
-        const tmuxCtx = getTmuxContext(job);
-        if (tmuxCtx) killWindow(tmuxCtx.windowId);
-        state.backgroundJobs.delete(job.id);
-        if (job.status === "completed") state.completedJobCount++;
-        if (job.status === "failed") state.failedJobCount++;
-        state.recentTerminalJobs.push(job);
-        if (state.recentTerminalJobs.length > 20)
-            state.recentTerminalJobs.shift();
-    };
-
-    if (job.outputConsumed) {
-        // Job was killed — suppress notification and clean up window.
-        cleanup();
-        return;
-    }
-
-    // Keep the job visible until indexing finishes. This makes a completion
-    // notification and an immediate jobs(output) call observe the same IDs.
-    if (job.outputIndexPromise) await job.outputIndexPromise;
-    if (job.outputConsumed) {
-        cleanup();
-        return;
-    }
-
-    const duration = Date.now() - job.startTime;
-    const mins = Math.floor(duration / 60000);
-    const secs = Math.floor((duration % 60000) / 1000);
-    const durationText = mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
-    const emoji = job.status === "completed" ? "✅" : "❌";
-    const statusText = `Background ${job.id} ${job.status} (${durationText})`;
-    const exitCodeText =
-        job.exitCode !== undefined ? `\nExit code: ${job.exitCode}` : "";
-
-    ctx.ui.notify(statusText, job.status === "completed" ? "success" : "error");
-
-    pi.sendMessage(
-        {
-            customType: "job-completion",
-            content:
-                `${emoji} ${statusText}\n` +
-                `Command: ${job.command}\n` +
-                `Output: ${job.logPath}${exitCodeText}`,
-            display: true,
-            details: {
-                jobId: job.id,
-                status: job.status,
-                exitCode: job.exitCode,
-                duration: durationText,
-                command: job.command,
-                logPath: job.logPath,
-                sourceId: job.sourceId,
-                chunkIds: job.chunkIds,
-            },
-        },
-        { deliverAs: "followUp", triggerTurn: true } as never
-    );
-
-    cleanup();
 }
