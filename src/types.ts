@@ -62,6 +62,8 @@ export interface BackgroundJob {
     outputIndexPromise?: Promise<JobOutputIndex | undefined>;
     /** Optional triggers that fire async events when conditions are met. */
     triggers?: JobTrigger[];
+    /** Stops the active trigger monitor, if one is running. */
+    cancelTriggerMonitor?: () => void;
 }
 
 // ─── Job triggers ───────────────────────────────────────────────────
@@ -72,19 +74,38 @@ export interface BackgroundJob {
  * the agent and the trigger is deactivated (one-shot).
  * Time-based values are in seconds (wallTime, cpuTime, ioBlock).
  */
-export interface JobTrigger {
-    type:
-        | "outputLines"
-        | "rssKb"
-        | "ioReadBytes"
-        | "ioWriteBytes"
-        | "cpuTime"
-        | "ioBlock"
-        | "wallTime";
-    value: number;
-    /** Optional label for the agent's callback message. */
-    label?: string;
-}
+export type JobTrigger =
+    | {
+          /** Numeric-threshold trigger types. */
+          type:
+              | "outputLines"
+              | "rssKb"
+              | "ioReadBytes"
+              | "ioWriteBytes"
+              | "cpuTime"
+              | "ioBlock"
+              | "wallTime";
+          /** Threshold value (lines, KiB, bytes, or seconds). */
+          value: number;
+          /** Optional label for the agent's callback message. */
+          label?: string;
+      }
+    | {
+          type: "outputMatch";
+          /**
+           * JavaScript regular expression matched against the job log,
+           * the same regex language used by the rest of the agent tool
+           * surfaces (e.g. `jobs output grep`).
+           */
+          pattern: string;
+          /**
+           * Defaults to false: matching is case-insensitive unless this
+           * is set to true (same default as `jobs output grep`).
+           */
+          caseSensitive?: boolean;
+          /** Optional label for the agent's callback message. */
+          label?: string;
+      };
 
 export interface RunningProcess {
     toolCallId: string;

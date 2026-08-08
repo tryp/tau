@@ -32,6 +32,7 @@ import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import type { JobTrigger } from "../types.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
+import { ensureTriggerMonitor, triggerLabel } from "./trigger-monitor.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -299,7 +300,9 @@ function readProcSnapshot(pid: number): string | null {
                 const vmRssKb = parseInt(vmRss[1], 10);
                 return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round((vmRssKb || rssKb) / 1024)}MB state=${parts[0]}`;
             }
-        } catch {}
+        } catch {
+            /* best-effort /proc read */
+        }
         return `pid=${pid} cpu=${cpuSec.toFixed(2)}ms rss=${Math.round(rssKb / 1024)}MB state=${parts[0]}`;
     } catch {
         return null;
@@ -349,9 +352,13 @@ function readGpuSnapshot(): string | null {
                             break;
                         }
                     }
-                } catch {}
+                } catch {
+                    /* best-effort sensor read */
+                }
                 lines.push(`${entry}: ${busy}%${temp}`);
-            } catch {}
+            } catch {
+                /* best-effort per-entry read */
+            }
         }
         return lines.length > 0 ? lines.join(", ") : null;
     } catch {
@@ -836,7 +843,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "until it fires or is explicitly cancelled. It will NOT auto-cancel when a job completes. " +
             "For job monitoring, prefer bash_bg with remindDelay which auto-links the callback. " +
             "When used with jobId, triggers can be subscribed on the running job to fire async events " +
-            "when conditions like outputLines, rssKb, cpuTime, or wallTime are met.",
+            "when conditions like outputLines, rssKb, cpuTime, or wallTime are met. " +
+            "outputMatch fires when a regex pattern appears in the job's log " +
+            "(case-insensitive by default, like jobs output grep).",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -856,7 +865,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "Pass jobId when you must use manual remind() for a job-related check — " +
                 "this links the callback to the job so it auto-cancels on completion.",
             "Use triggers on remind to subscribe conditions on a running job — " +
-                'e.g., triggers: [{type:"outputLines", value: 200}] fires when the log has 200+ lines.',
+                'e.g., triggers: [{type:"outputLines", value: 200}] fires when the log has 200+ lines, ' +
+                'or triggers: [{type:"outputMatch", pattern: "benchmark complete|ERROR"}] fires when the ' +
+                "pattern appears in the log (case-insensitive by default; set caseSensitive: true to opt out).",
         ],
         parameters: Type.Object({
             action: Type.Optional(
@@ -897,27 +908,58 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             ),
             triggers: Type.Optional(
                 Type.Array(
-                    Type.Object({
-                        type: Type.String({
-                            description:
-                                'Trigger type: "outputLines", "rssKb", "ioReadBytes", "ioWriteBytes", ' +
-                                '"cpuTime", "ioBlock", or "wallTime".',
-                        }),
-                        value: Type.Number({
-                            description: "Threshold value.",
-                        }),
-                        label: Type.Optional(
-                            Type.String({
+                    Type.Union([
+                        Type.Object({
+                            type: Type.Union([
+                                Type.Literal("outputLines"),
+                                Type.Literal("rssKb"),
+                                Type.Literal("ioReadBytes"),
+                                Type.Literal("ioWriteBytes"),
+                                Type.Literal("cpuTime"),
+                                Type.Literal("ioBlock"),
+                                Type.Literal("wallTime"),
+                            ]),
+                            value: Type.Number({
                                 description:
-                                    "Optional label for the callback message.",
-                            })
-                        ),
-                    }),
+                                    "Threshold value (lines, KiB, bytes, or seconds).",
+                            }),
+                            label: Type.Optional(
+                                Type.String({
+                                    description:
+                                        "Optional label for the callback message.",
+                                })
+                            ),
+                        }),
+                        Type.Object({
+                            type: Type.Literal("outputMatch"),
+                            pattern: Type.String({
+                                description:
+                                    "JavaScript regular expression matched against the job log, " +
+                                    "the same regex language as the rest of the agent tool surfaces " +
+                                    "(e.g. jobs output grep). Keep patterns simple: literal " +
+                                    "substrings are matched directly and safely, but pathological " +
+                                    "regexes (nested quantifiers like (a+)+b) can stall the monitor.",
+                            }),
+                            caseSensitive: Type.Optional(
+                                Type.Boolean({
+                                    description:
+                                        "Defaults to false — matching is case-insensitive unless set true.",
+                                })
+                            ),
+                            label: Type.Optional(
+                                Type.String({
+                                    description:
+                                        "Optional label for the callback message.",
+                                })
+                            ),
+                        }),
+                    ]),
                     {
                         description:
                             "Optional triggers to subscribe on the linked job. " +
                             "Requires jobId. Monitored alongside any triggers already set on the job. " +
-                            'Example: [{type:"outputLines",value:200}] notifies when log has 200+ lines.',
+                            'Example: [{type:"outputLines",value:200}] notifies when log has 200+ lines; ' +
+                            '[{type:"outputMatch",pattern:"ERROR"}] notifies when the log contains ERROR.',
                     }
                 )
             ),
@@ -1096,11 +1138,13 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                                     ...(job.triggers ?? []),
                                     ...newTriggers,
                                 ];
+                                // Starts a fresh monitor if the previous
+                                // one self-stopped (one-shot fire) or was
+                                // cancelled; no-op while one is active.
+                                ensureTriggerMonitor(job, pi, state);
                                 result +=
                                     `\nSubscribed ${newTriggers.length} trigger(s): ` +
-                                    newTriggers
-                                        .map((t) => `${t.type}=${t.value}`)
-                                        .join(", ");
+                                    newTriggers.map(triggerLabel).join(", ");
                             } else {
                                 result += `\nWarning: job ${params.jobId} not found or not running — triggers not subscribed`;
                             }

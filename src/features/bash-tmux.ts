@@ -241,6 +241,12 @@ export function spawnForegroundTmux(
  * Spawn a bash command in a tmux window (background mode).
  *
  * Sets up completion detection and returns the job.
+ *
+ * `onStartStallWatchdog` arms the stall watchdog for this job (returns a
+ * cancel function). `onTerminal` (optional) fires once the job has been
+ * finalized — after completion detection, sidecar indexing, notification,
+ * and cleanup — so callers can refresh UI state that depends on the job map
+ * and the completed/failed counters (e.g. the background-jobs footer widget).
  */
 export function spawnBackgroundTmux(
     command: string,
@@ -253,7 +259,8 @@ export function spawnBackgroundTmux(
         jobId: string,
         command: string,
         logPath: string
-    ) => () => void
+    ) => () => void,
+    onTerminal?: () => void
 ): BackgroundJob {
     const { tmuxCtx, logPath } = spawnForegroundTmux(command, cwd);
 
@@ -290,7 +297,14 @@ export function spawnBackgroundTmux(
             result.exitCode ?? 0
         );
         void trackJobOutputIndex(job, ctx, "bash_bg");
-        void notifyTmuxCompletion(job, state, pi, ctx);
+        // Refresh the footer widget only after the job has been finalized
+        // (notification + cleanup + counter updates), so it neither shows the
+        // completed job as running nor reports stale completed/failed counts.
+        // Mirrors the auto-background poller in background.ts. Without this,
+        // the background-jobs widget stays frozen at the spawn-time snapshot.
+        void notifyTmuxCompletion(job, state, pi, ctx).finally(() => {
+            onTerminal?.();
+        });
     }, 500);
     pollTimer.unref();
 
