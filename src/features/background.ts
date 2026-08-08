@@ -547,6 +547,8 @@ type PendingCompletionDelivery = {
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 let completionAgentBusy = false;
+// Prevent duplicate notifications when both error and close handlers fire.
+const completionNotifiedJobs = new WeakSet<BackgroundJob>();
 // Invalidates asynchronous indexing callbacks after a batch is cleared.
 let completionBatchGeneration = 0;
 const suppressedCompletionJobIds = new Set<string>();
@@ -558,7 +560,7 @@ function countOutstandingJobs(state: TauState): number {
     ).length;
 }
 
-function flushCompletionBatch(): void {
+export function flushCompletionBatch(): void {
     const batch = completionBatch.jobs.splice(0);
     const pi = completionBatch.pi!;
     const state = completionBatch.state!;
@@ -835,7 +837,8 @@ export function notifyCompletion(
 ): void {
     // If the job was already silenced (killed by watchdog, tool, etc.),
     // skip notification entirely — the killing path already sent one.
-    if (job.outputConsumed) return;
+    if (job.outputConsumed || completionNotifiedJobs.has(job)) return;
+    completionNotifiedJobs.add(job);
 
     // Linked callbacks (remindDelay) are NOT cancelled here — delivery
     // is deferred to flushCompletionBatch which decides whether to
@@ -1039,7 +1042,7 @@ export function registerBackgroundJobs(
         ...originalBashTool,
         name: "bash",
         description:
-            "Execute bash commands with streaming output. Commands that run longer than 2 minutes " +
+            "Execute bash commands with streaming output. Commands that run longer than 15 seconds " +
             "are automatically backgrounded and the agent is asked whether to kill or let them continue. " +
             "Use Ctrl+Shift+B to manually background a running process. " +
             "Background job output is written to per-session log files. " +
@@ -1059,7 +1062,7 @@ export function registerBackgroundJobs(
             backgroundAfter: Type.Optional(
                 Type.Number({
                     description:
-                        "Background the command after this many seconds (default: auto, ~2 minutes). " +
+                        "Background the command after this many seconds (default: auto, ~15 seconds). " +
                         "The command continues running in the background; use jobs/attach to monitor it.",
                 })
             ),
@@ -1488,7 +1491,10 @@ export function registerBackgroundJobs(
                                         } satisfies BackgroundJob)
                                 );
                             }
-                        )
+                        ),
+                    // Refresh the background-jobs widget once the job is
+                    // finalized (completion/cleanup), not just at spawn.
+                    () => updateWidget(state, ctx)
                 );
 
                 updateWidget(state, ctx);

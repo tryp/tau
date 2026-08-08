@@ -9,10 +9,8 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
     evaluateTrigger,
-    makeTriggerAccum,
     type TriggerAccum,
 } from "../features/trigger-check.ts";
-import type { JobTrigger } from "../types.ts";
 import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 
@@ -27,8 +25,16 @@ before(() => {
 });
 
 after(() => {
-    try { unlinkSync(logPath); } catch {}
-    try { unlinkSync(tmpDir); } catch {}
+    try {
+        unlinkSync(logPath);
+    } catch {
+        /* file may already be gone */
+    }
+    try {
+        unlinkSync(tmpDir);
+    } catch {
+        /* dir may already be gone */
+    }
 });
 
 function writeLog(lines: string[]) {
@@ -41,6 +47,8 @@ function acc(overrides: Partial<TriggerAccum> = {}): TriggerAccum {
         prevLines: 0,
         ioBlockStartMs: undefined,
         jobStartMs: Date.now(),
+        matchPrevSize: 0,
+        matchTail: "",
         ...overrides,
     };
 }
@@ -57,7 +65,10 @@ void describe("evaluateTrigger — wallTime", () => {
             a
         );
         assert.equal(result.met, true);
-        assert.ok(result.current >= 3, `current=${result.current} should be >= 3`);
+        assert.ok(
+            result.current >= 3,
+            `current=${result.current} should be >= 3`
+        );
     });
 
     void it("does not fire before threshold", () => {
@@ -174,7 +185,10 @@ void describe("evaluateTrigger — rssKb", () => {
         );
         // Our process should definitely have RSS > 1 KB
         assert.equal(result.met, true);
-        assert.ok(result.current > 100, `current=${result.current} should be > 100 Kb`);
+        assert.ok(
+            result.current > 100,
+            `current=${result.current} should be > 100 Kb`
+        );
     });
 
     void it("does not fire for unrealistically high threshold", () => {
@@ -284,18 +298,192 @@ void describe("evaluateTrigger — ioBlock", () => {
     });
 });
 
+// ─── outputMatch ────────────────────────────────────────────────────
+
+void describe("evaluateTrigger — outputMatch", () => {
+    void it("fires when the pattern appears in the log", () => {
+        writeLog(["started", "benchmark complete in 4m33s", "done"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "benchmark complete" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.current, 1);
+    });
+
+    void it("is case-insensitive by default", () => {
+        writeLog(["Benchmark COMPLETE"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "benchmark complete" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+    });
+
+    void it("respects caseSensitive: true", () => {
+        writeLog(["Benchmark COMPLETE"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            {
+                type: "outputMatch",
+                pattern: "benchmark complete",
+                caseSensitive: true,
+            },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+    });
+
+    void it("does not fire when the pattern is absent", () => {
+        writeLog(["nothing", "to see here"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "ERROR|FAILED" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+        assert.equal(result.current, 0);
+    });
+
+    void it("matches only newly appended bytes on later polls", () => {
+        writeLog(["first phase done"]);
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputMatch", pattern: "ready" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.met, false);
+
+        writeLog(["first phase done", "server ready"]);
+        const r2 = evaluateTrigger(
+            { type: "outputMatch", pattern: "ready" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r2.met, true);
+    });
+
+    void it("matches patterns spanning incremental-chunk boundaries", async () => {
+        const { appendFileSync } = await import("node:fs");
+        writeFileSync(logPath, "building the ");
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputMatch", pattern: "building the widget" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.met, false);
+
+        // Append the rest of the match across the scan boundary.
+        appendFileSync(logPath, "widget\n");
+        const r2 = evaluateTrigger(
+            { type: "outputMatch", pattern: "building the widget" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r2.met, true);
+    });
+
+    void it("resets the scan when the log is truncated", async () => {
+        const { appendFileSync } = await import("node:fs");
+        writeLog(["old content"]);
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputMatch", pattern: "fresh" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.met, false);
+
+        // Rotation observed mid-poll: empty file resets the incremental scan.
+        writeFileSync(logPath, "");
+        const r2 = evaluateTrigger(
+            { type: "outputMatch", pattern: "fresh" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r2.met, false);
+
+        // Fresh content written after rotation is scanned from the start.
+        writeFileSync(logPath, "fresh start\n");
+        const r3 = evaluateTrigger(
+            { type: "outputMatch", pattern: "fresh" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r3.met, true);
+
+        // A smaller file after the scan also resets the incremental offset.
+        writeFileSync(logPath, "fresh start\n");
+        const r4 = evaluateTrigger(
+            { type: "outputMatch", pattern: "fresh" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r4.met, false); // nothing new appended
+        appendFileSync(logPath, "more fresh\n");
+        const r5 = evaluateTrigger(
+            { type: "outputMatch", pattern: "fresh" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r5.met, true);
+    });
+
+    void it("counts multiple matches across the scanned region", () => {
+        writeLog(["a", "b", "a"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "a" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.current, 2);
+    });
+
+    void it("reports an error for an invalid pattern", () => {
+        writeLog(["anything"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "(" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+        assert.ok(result.error, "error should be set for invalid regex");
+    });
+});
+
 // ─── error handling ─────────────────────────────────────────────────
 
 void describe("evaluateTrigger — error handling", () => {
     void it("throws on non-existent PID for fs-backed triggers", () => {
         const a = acc();
         assert.throws(() => {
-            evaluateTrigger(
-                { type: "rssKb", value: 1 },
-                999999999,
-                logPath,
-                a
-            );
+            evaluateTrigger({ type: "rssKb", value: 1 }, 999999999, logPath, a);
         });
     });
 

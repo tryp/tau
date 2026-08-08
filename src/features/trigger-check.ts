@@ -18,6 +18,10 @@ export interface TriggerAccum {
     prevLines: number;
     ioBlockStartMs: number | undefined;
     jobStartMs: number;
+    /** Bytes already scanned by an outputMatch trigger (incremental scan). */
+    matchPrevSize: number;
+    /** Tail of the previously scanned region, retained for boundary matches. */
+    matchTail: string;
 }
 
 export function makeTriggerAccum(): TriggerAccum {
@@ -26,6 +30,8 @@ export function makeTriggerAccum(): TriggerAccum {
         prevLines: 0,
         ioBlockStartMs: undefined,
         jobStartMs: Date.now(),
+        matchPrevSize: 0,
+        matchTail: "",
     };
 }
 
@@ -34,6 +40,8 @@ export function makeTriggerAccum(): TriggerAccum {
 export interface TriggerResult {
     met: boolean;
     current: number;
+    /** Set when the trigger could not be evaluated (e.g. invalid pattern). */
+    error?: string;
 }
 
 /**
@@ -61,19 +69,32 @@ export function evaluateTrigger(
             // acceptable. The 64 KiB tail is the worst case; most logs are
             // much smaller.
             const size = statSync(logPath).size;
-            if (size === 0) { acc.prevSize = 0; acc.prevLines = 0; break; }
+            if (size === 0) {
+                acc.prevSize = 0;
+                acc.prevLines = 0;
+                break;
+            }
 
             // If the log was rotated (size decreased), reset counters to
             // avoid overcounting lines from the old log file.
-            if (size < acc.prevSize) { acc.prevSize = 0; acc.prevLines = 0; }
+            if (size < acc.prevSize) {
+                acc.prevSize = 0;
+                acc.prevLines = 0;
+            }
             acc.prevSize = size;
 
             const readLen = Math.min(size, 65536);
             const buf = Buffer.alloc(readLen);
             const fd = openSync(logPath, "r");
-            let bytes = 0;
+            let bytes: number;
             try {
-                bytes = readSync(fd, buf, 0, readLen, Math.max(0, size - readLen));
+                bytes = readSync(
+                    fd,
+                    buf,
+                    0,
+                    readLen,
+                    Math.max(0, size - readLen)
+                );
             } finally {
                 closeSync(fd);
             }
@@ -155,6 +176,73 @@ export function evaluateTrigger(
         case "wallTime": {
             current = Math.floor((Date.now() - acc.jobStartMs) / 1000);
             if (current >= trigger.value) met = true;
+            break;
+        }
+
+        case "outputMatch": {
+            // Incremental scan: read only the bytes appended since the last
+            // poll, retaining the previous chunk's tail so patterns that span
+            // chunk boundaries still match. I/O stays proportional to output
+            // rate instead of total log size, so a long-running job with a
+            // huge log doesn't make the monitor re-read the whole file.
+            let size: number;
+            try {
+                size = statSync(logPath).size;
+            } catch {
+                // Log not readable yet (or removed) — keep the trigger pending.
+                break;
+            }
+            if (size === 0) {
+                acc.matchPrevSize = 0;
+                acc.matchTail = "";
+                break;
+            }
+            // Log rotated or truncated (size decreased): restart the scan.
+            if (size < acc.matchPrevSize) {
+                acc.matchPrevSize = 0;
+                acc.matchTail = "";
+            }
+            if (size === acc.matchPrevSize) {
+                // Nothing new since the last poll.
+                break;
+            }
+
+            const readLen = size - acc.matchPrevSize;
+            const buf = Buffer.alloc(readLen);
+            const fd = openSync(logPath, "r");
+            let bytes: number;
+            try {
+                bytes = readSync(fd, buf, 0, readLen, acc.matchPrevSize);
+            } finally {
+                closeSync(fd);
+            }
+            const chunk = buf.toString("utf-8", 0, bytes);
+            acc.matchPrevSize = size;
+
+            // Retain a bounded tail of scanned content for boundary matches.
+            const BOUNDARY_WINDOW = 4096;
+            const searchText = acc.matchTail + chunk;
+            acc.matchTail = searchText.slice(-BOUNDARY_WINDOW);
+
+            try {
+                // JavaScript regex, matching the common tool-surface
+                // language (jobs output grep). Case-insensitive by default
+                // (caseSensitive defaults to false); the multiline flag
+                // keeps ^/$ line-anchored like the per-line grep tools.
+                const flags = trigger.caseSensitive ? "gm" : "gim";
+                const matches =
+                    searchText.match(new RegExp(trigger.pattern, flags)) ?? [];
+                current = matches.length;
+                if (current > 0) met = true;
+            } catch {
+                // Invalid pattern — surface an error so the agent learns the
+                // regex is bad instead of silently never firing.
+                return {
+                    met: false,
+                    current: 0,
+                    error: `invalid regex /${trigger.pattern}/`,
+                };
+            }
             break;
         }
     }
