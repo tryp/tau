@@ -54,7 +54,7 @@ function acc(overrides: Partial<TriggerAccum> = {}): TriggerAccum {
         ioBlockStartMs: undefined,
         jobStartMs: Date.now(),
         matchPrevSize: 0,
-        matchTail: "",
+        matchTail: Buffer.alloc(0),
         ...overrides,
     };
 }
@@ -747,6 +747,74 @@ void describe("evaluateTrigger — outputMatch", () => {
             elapsed < 1000,
             `literal search took ${elapsed}ms, expected < 1000ms`
         );
+    });
+
+    void it("matches multi-byte UTF-8 characters split across write boundaries", () => {
+        // Regression: the retained tail was a decoded string slice, so when
+        // a write boundary cut a multi-byte character mid-sequence, both
+        // halves decoded to U+FFFD and a non-ASCII pattern matching across
+        // the boundary could never fire. The tail is now retained as raw
+        // bytes and joined with the chunk before decoding, so the split
+        // character reassembles correctly.
+        // 日 = E6 97 A5 (3 bytes). Poll 1 ends with its first 2 bytes; poll
+        // 2 appends the last byte plus a complete 本 (E6 9C AC).
+        writeFileSync(
+            logPath,
+            Buffer.concat([
+                Buffer.alloc(4085, 0x41), // 4085 ASCII 'A's
+                Buffer.from([0xe6, 0x97]), // first 2 bytes of 日
+            ])
+        );
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputMatch", pattern: "日本" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.met, false);
+
+        appendFileSync(
+            logPath,
+            Buffer.from([0xa5, 0xe6, 0x9c, 0xac]) // rest of 日 + 本
+        );
+        const r2 = evaluateTrigger(
+            { type: "outputMatch", pattern: "日本" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r2.met, true, "char split across polls must still match");
+    });
+
+    void it("still matches ASCII patterns when a chunk starts mid-character", () => {
+        // A chunk beginning with the tail bytes of a split multi-byte char
+        // must not corrupt matching of subsequent ASCII content.
+        writeFileSync(
+            logPath,
+            Buffer.concat([
+                Buffer.alloc(4085, 0x41),
+                Buffer.from([0xe6, 0x97]), // 日 split: first 2 bytes
+            ])
+        );
+        const a = acc();
+        evaluateTrigger(
+            { type: "outputMatch", pattern: "日" },
+            process.pid,
+            logPath,
+            a
+        );
+        appendFileSync(
+            logPath,
+            Buffer.from([0xa5, 0x45, 0x52, 0x52, 0x4f, 0x52]) // 日 tail + "ERROR"
+        );
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "ERROR" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
     });
 });
 

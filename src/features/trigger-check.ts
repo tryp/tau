@@ -20,6 +20,15 @@ import type { JobTrigger } from "../types.ts";
 const MAX_OUTPUT_MATCH_DELTA = 4 * 1024 * 1024;
 
 /**
+ * Bytes of previously scanned content retained across polls so patterns
+ * spanning a write boundary still match. Retained as raw bytes: the tail
+ * is concatenated with the new chunk and decoded as one contiguous
+ * buffer, so a multi-byte UTF-8 character split by the boundary decodes
+ * correctly instead of becoming U+FFFD on both sides.
+ */
+const BOUNDARY_WINDOW = 4096;
+
+/**
  * Regex metacharacters that force a pattern through the RegExp engine.
  * Patterns without any of these are matched literally (case-folded
  * `includes`), which is O(n) and cannot trigger catastrophic
@@ -42,7 +51,7 @@ export interface TriggerAccum {
     /** Bytes already scanned by an outputMatch trigger (incremental scan). */
     matchPrevSize: number;
     /** Tail of the previously scanned region, retained for boundary matches. */
-    matchTail: string;
+    matchTail: Buffer;
 }
 
 export function makeTriggerAccum(jobStartMs = Date.now()): TriggerAccum {
@@ -52,7 +61,7 @@ export function makeTriggerAccum(jobStartMs = Date.now()): TriggerAccum {
         ioBlockStartMs: undefined,
         jobStartMs,
         matchPrevSize: 0,
-        matchTail: "",
+        matchTail: Buffer.alloc(0),
     };
 }
 
@@ -223,13 +232,13 @@ export function evaluateTrigger(
             }
             if (size === 0) {
                 acc.matchPrevSize = 0;
-                acc.matchTail = "";
+                acc.matchTail = Buffer.alloc(0);
                 break;
             }
             // Log rotated or truncated (size decreased): restart the scan.
             if (size < acc.matchPrevSize) {
                 acc.matchPrevSize = 0;
-                acc.matchTail = "";
+                acc.matchTail = Buffer.alloc(0);
             }
             if (size === acc.matchPrevSize) {
                 // Nothing new since the last poll.
@@ -251,13 +260,18 @@ export function evaluateTrigger(
             } finally {
                 closeSync(fd);
             }
-            const chunk = buf.toString("utf-8", 0, bytes);
+            const chunkBytes = buf.subarray(0, bytes);
             acc.matchPrevSize = size;
 
-            // Retain a bounded tail of scanned content for boundary matches.
-            const BOUNDARY_WINDOW = 4096;
-            const searchText = acc.matchTail + chunk;
-            acc.matchTail = searchText.slice(-BOUNDARY_WINDOW);
+            // Join the retained tail with the new chunk as one contiguous
+            // byte range and decode together: a UTF-8 character whose bytes
+            // straddle the write boundary then decodes correctly. Retain a
+            // bounded byte tail of the joined region for the next poll.
+            const searchBytes = Buffer.concat([acc.matchTail, chunkBytes]);
+            const searchText = searchBytes.toString("utf-8");
+            acc.matchTail = searchBytes.subarray(
+                Math.max(0, searchBytes.length - BOUNDARY_WINDOW)
+            );
 
             try {
                 if (isLiteralPattern(trigger.pattern)) {
