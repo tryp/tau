@@ -39,7 +39,10 @@ import {
 import { purgeSidecar, registerBackgroundJobs } from "./features/background.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
-import { registerPlanMode, PLAN_MODE_TIMEOUT_MS } from "./features/plan-mode.ts";
+import {
+    registerPlanMode,
+    PLAN_MODE_TIMEOUT_MS,
+} from "./features/plan-mode.ts";
 import { cancelPlanMode } from "./features/plan-tools.ts";
 import { getPlanFilePath } from "./features/plan-file.ts";
 import {
@@ -97,64 +100,77 @@ export default function (pi: ExtensionAPI) {
 
     // ── Compact renderer for job-completion messages ──────────────────
 
-    pi.registerMessageRenderer("job-completion", (message, _options, _theme) => {
-        const d = message.details as Record<string, unknown>;
-        const batch = d?.batch as
-            | Array<{
-                  jobId: string;
-                  status: string;
-                  exitCode?: number;
-                  duration: string;
-                  command: string;
-                  logPath: string;
-              }>
-            | undefined;
+    pi.registerMessageRenderer(
+        "job-completion",
+        (message, _options, _theme) => {
+            const d = message.details as Record<string, unknown>;
+            const batch = d?.batch as
+                | Array<{
+                      jobId: string;
+                      status: string;
+                      exitCode?: number;
+                      duration: string;
+                      command: string;
+                      logPath: string;
+                  }>
+                | undefined;
 
-        if (batch && batch.length > 1) {
-            // Aggregated batch format
-            const completed = batch.filter((b) => b.status === "completed");
-            const failed = batch.filter((b) => b.status !== "completed");
-            const parts: string[] = [];
-            if (completed.length > 0) parts.push(`${completed.length} completed`);
-            if (failed.length > 0) parts.push(`${failed.length} failed`);
+            if (batch && batch.length > 1) {
+                // Aggregated batch format
+                const completed = batch.filter((b) => b.status === "completed");
+                const failed = batch.filter((b) => b.status !== "completed");
+                const parts: string[] = [];
+                if (completed.length > 0)
+                    parts.push(`${completed.length} completed`);
+                if (failed.length > 0) parts.push(`${failed.length} failed`);
+                const suffix =
+                    ((d?.outstandingJobs as number) ?? 0) > 0
+                        ? ` (${(d?.outstandingJobs as number) ?? 0} jobs outstanding)`
+                        : "";
+                const header = `🏁 ${parts.join(", ")}${suffix}`;
+                const lines = batch.map(
+                    (b) =>
+                        `  ${b.status === "completed" ? "✅" : "❌"} ${b.jobId} ${b.status} (${b.duration})${
+                            b.exitCode !== undefined
+                                ? `, exit ${b.exitCode}`
+                                : ""
+                        }`
+                );
+                return new Text(`${header}\n${lines.join("\n")}`, 0, 0);
+            }
+
+            // Individual format
+            const emoji =
+                batch && batch.length === 1
+                    ? batch[0].status === "completed"
+                        ? "✅"
+                        : "❌"
+                    : d?.status === "completed"
+                      ? "✅"
+                      : "❌";
+            const jobId = batch?.[0]?.jobId ?? (d?.jobId as string) ?? "";
+            const status = batch?.[0]?.status ?? (d?.status as string) ?? "";
+            const duration =
+                batch?.[0]?.duration ?? (d?.duration as string) ?? "";
+            const exitCode =
+                batch?.[0]?.exitCode ?? (d?.exitCode as number | undefined);
+            const command = batch?.[0]?.command ?? (d?.command as string) ?? "";
+            const logPath = batch?.[0]?.logPath ?? (d?.logPath as string) ?? "";
             const suffix =
                 ((d?.outstandingJobs as number) ?? 0) > 0
-                    ? ` (${d!.outstandingJobs} jobs outstanding)`
+                    ? ` (${(d?.outstandingJobs as number) ?? 0} jobs outstanding)`
                     : "";
-            const header = `🏁 ${parts.join(", ")}${suffix}`;
-            const lines = batch.map(
-                (b) =>
-                    `  ${b.status === "completed" ? "✅" : "❌"} ${b.jobId} ${b.status} (${b.duration})${
-                        b.exitCode !== undefined ? `, exit ${b.exitCode}` : ""
-                    }`
-            );
-            return new Text(`${header}\n${lines.join("\n")}`, 0, 0);
+            const lines: string[] = [
+                `${emoji} ${jobId} ${status} (${duration})${suffix}`,
+                `   Command: ${command}`,
+                `   Output: ${logPath}`,
+            ];
+            if (exitCode !== undefined) {
+                lines.push(`   Exit code: ${exitCode}`);
+            }
+            return new Text(lines.join("\n"), 0, 0);
         }
-
-        // Individual format
-        const emoji = batch && batch.length === 1
-            ? (batch[0].status === "completed" ? "✅" : "❌")
-            : (d?.status === "completed" ? "✅" : "❌");
-        const jobId = batch?.[0]?.jobId ?? (d?.jobId as string) ?? "";
-        const status = batch?.[0]?.status ?? (d?.status as string) ?? "";
-        const duration = batch?.[0]?.duration ?? (d?.duration as string) ?? "";
-        const exitCode = batch?.[0]?.exitCode ?? (d?.exitCode as number | undefined);
-        const command = batch?.[0]?.command ?? (d?.command as string) ?? "";
-        const logPath = batch?.[0]?.logPath ?? (d?.logPath as string) ?? "";
-        const suffix =
-            ((d?.outstandingJobs as number) ?? 0) > 0
-                ? ` (${d!.outstandingJobs} jobs outstanding)`
-                : "";
-        const lines: string[] = [
-            `${emoji} ${jobId} ${status} (${duration})${suffix}`,
-            `   Command: ${command}`,
-            `   Output: ${logPath}`,
-        ];
-        if (exitCode !== undefined) {
-            lines.push(`   Exit code: ${exitCode}`);
-        }
-        return new Text(lines.join("\n"), 0, 0);
-    });
+    );
 
     // ── Register all features ─────────────────────────────────────────
 
@@ -230,7 +246,7 @@ export default function (pi: ExtensionAPI) {
     pi.on("agent_start", async (_event, ctx) => {
         startTitlebarSpinner(pi, state, ctx);
         state.agentStartTime = Date.now();
-        startAgentTimer(state, ctx);
+        if (ctx.hasUI) startAgentTimer(state, ctx);
     });
 
     pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult> => {
@@ -261,7 +277,8 @@ export default function (pi: ExtensionAPI) {
             }
             return {
                 block: true,
-                reason: "Agent is backgrounded. Run any bash command to auto-resume, " +
+                reason:
+                    "Agent is backgrounded. Run any bash command to auto-resume, " +
                     "or use Ctrl+B or /bg to resume.",
             };
         }
@@ -349,7 +366,7 @@ export default function (pi: ExtensionAPI) {
 
     pi.on("turn_start", async (_event, ctx) => {
         if (state.agentStartTime !== undefined && !state.agentTimer)
-            startAgentTimer(state, ctx);
+            if (ctx.hasUI) startAgentTimer(state, ctx);
 
         // First user interaction — clear the shortcut hint from status bar
         if (!state.hasInteracted) {
