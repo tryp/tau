@@ -845,7 +845,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             "When used with jobId, triggers can be subscribed on the running job to fire async events " +
             "when conditions like outputLines, rssKb, cpuTime, or wallTime are met. " +
             "outputMatch fires when a regex pattern appears in the job's log " +
-            "(case-insensitive by default, like jobs output grep).",
+            "(case-insensitive by default, like jobs output grep; the fired message " +
+            "includes the first matching line, so you can usually skip re-grepping the log).",
         promptSnippet: "Schedule, list, or cancel callbacks",
         promptGuidelines: [
             "Use remind when you promise to check on something later.",
@@ -936,7 +937,8 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                                 description:
                                     "JavaScript regular expression matched against the job log, " +
                                     "the same regex language as the rest of the agent tool surfaces " +
-                                    "(e.g. jobs output grep). Keep patterns simple: literal " +
+                                    "(e.g. jobs output grep). Multiline: ^ and $ match line " +
+                                    "starts/ends, like per-line grep. Keep patterns simple: literal " +
                                     "substrings are matched directly and safely, but pathological " +
                                     "regexes (nested quantifiers like (a+)+b) can stall the monitor.",
                             }),
@@ -958,8 +960,11 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                         description:
                             "Optional triggers to subscribe on the linked job. " +
                             "Requires jobId. Monitored alongside any triggers already set on the job. " +
+                            "Triggers are one-shot: each fires at most once and is removed, so " +
+                            "resubscribe to monitor for further occurrences. " +
                             'Example: [{type:"outputLines",value:200}] notifies when log has 200+ lines; ' +
-                            '[{type:"outputMatch",pattern:"ERROR"}] notifies when the log contains ERROR.',
+                            '[{type:"outputMatch",pattern:"ERROR"}] notifies when the log contains ' +
+                            "ERROR (the fired message includes the matching line).",
                     }
                 )
             ),

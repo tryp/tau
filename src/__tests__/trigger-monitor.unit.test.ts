@@ -167,6 +167,15 @@ void describe("startTriggerMonitor", () => {
 
             assert.equal(sent[0].customType, "bg-trigger");
             assert.match(sent[0].content, /server ready/);
+            assert.match(
+                sent[0].content,
+                /Matched: server ready/,
+                "fired message should carry the matching line"
+            );
+            assert.equal(
+                (sent[0].details as { matchText?: string }).matchText,
+                "server ready"
+            );
             assert.equal(job.triggers, undefined, "trigger should be removed");
 
             // Nothing further fires after the one-shot consumed the trigger.

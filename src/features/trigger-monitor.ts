@@ -87,13 +87,16 @@ export function startTriggerMonitor(
                 if (result.met || result.error) {
                     const suffix = outstandingJobsSuffix(state, job.id);
                     const errorPart = result.error ? ` — ${result.error}` : "";
+                    const matchPart = result.matchText
+                        ? `\nMatched: ${result.matchText}`
+                        : "";
                     pi.sendMessage(
                         {
                             customType: "bg-trigger",
                             content:
                                 `\u26a1 ${job.id} trigger: ${triggerLabel(t)} ` +
                                 `(current: ${result.current})${errorPart}${suffix}\n` +
-                                `Command: ${job.command}\nLog: ${job.logPath}`,
+                                `Command: ${job.command}\nLog: ${job.logPath}${matchPart}`,
                             display: true,
                             details: {
                                 jobId: job.id,
@@ -103,6 +106,7 @@ export function startTriggerMonitor(
                                         ? t.pattern
                                         : t.value,
                                 current: result.current,
+                                matchText: result.matchText,
                                 error: result.error,
                             },
                         },

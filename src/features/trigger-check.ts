@@ -37,8 +37,69 @@ const BOUNDARY_WINDOW = 4096;
  */
 const REGEX_METACHARS = /[.\\^$*+?()[\]{}|]/;
 
+/**
+ * Max length of the matched line carried in a fired trigger message. The
+ * line is truncated around the match so the agent sees the relevant
+ * region without the message ballooning on a single enormous log line.
+ */
+const MATCH_LINE_MAX = 200;
+
 function isLiteralPattern(pattern: string): boolean {
     return !REGEX_METACHARS.test(pattern);
+}
+
+/** Escape a string so it is matched literally by a RegExp. */
+function escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Index of the first match of `pattern` in `searchText`, or -1. For
+ * literal patterns the case-insensitive lookup uses an escaped-literal
+ * regex: it cannot backtrack (no quantifiers), so it stays O(n) while
+ * still returning the index on the *original* text (case-folded
+ * indexOf offsets drift on some Unicode input).
+ */
+function firstMatchIndex(
+    searchText: string,
+    pattern: string,
+    caseSensitive: boolean
+): number {
+    if (isLiteralPattern(pattern)) {
+        if (caseSensitive) return searchText.indexOf(pattern);
+        return searchText.search(new RegExp(escapeRegExp(pattern), "i"));
+    }
+    const flags = caseSensitive ? "gm" : "gim";
+    const m = searchText.matchAll(new RegExp(pattern, flags)).next().value;
+    return m ? m.index : -1;
+}
+
+/**
+ * Extract the line containing `matchIndex`, truncated around the match
+ * to at most MATCH_LINE_MAX chars (with ellipses on the cut sides).
+ */
+function extractMatchLine(
+    searchText: string,
+    matchIndex: number
+): string | undefined {
+    if (matchIndex < 0) return undefined;
+    const lineStart = searchText.lastIndexOf("\n", matchIndex) + 1;
+    let lineEnd = searchText.indexOf("\n", matchIndex);
+    if (lineEnd === -1) lineEnd = searchText.length;
+    let line = searchText.slice(lineStart, lineEnd);
+    if (line.length > MATCH_LINE_MAX) {
+        const rel = matchIndex - lineStart;
+        const half = Math.floor((MATCH_LINE_MAX - 1) / 2);
+        const start = Math.max(0, rel - half);
+        const fullLen = line.length;
+        const end = Math.min(
+            fullLen,
+            start + MATCH_LINE_MAX - (start > 0 ? 1 : 0)
+        );
+        line = (start > 0 ? "…" : "") + line.slice(start, end);
+        if (end < fullLen) line += "…";
+    }
+    return line;
 }
 
 // ─── Accumulator ────────────────────────────────────────────────────
@@ -72,6 +133,12 @@ export interface TriggerResult {
     current: number;
     /** Set when the trigger could not be evaluated (e.g. invalid pattern). */
     error?: string;
+    /**
+     * First matching line (truncated around the match) for outputMatch,
+     * carried in the fired message so the agent can often skip re-grepping
+     * the log. Absent for numeric triggers and non-fires.
+     */
+    matchText?: string;
 }
 
 /**
@@ -91,6 +158,7 @@ export function evaluateTrigger(
 ): TriggerResult {
     let met = false;
     let current = 0;
+    let matchText: string | undefined;
 
     switch (trigger.type) {
         case "outputLines": {
@@ -296,7 +364,19 @@ export function evaluateTrigger(
                         searchText.match(new RegExp(trigger.pattern, flags))
                             ?.length ?? 0;
                 }
-                if (current > 0) met = true;
+                if (current > 0) {
+                    met = true;
+                    // Only locate the match on the firing poll — the extra
+                    // pass costs nothing on the rare turn that fires.
+                    matchText = extractMatchLine(
+                        searchText,
+                        firstMatchIndex(
+                            searchText,
+                            trigger.pattern,
+                            trigger.caseSensitive ?? false
+                        )
+                    );
+                }
             } catch {
                 // Invalid pattern — surface an error so the agent learns the
                 // regex is bad instead of silently never firing.
@@ -310,5 +390,5 @@ export function evaluateTrigger(
         }
     }
 
-    return { met, current };
+    return { met, current, matchText };
 }

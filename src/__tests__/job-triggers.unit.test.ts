@@ -816,9 +816,90 @@ void describe("evaluateTrigger — outputMatch", () => {
         );
         assert.equal(result.met, true);
     });
-});
 
-// ─── error handling ─────────────────────────────────────────────────
+    void it("includes the first matching line in matchText with original case", () => {
+        writeLog(["Benchmark COMPLETE in 4m33s"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "benchmark complete" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.matchText, "Benchmark COMPLETE in 4m33s");
+    });
+
+    void it("carries the matching line for regex (metachar) patterns", () => {
+        writeLog(["checkpoint alpha reached"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "alpha|beta" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.matchText, "checkpoint alpha reached");
+    });
+
+    void it("keeps original case for caseSensitive literal matches", () => {
+        writeLog(["Server READY now"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            {
+                type: "outputMatch",
+                pattern: "READY",
+                caseSensitive: true,
+            },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.matchText, "Server READY now");
+    });
+
+    void it("truncates a very long matching line around the match", () => {
+        const before = "x".repeat(250);
+        const after = "y".repeat(150);
+        writeFileSync(logPath, `${before}NEEDLE${after}\n`);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "NEEDLE" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.ok(result.matchText !== undefined, "matchText should be set");
+        assert.ok(
+            result.matchText.length <= 201,
+            `truncated line too long: ${result.matchText.length}`
+        );
+        assert.ok(
+            result.matchText.includes("NEEDLE"),
+            "match must stay visible in the truncated line"
+        );
+        assert.ok(
+            result.matchText.startsWith("…") && result.matchText.endsWith("…"),
+            "both cut sides should carry an ellipsis"
+        );
+    });
+
+    void it("leaves matchText undefined when there is no match", () => {
+        writeLog(["nothing", "to see here"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "ERROR|FAILED" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+        assert.equal(result.matchText, undefined);
+    });
+});
 
 void describe("evaluateTrigger — error handling", () => {
     void it("throws on non-existent PID for fs-backed triggers", () => {
