@@ -19,6 +19,19 @@ import type { JobTrigger } from "../types.ts";
  */
 const MAX_OUTPUT_MATCH_DELTA = 4 * 1024 * 1024;
 
+/**
+ * Regex metacharacters that force a pattern through the RegExp engine.
+ * Patterns without any of these are matched literally (case-folded
+ * `includes`), which is O(n) and cannot trigger catastrophic
+ * backtracking — a pathological agent pattern must not be able to stall
+ * the agent's own event loop.
+ */
+const REGEX_METACHARS = /[.\\^$*+?()[\]{}|]/;
+
+function isLiteralPattern(pattern: string): boolean {
+    return !REGEX_METACHARS.test(pattern);
+}
+
 // ─── Accumulator ────────────────────────────────────────────────────
 
 export interface TriggerAccum {
@@ -74,7 +87,7 @@ export function evaluateTrigger(
         case "outputLines": {
             // Uses sync I/O intentionally — this runs in a timer callback
             // outside the agent loop, so blocking the event loop briefly is
-            // acceptable. The 64 KiB tail is the worst case; most logs are
+            // acceptable. The 64 KiB read is the worst case; most logs are
             // much smaller.
             const size = statSync(logPath).size;
             if (size === 0) {
@@ -89,26 +102,34 @@ export function evaluateTrigger(
                 acc.prevSize = 0;
                 acc.prevLines = 0;
             }
-            acc.prevSize = size;
 
-            const readLen = Math.min(size, 65536);
+            // Count only the newlines appended since the last poll, not the
+            // whole (overlapping) read window — adding the window total each
+            // poll made prevLines grow super-linearly, firing outputLines
+            // triggers far below their real threshold.
+            //
+            // The per-poll read is capped at 64 KiB: prevSize advances by
+            // bytes actually read, so a growth burst larger than the window
+            // is counted exactly across subsequent polls.
+            if (size === acc.prevSize) {
+                // Nothing new since the last poll — report the running total.
+                current = acc.prevLines;
+                if (current >= trigger.value) met = true;
+                break;
+            }
+            const readLen = Math.min(size - acc.prevSize, 65536);
             const buf = Buffer.alloc(readLen);
             const fd = openSync(logPath, "r");
             let bytes: number;
             try {
-                bytes = readSync(
-                    fd,
-                    buf,
-                    0,
-                    readLen,
-                    Math.max(0, size - readLen)
-                );
+                bytes = readSync(fd, buf, 0, readLen, acc.prevSize);
             } finally {
                 closeSync(fd);
             }
             const tailStr = buf.toString("utf-8", 0, bytes);
             const newlines = (tailStr.match(/\n/g) || []).length;
             acc.prevLines += Math.max(0, newlines);
+            acc.prevSize += bytes;
             current = acc.prevLines;
             if (current >= trigger.value) met = true;
             break;
@@ -239,14 +260,28 @@ export function evaluateTrigger(
             acc.matchTail = searchText.slice(-BOUNDARY_WINDOW);
 
             try {
-                // JavaScript regex, matching the common tool-surface
-                // language (jobs output grep). Case-insensitive by default
-                // (caseSensitive defaults to false); the multiline flag
-                // keeps ^/$ line-anchored like the per-line grep tools.
-                const flags = trigger.caseSensitive ? "gm" : "gim";
-                const matches =
-                    searchText.match(new RegExp(trigger.pattern, flags)) ?? [];
-                current = matches.length;
+                if (isLiteralPattern(trigger.pattern)) {
+                    // Literal fast-path: O(n) case-folded search. Literal
+                    // patterns are the common case ("ERROR", "server
+                    // ready") and cannot trigger catastrophic backtracking.
+                    const haystack = trigger.caseSensitive
+                        ? searchText
+                        : searchText.toLowerCase();
+                    const needle = trigger.caseSensitive
+                        ? trigger.pattern
+                        : trigger.pattern.toLowerCase();
+                    current = haystack.split(needle).length - 1;
+                } else {
+                    // JavaScript regex, matching the common tool-surface
+                    // language (jobs output grep). Case-insensitive by
+                    // default (caseSensitive defaults to false); the
+                    // multiline flag keeps ^/$ line-anchored like the
+                    // per-line grep tools.
+                    const flags = trigger.caseSensitive ? "gm" : "gim";
+                    current =
+                        searchText.match(new RegExp(trigger.pattern, flags))
+                            ?.length ?? 0;
+                }
                 if (current > 0) met = true;
             } catch {
                 // Invalid pattern — surface an error so the agent learns the

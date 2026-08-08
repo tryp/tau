@@ -11,7 +11,13 @@ import {
     evaluateTrigger,
     type TriggerAccum,
 } from "../features/trigger-check.ts";
-import { writeFileSync, unlinkSync, mkdtempSync, statSync } from "node:fs";
+import {
+    writeFileSync,
+    unlinkSync,
+    mkdtempSync,
+    statSync,
+    appendFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -169,6 +175,80 @@ void describe("evaluateTrigger — outputLines", () => {
             a
         );
         assert.equal(r2.current, 0);
+    });
+
+    void it("counts lines incrementally without double-counting across polls", () => {
+        // Regression: the old code added the whole window's newline count
+        // each poll, so a 50-line log reported 50, then 105, then 165 — an
+        // outputLines=100 trigger fired at ~55 real lines.
+        writeLog(["0", "1", "2"]);
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputLines", value: 5 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.current, 3);
+
+        appendFileSync(logPath, "3\n4\n");
+        const r2 = evaluateTrigger(
+            { type: "outputLines", value: 5 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r2.met, true);
+        assert.equal(r2.current, 5, "cumulative, not re-counted");
+
+        // A poll with no growth must not re-count existing lines.
+        const r3 = evaluateTrigger(
+            { type: "outputLines", value: 100 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r3.current, 5, "no re-count when nothing was appended");
+    });
+
+    void it("counts lines exactly when growth exceeds the read window", () => {
+        // A single burst larger than the 64 KiB per-poll window must still
+        // reach the exact total across the polls that cover it.
+        writeLog(["start"]);
+        const a = acc();
+        const r1 = evaluateTrigger(
+            { type: "outputLines", value: 999_999 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r1.current, 1);
+
+        const count = 10_000; // ~110 KiB of lines
+        appendFileSync(
+            logPath,
+            Array.from({ length: count }, (_, i) => `line-${i}`).join("\n") +
+                "\n"
+        );
+        const r2 = evaluateTrigger(
+            { type: "outputLines", value: count + 1 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(
+            r2.met,
+            false,
+            "first window covers only part of the burst"
+        );
+        const r3 = evaluateTrigger(
+            { type: "outputLines", value: count + 1 },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(r3.met, true);
+        assert.equal(r3.current, count + 1, "exact total across windows");
     });
 });
 
@@ -567,6 +647,106 @@ void describe("evaluateTrigger — outputMatch", () => {
             "pattern at the tail of a huge delta must match"
         );
         assert.equal(a.matchPrevSize, statSync(logPath).size);
+    });
+
+    void it("matches literal patterns without the regex engine (fast path)", () => {
+        writeLog(["build complete", "ERROR: oops"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "ERROR: oops" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.current, 1);
+    });
+
+    void it("literal fast-path is case-insensitive by default", () => {
+        writeLog(["Server READY"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "server ready" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+    });
+
+    void it("literal fast-path respects caseSensitive: true", () => {
+        writeLog(["Server READY"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            {
+                type: "outputMatch",
+                pattern: "server ready",
+                caseSensitive: true,
+            },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+    });
+
+    void it("counts literal occurrences across the scanned region", () => {
+        writeLog(["a", "b", "a"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "a" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, true);
+        assert.equal(result.current, 2);
+    });
+
+    void it("routes metacharacter patterns through the regex engine", () => {
+        // "a(b" is invalid as a regex; a literal search would never error,
+        // so the error proves the metacharacter detection works.
+        writeLog(["anything"]);
+        const a = acc();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "a(b" },
+            process.pid,
+            logPath,
+            a
+        );
+        assert.equal(result.met, false);
+        assert.ok(
+            result.error,
+            "regex path must surface invalid-pattern errors"
+        );
+    });
+
+    void it("literal fast-path cannot stall on pathological input", () => {
+        // A huge single-character run with a literal pattern must complete
+        // promptly. The regex equivalent (e.g. (a+)+b) hangs indefinitely on
+        // input like this, so this guards the fast path from regressing.
+        writeLog(["start"]);
+        const a = acc();
+        evaluateTrigger(
+            { type: "outputMatch", pattern: "start" },
+            process.pid,
+            logPath,
+            a
+        );
+        appendFileSync(logPath, "a".repeat(2 * 1024 * 1024) + "needle\n");
+        const t0 = Date.now();
+        const result = evaluateTrigger(
+            { type: "outputMatch", pattern: "needle" },
+            process.pid,
+            logPath,
+            a
+        );
+        const elapsed = Date.now() - t0;
+        assert.equal(result.met, true);
+        assert.ok(
+            elapsed < 1000,
+            `literal search took ${elapsed}ms, expected < 1000ms`
+        );
     });
 });
 

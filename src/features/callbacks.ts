@@ -936,7 +936,9 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                                 description:
                                     "JavaScript regular expression matched against the job log, " +
                                     "the same regex language as the rest of the agent tool surfaces " +
-                                    "(e.g. jobs output grep).",
+                                    "(e.g. jobs output grep). Keep patterns simple: literal " +
+                                    "substrings are matched directly and safely, but pathological " +
+                                    "regexes (nested quantifiers like (a+)+b) can stall the monitor.",
                             }),
                             caseSensitive: Type.Optional(
                                 Type.Boolean({
