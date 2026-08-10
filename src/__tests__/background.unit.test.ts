@@ -1458,7 +1458,7 @@ void describe(
 
 // ─── bash tool — foreground completion cleanup ──────────────────────
 
-function captureBashTool(state: TauState) {
+function captureBashTool(state: TauState, toolName = "bash") {
     let captured: {
         execute: (
             toolCallId: string,
@@ -1474,7 +1474,7 @@ function captureBashTool(state: TauState) {
 
     const pi = {
         registerTool(tool: { name: string; execute: unknown }) {
-            if (tool.name === "bash") captured = tool as typeof captured;
+            if (tool.name === toolName) captured = tool as typeof captured;
         },
         registerCommand() {},
         registerToolPromptGuidelines() {},
@@ -1484,6 +1484,65 @@ function captureBashTool(state: TauState) {
     registerBackgroundJobs(pi, state);
     return captured!;
 }
+
+void describe("bash cwd validation", () => {
+    void it("rejects an invalid per-call cwd without spawning a child", async () => {
+        const state = new TauState();
+        const bashTool = captureBashTool(state);
+
+        await assert.rejects(
+            bashTool.execute(
+                "tc-bad-cwd",
+                {
+                    command: "echo should-not-run",
+                    cwd: "/this/directory/does/not/exist/12345",
+                },
+                undefined,
+                undefined,
+                { cwd: process.cwd() }
+            ),
+            /Working directory does not exist or is not a directory/
+        );
+        assert.equal(state.backgroundJobs.size, 0);
+        assert.equal(state.runningProcesses.size, 0);
+    });
+
+    void it("rejects an invalid bash_bg cwd without spawning a child", async () => {
+        const state = new TauState();
+        const bashBgTool = captureBashTool(state, "bash_bg");
+
+        await assert.rejects(
+            bashBgTool.execute(
+                "tc-bg-bad-cwd",
+                {
+                    command: "echo should-not-run",
+                    cwd: "/this/directory/does/not/exist/12345",
+                },
+                undefined,
+                undefined,
+                { cwd: process.cwd() }
+            ),
+            /Working directory does not exist or is not a directory/
+        );
+        assert.equal(state.backgroundJobs.size, 0);
+    });
+
+    void it("resolves relative per-call cwd against the session cwd", async () => {
+        const state = new TauState();
+        const bashTool = captureBashTool(state);
+        const result = await bashTool.execute(
+            "tc-relative-cwd",
+            { command: "pwd", cwd: "." },
+            undefined,
+            undefined,
+            { cwd: "/tmp" }
+        );
+
+        assert.match(result.content[0].text, /^\/tmp\s*$/m);
+        assert.equal(state.backgroundJobs.size, 0);
+        assert.equal(state.runningProcesses.size, 0);
+    });
+});
 
 void describe("bash tool — foreground completion cleanup", () => {
     void it("removes job from backgroundJobs when command completes quickly", async () => {

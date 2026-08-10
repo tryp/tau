@@ -38,6 +38,9 @@ import {
     clearPendingDecision,
     notifyCompletion,
     updateWidget,
+    installSpawnErrorHandler,
+    resolveExecutionCwd,
+    validateWorkingDirectory,
 } from "./background.ts";
 import { trackJobOutputIndex } from "./sidecar.ts";
 
@@ -250,11 +253,14 @@ export function registerAgentBackground(
                 `@${promptFile}`,
             ];
 
+            const execCwd = resolveExecutionCwd(params.cwd, ctx.cwd);
+            validateWorkingDirectory(execCwd);
             const proc = spawn("pi", spawnArgs, {
-                cwd: params.cwd ?? ctx.cwd,
+                cwd: execCwd,
                 detached: true,
                 stdio: ["pipe", "pipe", "pipe"],
             });
+            installSpawnErrorHandler(proc);
 
             if (!proc.pid) {
                 try {

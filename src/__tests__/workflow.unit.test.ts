@@ -375,6 +375,21 @@ void describe("workflow claude-script structure", () => {
 
 // ─── Registration tests ─────────────────────────────────────────────
 
+void describe("workflow executeAgent cwd validation", () => {
+    void it("rejects a missing cwd before spawning pi", async () => {
+        const { executeAgent } = await import("../features/workflow.ts");
+
+        await assert.rejects(
+            executeAgent(
+                "should not spawn",
+                undefined,
+                "/this/directory/does/not/exist/12345"
+            ),
+            /Working directory does not exist or is not a directory/
+        );
+    });
+});
+
 void describe("workflow registration", () => {
     void it("exports registerWorkflow function", async () => {
         const mod = await import("../features/workflow.ts");

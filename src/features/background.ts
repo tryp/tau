@@ -5,7 +5,11 @@
  * and the pill-bar status widget.
  */
 
-import { spawn } from "node:child_process";
+import {
+    spawn,
+    type ChildProcess,
+    type SpawnOptions,
+} from "node:child_process";
 import {
     closeSync,
     existsSync,
@@ -16,7 +20,8 @@ import {
     statSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, resolve as resolvePath } from "node:path";
 
 // ─── Context sidecar integration ────────────────────────────────────
 
@@ -96,6 +101,55 @@ import {
     spawnForegroundTmux,
 } from "./bash-tmux.ts";
 import { captureOutput } from "../tmux.ts";
+
+export function resolveExecutionCwd(
+    perCallCwd: unknown,
+    baseCwd: string
+): string {
+    if (typeof perCallCwd !== "string" || perCallCwd.length === 0) {
+        return baseCwd;
+    }
+    if (perCallCwd === "~") return homedir();
+    if (perCallCwd.startsWith("~/")) {
+        return resolvePath(homedir(), perCallCwd.slice(2));
+    }
+    return resolvePath(baseCwd, perCallCwd);
+}
+
+export function validateWorkingDirectory(cwd: string): void {
+    try {
+        if (!statSync(cwd).isDirectory()) {
+            throw new Error("not a directory");
+        }
+    } catch (error) {
+        throw new Error(
+            `Working directory does not exist or is not a directory: ${cwd}`,
+            { cause: error }
+        );
+    }
+}
+
+export function installSpawnErrorHandler(proc: ChildProcess): void {
+    // A failed spawn emits `error` asynchronously. Callers may inspect pid or
+    // throw before their normal lifecycle handlers are installed, so attach a
+    // listener immediately to prevent an uncaught EventEmitter error.
+    proc.once("error", () => {});
+}
+
+function spawnBashProcess(
+    command: string,
+    cwd: string,
+    options: SpawnOptions
+): ChildProcess {
+    validateWorkingDirectory(cwd);
+    const proc = spawn("bash", ["-c", command], {
+        ...options,
+        cwd,
+        env: options.env ?? { ...process.env },
+    });
+    installSpawnErrorHandler(proc);
+    return proc;
+}
 
 // ─── Kill helpers ───────────────────────────────────────────────────
 
@@ -1109,7 +1163,8 @@ export function registerBackgroundJobs(
             ctx
         ): Promise<AgentToolResult<BashToolDetails | undefined>> {
             const { command, cwd } = params;
-            const execCwd = cwd ?? ctx.cwd;
+            const execCwd = resolveExecutionCwd(cwd, ctx.cwd);
+            validateWorkingDirectory(execCwd);
 
             // Validate: block sleep >= 2s
             const sleepMatch = detectBlockedSleep(command);
@@ -1145,13 +1200,15 @@ export function registerBackgroundJobs(
             mkdirSync(dirname(logPath), { recursive: true });
 
             const logFd = openSync(logPath, "w");
-            const proc = spawn("bash", ["-c", command], {
-                stdio: ["pipe", logFd, logFd],
-                cwd: execCwd,
-                detached: true,
-                env: { ...process.env },
-            });
-            closeSync(logFd);
+            let proc: ChildProcess;
+            try {
+                proc = spawnBashProcess(command, execCwd, {
+                    stdio: ["pipe", logFd, logFd],
+                    detached: true,
+                });
+            } finally {
+                closeSync(logFd);
+            }
 
             if (!proc.pid) {
                 throw new Error("Failed to spawn process");
@@ -1502,12 +1559,14 @@ export function registerBackgroundJobs(
             ctx
         ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             const shouldNotify = params.notify !== false;
+            const execCwd = resolveExecutionCwd(params.cwd, ctx.cwd);
+            validateWorkingDirectory(execCwd);
 
             // ── Tmux path ─────────────────────────────────────────────
             if (state.tmuxAvailable) {
                 const job = spawnBackgroundTmux(
                     params.command,
-                    typeof params.cwd === "string" ? params.cwd : ctx.cwd,
+                    execCwd,
                     toolCallId,
                     state,
                     pi,
@@ -1566,13 +1625,15 @@ export function registerBackgroundJobs(
             const logPath = logPathForJob(jobId);
 
             const logFd = openSync(logPath, "w");
-            const proc = spawn("bash", ["-c", params.command], {
-                stdio: ["pipe", logFd, logFd],
-                cwd: typeof params.cwd === "string" ? params.cwd : ctx.cwd,
-                detached: true,
-                env: { ...process.env },
-            });
-            closeSync(logFd);
+            let proc: ChildProcess;
+            try {
+                proc = spawnBashProcess(params.command, execCwd, {
+                    stdio: ["pipe", logFd, logFd],
+                    detached: true,
+                });
+            } finally {
+                closeSync(logFd);
+            }
 
             if (!proc.pid) {
                 throw new Error("Failed to spawn background process");
@@ -2292,7 +2353,7 @@ async function executeTmuxForeground(
     let tmuxCtx: import("./bash-tmux.ts").TmuxJobContext;
 
     try {
-        const execCwd = typeof params.cwd === "string" ? params.cwd : ctx.cwd;
+        const execCwd = resolveExecutionCwd(params.cwd, ctx.cwd);
         const result = spawnForegroundTmux(command, execCwd);
         logPath = result.logPath;
         tmuxCtx = result.tmuxCtx;

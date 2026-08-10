@@ -50,6 +50,10 @@ import type {
 import { Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
+import {
+    installSpawnErrorHandler,
+    validateWorkingDirectory,
+} from "./background.ts";
 import { killProcessGroup } from "../utils.ts";
 import type {
     WorkflowMeta,
@@ -290,6 +294,7 @@ export async function executeAgent(
     const promptFile = join(tmpdir(), `pi-wf-agent-${id}.md`);
     const logFile = join(tmpdir(), `pi-wf-agent-${id}.log`);
 
+    validateWorkingDirectory(cwd);
     writeFileSync(promptFile, prompt);
 
     const modelArg = model ? ["--model", model] : [];
@@ -328,6 +333,7 @@ export async function executeAgent(
             detached: true,
             stdio: ["ignore", "pipe", "pipe"],
         });
+        installSpawnErrorHandler(proc);
 
         const logStream = createWriteStream(logFile, { flags: "w" });
         let output = "";
