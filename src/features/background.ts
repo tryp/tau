@@ -625,6 +625,8 @@ type PendingCompletionDelivery = {
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 let completionAgentBusy = false;
+let completionLifecycleToken = 0;
+let settledCompletionFlushTimer: NodeJS.Timeout | undefined;
 // Prevent duplicate notifications when both error and close handlers fire.
 const completionNotifiedJobs = new WeakSet<BackgroundJob>();
 // Invalidates asynchronous indexing callbacks after a batch is cleared.
@@ -1100,14 +1102,33 @@ export function registerBackgroundJobs(
         on?: (event: string, handler: (...args: unknown[]) => unknown) => void;
     };
     eventPi.on?.("agent_start", () => {
+        completionLifecycleToken++;
         completionAgentBusy = true;
+        if (settledCompletionFlushTimer) {
+            clearTimeout(settledCompletionFlushTimer);
+            settledCompletionFlushTimer = undefined;
+        }
     });
-    eventPi.on?.("agent_end", () => {
-        completionAgentBusy = false;
-        flushPendingCompletionDeliveries();
+    eventPi.on?.("agent_settled", () => {
+        const token = completionLifecycleToken;
+        if (settledCompletionFlushTimer) return;
+        // agent_settled handlers run before the core finishes returning from
+        // the turn. Defer delivery until the handler stack has unwound so a
+        // triggerTurn message cannot re-enter the settling agent.
+        settledCompletionFlushTimer = setTimeout(() => {
+            settledCompletionFlushTimer = undefined;
+            if (token !== completionLifecycleToken) return;
+            completionAgentBusy = false;
+            flushPendingCompletionDeliveries();
+        }, 0);
     });
     eventPi.on?.("session_shutdown", () => {
+        completionLifecycleToken++;
         completionAgentBusy = false;
+        if (settledCompletionFlushTimer) {
+            clearTimeout(settledCompletionFlushTimer);
+            settledCompletionFlushTimer = undefined;
+        }
         pendingCompletionDeliveries.length = 0;
         clearAllCompletionBatches();
     });

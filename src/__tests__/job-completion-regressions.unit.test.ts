@@ -42,10 +42,17 @@ function registerTestTools(state: TauState): {
     jobs: TestTool;
     pi: { sendMessage(message: unknown): void };
     sentMessages: unknown[];
+    sentMessageOptions: unknown[];
+    invoke: (event: string) => Promise<void>;
 } {
     let jobs: TestTool | undefined;
+    const handlers = new Map<string, () => unknown>();
     const sentMessages: unknown[] = [];
+    const sentMessageOptions: unknown[] = [];
     const pi = {
+        on(event: string, handler: () => unknown) {
+            handlers.set(event, handler);
+        },
         registerTool(tool: { name: string; execute: unknown }) {
             if (tool.name === "jobs") jobs = tool as TestTool;
         },
@@ -53,14 +60,23 @@ function registerTestTools(state: TauState): {
         registerMessageRenderer() {},
         registerToolPromptGuidelines() {},
         createBashTool: () => ({ execute: async () => ({ content: [] }) }),
-        sendMessage(message: unknown) {
+        sendMessage(message: unknown, options: unknown) {
             sentMessages.push(message);
+            sentMessageOptions.push(options);
         },
     } as never;
 
     registerBackgroundJobs(pi, state);
     assert.ok(jobs, "jobs tool must be registered");
-    return { jobs, pi, sentMessages };
+    return {
+        jobs,
+        pi,
+        sentMessages,
+        sentMessageOptions,
+        invoke: async (event: string) => {
+            await handlers.get(event)?.();
+        },
+    };
 }
 
 function notificationContext() {
@@ -108,6 +124,37 @@ void describe("job completion regression coverage", () => {
             0,
             "attach-consumed output must suppress the deferred completion"
         );
+    });
+
+    void it("holds completion delivery until the session is settled", async () => {
+        const state = new TauState();
+        const { pi, sentMessages, sentMessageOptions, invoke } =
+            registerTestTools(state);
+        const job = makeJob({
+            id: "job-settlement-boundary",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+
+        await invoke("agent_start");
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(sentMessages.length, 0);
+
+        await invoke("agent_end");
+        assert.equal(sentMessages.length, 0);
+
+        await invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.equal(sentMessages.length, 1);
+        const message = sentMessages[0] as { customType: string };
+        assert.equal(message.customType, "job-completion");
+        assert.deepEqual(sentMessageOptions[0], {
+            deliverAs: "followUp",
+            triggerTurn: true,
+        });
     });
 
     void it("does not deliver duplicate notifications for one terminal job", async () => {
