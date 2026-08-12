@@ -146,7 +146,9 @@ void describe("job completion regression coverage", () => {
         assert.equal(sentMessages.length, 0);
 
         await invoke("agent_settled");
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        // The flush is deferred by one timer turn; wait for that turn rather
+        // than relying on an arbitrary wall-clock delay.
+        await new Promise((resolve) => setTimeout(resolve, 0));
 
         assert.equal(sentMessages.length, 1);
         const message = sentMessages[0] as { customType: string };
@@ -155,6 +157,50 @@ void describe("job completion regression coverage", () => {
             deliverAs: "followUp",
             triggerTurn: true,
         });
+    });
+
+    void it("does not flush a settled batch into a newer agent run", async () => {
+        const state = new TauState();
+        const { pi, sentMessages, invoke } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-stale-settled-flush",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+
+        await invoke("agent_start");
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        await invoke("agent_settled");
+        // A new run invalidates the old deferred flush. The completion stays
+        // pending and must be delivered only after the newer run settles.
+        await invoke("agent_start");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(sentMessages.length, 0);
+
+        await invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(sentMessages.length, 1);
+    });
+
+    void it("drops deferred completion delivery during shutdown", async () => {
+        const state = new TauState();
+        const { pi, sentMessages, invoke } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-shutdown-settled-flush",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+
+        await invoke("agent_start");
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        await invoke("agent_settled");
+        await invoke("session_shutdown");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(sentMessages.length, 0);
     });
 
     void it("does not deliver duplicate notifications for one terminal job", async () => {
