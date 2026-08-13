@@ -1181,7 +1181,7 @@ void describe(
             ]);
         });
 
-        void it("suppresses successful tmux completions unless wanted", async () => {
+        void it("delivers successful tmux completions when notify is enabled", async () => {
             const state = new TauState();
             const sentMessages: unknown[] = [];
             const pi = {
@@ -1216,8 +1216,8 @@ void describe(
 
             assert.equal(
                 sentMessages.length,
-                0,
-                "plain successful tmux completion must be suppressed"
+                1,
+                "notify:true must deliver successful tmux completion"
             );
             assert.equal(
                 state.backgroundJobs.has(job.id),
@@ -1228,6 +1228,7 @@ void describe(
                 lookupJob(state, job.id),
                 "job still findable via recent-terminal fallback"
             );
+            assert.equal(job.wantsCompletionNotification, true);
         });
 
         void it("delivers failed tmux completions with source IDs after indexing", async () => {
@@ -1458,7 +1459,11 @@ void describe(
 
 // ─── bash tool — foreground completion cleanup ──────────────────────
 
-function captureBashTool(state: TauState, toolName = "bash") {
+function captureBashTool(
+    state: TauState,
+    toolName = "bash",
+    sentMessages: unknown[] = []
+) {
     let captured: {
         execute: (
             toolCallId: string,
@@ -1478,7 +1483,9 @@ function captureBashTool(state: TauState, toolName = "bash") {
         },
         registerCommand() {},
         registerToolPromptGuidelines() {},
-        sendMessage() {},
+        sendMessage(message: unknown) {
+            sentMessages.push(message);
+        },
     } as never;
 
     registerBackgroundJobs(pi, state);
@@ -1541,6 +1548,45 @@ void describe("bash cwd validation", () => {
         assert.match(result.content[0].text, /^\/tmp\s*$/m);
         assert.equal(state.backgroundJobs.size, 0);
         assert.equal(state.runningProcesses.size, 0);
+    });
+
+    void it("delivers successful direct bash_bg completions by default", async () => {
+        const state = new TauState();
+        const sentMessages: unknown[] = [];
+        const bashBgTool = captureBashTool(state, "bash_bg", sentMessages);
+
+        await bashBgTool.execute(
+            "tc-bg-success-notify",
+            { command: "printf direct-success" },
+            undefined,
+            undefined,
+            {
+                cwd: "/tmp",
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                },
+            } as never
+        );
+
+        let job: BackgroundJob | undefined;
+        for (let i = 0; i < 100 && !job; i++) {
+            job = state.recentTerminalJobs.find(
+                (candidate) => candidate.toolCallId === "tc-bg-success-notify"
+            );
+            if (!job) await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        assert.ok(job, "direct bash_bg job should reach terminal state");
+        await job.outputIndexPromise;
+        state._flushCompletionBatch?.();
+        assert.equal(job.wantsCompletionNotification, true);
+        assert.equal(sentMessages.length, 1);
+        assert.equal(
+            (sentMessages[0] as { customType: string }).customType,
+            "job-completion"
+        );
     });
 });
 

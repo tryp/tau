@@ -361,6 +361,11 @@ export function handleTmuxCompletion(
     shouldNotify: boolean
 ): void {
     if (shouldNotify) {
+        // bash_bg's notify option is an explicit request for a completion
+        // turn. Preserve it through the shared successful-completion
+        // suppression check; otherwise successful tmux jobs are silently
+        // dropped even though notify defaults to true.
+        job.wantsCompletionNotification = true;
         notifyCompletion(job, state, pi, ctx);
     } else {
         removeJob(state, job);
@@ -1670,6 +1675,10 @@ export function registerBackgroundJobs(
                 proc,
                 toolCallId,
                 isBackgrounded: true,
+                // bash_bg defaults to notifying on completion. This flag
+                // makes that explicit request survive successful-completion
+                // suppression in flushCompletionBatch.
+                wantsCompletionNotification: shouldNotify,
             };
             createJobDonePromise(job);
             state.backgroundJobs.set(jobId, job);
