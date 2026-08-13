@@ -26,6 +26,22 @@ export interface JobResultDetails {
     empty?: boolean;
     error?: boolean;
     timedOut?: boolean;
+    /**
+     * OS PID of the direct child process backing the job. Present only when
+     * the job is backed by a real process (spawn/detached). Tmux-backed jobs
+     * have no single PID, so the field is omitted rather than faked.
+     */
+    pid?: number;
+    /** Epoch ms at which the job started. */
+    startTime?: number;
+    /** Epoch ms at which the job reached a terminal state. Absent while running. */
+    endTime?: number;
+    /**
+     * Runtime in ms: full duration once terminal, elapsed-so-far while running.
+     * Computed as `(endTime ?? now) - startTime`, so a still-running job's
+     * value grows between snapshots.
+     */
+    durationMs?: number;
     /** Source ID for the job's output in the context sidecar. */
     sourceId?: string;
     /** Stable context-sidecar chunk IDs for the indexed output. */
@@ -39,6 +55,8 @@ export interface BackgroundJob {
     startTime: number;
     status: JobStatus;
     exitCode?: number;
+    /** Epoch ms at which the job reached a terminal state; unset while running. */
+    endTime?: number;
     logPath: string;
     proc?: ChildProcess;
     toolCallId: string;

@@ -96,6 +96,9 @@ export function markJobTerminal(
     }
     job.status = status;
     job.exitCode = exitCode;
+    // Record when the job reached its terminal state so structured results
+    // can expose lifecycle timing (endTime/durationMs) for the job.
+    job.endTime = Date.now();
     delete job.proc;
     if (job.resolveDone) {
         job.resolveDone();

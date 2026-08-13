@@ -13,7 +13,11 @@ type AgentSdkModule = typeof import("@anthropic-ai/claude-agent-sdk");
 
 let cached: AgentSdkModule | undefined;
 
-const INSTALL_HINT =
+/**
+ * Actionable install instruction for the missing optional SDK dependency.
+ * Reused by the readiness diagnostics so every surface reports the same hint.
+ */
+export const AGENT_SDK_INSTALL_HINT =
     "@anthropic-ai/claude-agent-sdk is not installed. Install it with:\n" +
     "  cd ~/.pi/agent/extensions/tau && pnpm add -O @anthropic-ai/claude-agent-sdk";
 
@@ -35,7 +39,7 @@ export async function loadAgentSdk(): Promise<AgentSdkModule> {
             message.includes("MODULE_NOT_FOUND") ||
             message.includes("Cannot resolve")
         ) {
-            throw new Error(INSTALL_HINT, { cause: error });
+            throw new Error(AGENT_SDK_INSTALL_HINT, { cause: error });
         }
         throw error;
     }

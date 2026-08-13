@@ -528,7 +528,7 @@ export function formatJobOutput(
     };
 }
 
-function jobDetails(
+export function jobDetails(
     job: BackgroundJob,
     overrides: Partial<JobResultDetails> = {}
 ): JobResultDetails {
@@ -537,6 +537,14 @@ function jobDetails(
         status: job.status,
         exitCode: job.exitCode,
         logPath: job.logPath,
+        // Only expose a PID when the job is backed by a real direct process.
+        // Tmux jobs carry the -1 sentinel internally; omitting the field here
+        // avoids pretending a tmux window has a single PID.
+        ...(job.pid > 0 ? { pid: job.pid } : {}),
+        startTime: job.startTime,
+        ...(job.endTime !== undefined ? { endTime: job.endTime } : {}),
+        // Full duration once terminal; elapsed-so-far while still running.
+        durationMs: (job.endTime ?? Date.now()) - job.startTime,
         sourceId: job.sourceId,
         chunkIds: job.chunkIds,
         ...overrides,
@@ -1444,6 +1452,8 @@ export function registerBackgroundJobs(
                                 jobId: job.id,
                                 logPath: job.logPath,
                                 command,
+                                pid: job.pid,
+                                startTime: job.startTime,
                             },
                         },
                         { deliverAs: "followUp", triggerTurn: true }
@@ -1638,11 +1648,7 @@ export function registerBackgroundJobs(
                             text: `Started background job ${job.id}\nCommand: ${params.command}\nOutput: ${job.logPath}`,
                         },
                     ],
-                    details: {
-                        jobId: job.id,
-                        status: job.status,
-                        logPath: job.logPath,
-                    },
+                    details: jobDetails(job),
                 };
             }
 
@@ -1701,7 +1707,7 @@ export function registerBackgroundJobs(
                 killTimer = setTimeout(() => {
                     if (proc.pid && job.status === "running") {
                         killProcessGroup(proc.pid, "SIGTERM");
-                        job.status = "killed";
+                        markJobTerminal(job, "killed");
                         // Don't silence — let notifyCompletion send the notification
                     }
                 }, params.timeout * 1_000);
@@ -1768,11 +1774,7 @@ export function registerBackgroundJobs(
                             `Output: ${logPath}${extra}`,
                     },
                 ],
-                details: {
-                    jobId,
-                    status: job.status,
-                    logPath,
-                },
+                details: jobDetails(job),
             };
         },
     });
@@ -2022,11 +2024,7 @@ export function registerBackgroundJobs(
                                     : `Sent SIGTERM to ${job.id} (process group)`,
                             },
                         ],
-                        details: {
-                            jobId: job.id,
-                            status: job.status,
-                            logPath: job.logPath,
-                        },
+                        details: jobDetails(job),
                     };
                 }
 

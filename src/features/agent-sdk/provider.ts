@@ -56,6 +56,7 @@ import {
 import type {
     EffortLevel,
     Options,
+    Query,
     SDKMessage,
     SDKUserMessage,
     ThinkingConfig,
@@ -92,6 +93,10 @@ import {
 import { createHash } from "node:crypto";
 import { resolveClaudeCodeExecutable } from "./executable.ts";
 import { loadAgentSdk } from "./sdk-loader.ts";
+import {
+    checkAgentSdkReadiness,
+    type AgentSdkReadinessProbe,
+} from "./readiness.ts";
 import { assertSubscriptionAuth, buildSdkEnv } from "./auth.ts";
 import type { AgentSdkSettings } from "./settings.ts";
 
@@ -840,6 +845,13 @@ interface StreamDeps {
     >;
     /** Called with the subscription rate-limit snapshot when the SDK reports it. */
     onRateLimit?: (info: AgentSdkRateLimit) => void;
+    /**
+     * Readiness probe override (test seam / advanced configuration). Defaults
+     * to the real module-resolution probes in readiness.ts. Injected so the
+     * missing-dependency error path can be unit-tested without touching the
+     * filesystem or the installed optional dependency.
+     */
+    readinessProbe?: AgentSdkReadinessProbe;
 }
 
 /**
@@ -878,9 +890,7 @@ async function runAgentSdkQuery(
     // code 1") surfaces its real reason instead of a bare exit code.
     const subprocessStderr: string[] = [];
 
-    const sdk = await loadAgentSdk();
-
-    let queryHandle: ReturnType<typeof sdk.query> | undefined;
+    let queryHandle: Query | undefined;
     const onAbort = () => {
         if (!queryHandle) return;
         void queryHandle.interrupt().catch(() => {
@@ -897,6 +907,21 @@ async function runAgentSdkQuery(
     }
 
     try {
+        // Readiness gate: the Agent SDK is an optional dependency with a native
+        // binary. Probe it BEFORE any dynamic import or subprocess spawn so a
+        // configured/listed model reports the missing runtime dependency with a
+        // structured, actionable diagnostic on the first turn instead of failing
+        // deep inside the SDK subprocess. When ready, loadAgentSdk() below remains
+        // the authoritative gate (a broken install still errors there).
+        const readiness = checkAgentSdkReadiness(deps.readinessProbe);
+        if (!readiness.ready) {
+            throw new Error(
+                readiness.reason ??
+                    "Claude Agent SDK provider is not ready to execute."
+            );
+        }
+
+        const sdk = await loadAgentSdk();
         const resolved = resolveSdkTools(context);
         const mcpServers = buildCustomToolServers(sdk, resolved);
         const thinking = resolveThinkingOptions(

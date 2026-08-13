@@ -41,6 +41,7 @@ import {
     installSpawnErrorHandler,
     resolveExecutionCwd,
     validateWorkingDirectory,
+    jobDetails,
 } from "./background.ts";
 import { trackJobOutputIndex } from "./sidecar.ts";
 
@@ -374,11 +375,7 @@ export function registerAgentBackground(
                             `Context: ${(conversationBytes / 1024).toFixed(0)} KB / ${contextWindowTokens} tokens`,
                     },
                 ],
-                details: {
-                    jobId,
-                    status: job.status,
-                    logPath,
-                },
+                details: jobDetails(job),
             };
         },
     });
