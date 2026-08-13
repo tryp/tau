@@ -1588,6 +1588,43 @@ void describe("bash cwd validation", () => {
             "job-completion"
         );
     });
+
+    void it("cleans up direct bash_bg jobs when notify is disabled", async () => {
+        const state = new TauState();
+        const sentMessages: unknown[] = [];
+        const bashBgTool = captureBashTool(state, "bash_bg", sentMessages);
+
+        await bashBgTool.execute(
+            "tc-bg-success-silent",
+            { command: "printf direct-silent", notify: false },
+            undefined,
+            undefined,
+            {
+                cwd: "/tmp",
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                },
+            } as never
+        );
+
+        let job: BackgroundJob | undefined;
+        for (let i = 0; i < 100 && !job; i++) {
+            job = state.recentTerminalJobs.find(
+                (candidate) => candidate.toolCallId === "tc-bg-success-silent"
+            );
+            if (!job) await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        assert.ok(
+            job,
+            "silent direct bash_bg job should reach recent terminals"
+        );
+        assert.equal(state.backgroundJobs.has(job.id), false);
+        assert.equal(state.completedJobCount, 1);
+        assert.equal(sentMessages.length, 0);
+    });
 });
 
 void describe("bash tool — foreground completion cleanup", () => {

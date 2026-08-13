@@ -1730,6 +1730,7 @@ export function registerBackgroundJobs(
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
+                else removeJob(state, job);
                 updateWidget(state, ctx);
             });
 
@@ -1741,6 +1742,7 @@ export function registerBackgroundJobs(
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
+                else removeJob(state, job);
                 updateWidget(state, ctx);
             });
 
