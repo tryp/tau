@@ -208,22 +208,41 @@ export function startStallWatchdog(
             if (Date.now() - lastGrowth < STALL_THRESHOLD_MS) return;
 
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
-            if (!looksLikePrompt(tail)) {
-                lastGrowth = Date.now();
-                return;
-            }
 
             cancelled = true;
             clearInterval(timer);
 
-            const summary =
-                `Background job ${jobId} appears to be waiting for interactive input.\n` +
-                `Command: ${command}\n\n` +
-                `Last output:\n${tail.trimEnd()}\n\n` +
-                `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
-                `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
-
             const suffix = outstandingJobsSuffix(state, jobId);
+            if (looksLikePrompt(tail)) {
+                const summary =
+                    `Background job ${jobId} appears to be waiting for interactive input.\n` +
+                    `Command: ${command}\n\n` +
+                    `Last output:\n${tail.trimEnd()}\n\n` +
+                    `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
+                    `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
+                pi.sendMessage(
+                    {
+                        customType: "bg-stall",
+                        content: `⚠️ ${summary}${suffix}`,
+                        display: true,
+                        details: { jobId, logPath, command },
+                    },
+                    { deliverAs: "followUp", triggerTurn: true }
+                );
+                return;
+            }
+
+            // Sustained zero growth with no prompt-like output: the job is
+            // silent — spinning (e.g. pathological regex), deadlocked, or
+            // simply producing no output. Surface it so the agent can decide
+            // keep/kill instead of waiting forever. Session analysis: a
+            // zero-output job burned one core at 100% for 21.6h while the
+            // agent and its parent session stayed blocked on it.
+            const summary =
+                `Background job ${jobId} has produced no output for ${formatDuration(STALL_THRESHOLD_MS)}.\n` +
+                `Command: ${command}\n\n` +
+                `The job may be spinning, hung, or silently computing. Use job_decide ` +
+                `to keep it running or kill it.`;
             pi.sendMessage(
                 {
                     customType: "bg-stall",
