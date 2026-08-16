@@ -9,6 +9,27 @@ import path from "node:path";
 
 const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// Aligned with the slow-spinner customization (extensions/slow-spinner.ts).
+// Every tick writes an OSC 0 title sequence to stdout; under tmux that is a
+// pane-title update per tick. The legacy 80ms rate caused ~12.5 title
+// updates/sec, churning tmux state and interrupting mouse selection. Slow to
+// one tick per two seconds, honoring the same PI_SPINNER_INTERVAL_MS env knob
+// that slow-spinner uses (0 restores the legacy speed).
+const LEGACY_INTERVAL_MS = 80;
+const DEFAULT_INTERVAL_MS = 2000;
+
+export function readTitlebarIntervalMs(): number {
+    const raw = process.env.PI_SPINNER_INTERVAL_MS;
+    const parsed = Number.parseInt(raw ?? "", 10);
+    if (!Number.isFinite(parsed)) {
+        return DEFAULT_INTERVAL_MS;
+    }
+    if (parsed <= 0) {
+        return LEGACY_INTERVAL_MS;
+    }
+    return parsed;
+}
+
 // Global registry of all agent-timer interval IDs. Stored on globalThis so
 // it survives across jiti module re-evaluations. Each startAgentTimer call
 // kills ALL previously registered intervals before starting a new one.
@@ -50,7 +71,7 @@ export function startTitlebarSpinner(
             BRAILLE_FRAMES[state.titlebarFrameIndex % BRAILLE_FRAMES.length];
         ctx.ui.setTitle(`${frame} ${getTitleBase(pi)}`);
         state.titlebarFrameIndex++;
-    }, 80);
+    }, readTitlebarIntervalMs());
 }
 
 export function stopTitlebarSpinner(
