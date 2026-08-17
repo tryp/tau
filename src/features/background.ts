@@ -182,6 +182,13 @@ export function startStallWatchdog(
     const timer = setInterval(() => {
         if (cancelled) return;
         try {
+            const trackedJob = state.backgroundJobs.get(jobId);
+            if (trackedJob && trackedJob.status !== "running") {
+                cancelled = true;
+                clearInterval(timer);
+                return;
+            }
+
             const size = statSync(logPath).size;
 
             if (size > MAX_LOG_BYTES) {

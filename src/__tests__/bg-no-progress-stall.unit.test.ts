@@ -152,6 +152,32 @@ void describe("stall watchdog — no-progress jobs", () => {
         );
     });
 
+    void it("suppresses stale warnings after a job reaches terminal state", () => {
+        const state = new TauState();
+        state.backgroundJobs.set("job-killed", {
+            id: "job-killed",
+            status: "killed",
+        } as never);
+        const cancel = startStallWatchdog(
+            "job-killed",
+            "tmux send-keys",
+            logPath,
+            makePi(messages),
+            state
+        );
+
+        for (let i = 0; i < STALL_TICKS; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        cancel();
+
+        assert.equal(
+            messages.length,
+            0,
+            "terminal jobs must not emit delayed bg-stall notifications"
+        );
+    });
+
     void it("still surfaces a job blocked on an interactive prompt", () => {
         writeFileSync(logPath, "Overwrite existing file? (y/n): ");
         const state = new TauState();
