@@ -6,6 +6,8 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
     buildBackgroundSpawnArgs,
     chooseBackgroundPath,
@@ -16,6 +18,8 @@ import {
     LAST_SUMMARY_MAX_CHARS,
     ORIGINAL_PROMPT_MAX_CHARS,
 } from "../features/agent-background.ts";
+import { TauState } from "../state.ts";
+import { cancelPendingBackgroundAgent } from "../utils.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 // ─── chooseBackgroundPath ────────────────────────────────────────────
@@ -99,6 +103,49 @@ void describe("buildBackgroundSpawnArgs", () => {
             }),
             ["-p", "--mode", "text", "@/tmp/prompt.md"]
         );
+    });
+});
+
+// ─── cancelPendingBackgroundAgent ─────────────────────────────────────
+
+void describe("cancelPendingBackgroundAgent", () => {
+    void it("kills a queued job and removes its prompt file", () => {
+        const state = new TauState();
+        const jobId = "job-test-queued";
+        const promptFile = `${tmpdir()}/pi-bg-test-${jobId}.md`;
+        writeFileSync(promptFile, "queued prompt");
+        const job = {
+            id: jobId,
+            command: "pi --fork (background agent)",
+            pid: 0,
+            startTime: Date.now(),
+            status: "running" as const,
+            queued: true,
+            logPath: `${tmpdir()}/pi-bg-test-${jobId}.log`,
+            toolCallId: "tool-test",
+            isBackgrounded: true,
+        };
+        state.backgroundJobs.set(jobId, job);
+        state.pendingBackgroundAgents.set(jobId, {
+            jobId,
+            promptFile,
+            execCwd: tmpdir(),
+            conversationBytes: 0,
+            contextWindowTokens: 32768,
+        });
+
+        const cancelled = cancelPendingBackgroundAgent(state, jobId);
+
+        assert.equal(cancelled, job);
+        assert.equal(job.status, "killed");
+        assert.equal(job.queued, undefined);
+        assert.equal(state.pendingBackgroundAgents.has(jobId), false);
+        assert.equal(existsSync(promptFile), false);
+        try {
+            unlinkSync(promptFile);
+        } catch {
+            /* already removed */
+        }
     });
 });
 

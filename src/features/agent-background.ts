@@ -32,6 +32,7 @@ import type {
     PendingBackgroundAgent,
 } from "../types.ts";
 import {
+    cancelPendingBackgroundAgent,
     createJobDonePromise,
     generateJobId,
     killProcessGroup,
@@ -64,6 +65,7 @@ interface AgentProcessOptions {
 
 /** Maximum fraction of context window that a forked session can consume. */
 const MAX_CONTEXT_FRACTION = 0.4;
+const PENDING_SETTLE_TIMEOUT_MS = 30 * 60_000;
 
 /** Cap on the original user prompt inherited by a background agent. */
 export const ORIGINAL_PROMPT_MAX_CHARS = 6000;
@@ -242,6 +244,10 @@ export function registerAgentBackground(
             existsSync(options.sessionFile)
                 ? "fork"
                 : "summary";
+        job.command =
+            mode === "fork"
+                ? "pi --fork (background agent)"
+                : "pi -p (background agent)";
         const spawnArgs = buildBackgroundSpawnArgs({
             mode,
             sessionFile: options.sessionFile,
@@ -276,8 +282,12 @@ export function registerAgentBackground(
 
         job.pid = proc.pid;
         job.proc = proc;
+        delete job.queued;
 
         const logStream = createWriteStream(job.logPath, { flags: "w" });
+        logStream.write(
+            `Mode: ${mode === "fork" ? "fork-and-resume" : "summary-only"}\n`
+        );
         let logStreamFinish: Promise<void> | undefined;
         const finishLogStream = (): Promise<void> => {
             if (!logStreamFinish) {
@@ -341,9 +351,9 @@ export function registerAgentBackground(
         settlementScheduled = false;
         if (state.pendingBackgroundAgents.size === 0) return;
 
-        // pi 0.74 exposes agent_end but not agent_settled. Wait until the
-        // event loop reports idle so the current tool result and any queued
-        // continuation have finished writing the session JSONL.
+        // Older pi versions only expose agent_end, so the fallback waits
+        // until the event loop reports idle. Newer versions use the explicit
+        // agent_settled event below and skip this heuristic.
         const settled = ctx.isIdle();
         if (!settled && attempt < 100) {
             settlementScheduled = true;
@@ -358,6 +368,7 @@ export function registerAgentBackground(
         const pending = Array.from(state.pendingBackgroundAgents.values());
         state.pendingBackgroundAgents.clear();
         for (const request of pending) {
+            if (request.settleTimer) clearTimeout(request.settleTimer);
             const job = state.backgroundJobs.get(request.jobId);
             if (!job) {
                 try {
@@ -398,24 +409,78 @@ export function registerAgentBackground(
         }
     };
 
-    pi.on("agent_end", async (_event, ctx) => {
+    const schedulePendingAgents = (
+        ctx: ExtensionContext,
+        trustedSettled: boolean
+    ): void => {
         if (settlementScheduled || state.pendingBackgroundAgents.size === 0) {
             return;
         }
         settlementScheduled = true;
-        const timer = setTimeout(() => startPendingAgents(ctx), 0);
+        const timer = setTimeout(() => {
+            settlementScheduled = false;
+            if (trustedSettled) {
+                const pending = Array.from(
+                    state.pendingBackgroundAgents.values()
+                );
+                state.pendingBackgroundAgents.clear();
+                for (const request of pending) {
+                    if (request.settleTimer) clearTimeout(request.settleTimer);
+                    const job = state.backgroundJobs.get(request.jobId);
+                    if (!job || job.status !== "running") {
+                        try {
+                            unlinkSync(request.promptFile);
+                        } catch {
+                            /* already gone */
+                        }
+                        continue;
+                    }
+                    const sessionFile = ctx.sessionManager.getSessionFile();
+                    startAgentProcess(
+                        job,
+                        {
+                            mode: sessionFile ? "fork" : "summary",
+                            promptFile: request.promptFile,
+                            execCwd: request.execCwd,
+                            sessionFile: sessionFile ?? undefined,
+                            modelArg: request.modelArg,
+                            thinkingLevel: request.thinkingLevel,
+                        },
+                        ctx
+                    );
+                    updateWidget(state, ctx);
+                }
+            } else {
+                startPendingAgents(ctx);
+            }
+        }, 0);
         timer.unref();
+    };
+
+    // agent_settled is the authoritative event: the current tool result,
+    // retries, compaction, and queued continuations have all been persisted.
+    // Cast only for compatibility with older installed pi type declarations.
+    const settledApi = pi as ExtensionAPI & {
+        on(
+            event: "agent_settled",
+            handler: (
+                event: unknown,
+                ctx: ExtensionContext
+            ) => void | Promise<void>
+        ): void;
+    };
+    settledApi.on("agent_settled", async (_event, ctx) => {
+        schedulePendingAgents(ctx, true);
+    });
+
+    // Compatibility fallback for pi versions without agent_settled.
+    pi.on("agent_end", async (_event, ctx) => {
+        schedulePendingAgents(ctx, false);
     });
 
     pi.on("session_shutdown", async () => {
         for (const request of state.pendingBackgroundAgents.values()) {
-            const job = state.backgroundJobs.get(request.jobId);
-            if (job) silenceJobAfterKill(job);
-            try {
-                unlinkSync(request.promptFile);
-            } catch {
-                /* already gone */
-            }
+            cancelPendingBackgroundAgent(state, request.jobId);
         }
         state.pendingBackgroundAgents.clear();
     });
@@ -425,14 +490,14 @@ export function registerAgentBackground(
         label: "Background Agent",
         description:
             "Spawn a separate pi process to handle a task in the background. " +
-            "Constructs a continuation prompt from the current conversation " +
-            "context and the specified task. " +
+            "Uses fork-and-resume for small persisted sessions and a " +
+            "summary-only continuation otherwise. " +
             "Use the jobs tool to check status and read output.",
         promptSnippet:
             "Delegate a task to a background pi process with context continuity",
         promptGuidelines: [
             "Use agent_bg for tasks that can run independently without the current conversation.",
-            "The background agent gets a summary of the original task and where you left off.",
+            "The background agent either forks the persisted conversation or receives a summary of the original task and where you left off.",
             "Use the jobs tool to check on progress. You will be notified when it finishes.",
             "The result details include jobId, status, and logPath; completed output is indexed with sourceId/chunkIds for context-sidecar retrieval when available.",
         ],
@@ -521,12 +586,16 @@ export function registerAgentBackground(
 
             const job: BackgroundJob = {
                 id: jobId,
-                command: `pi -p (background agent)`,
+                command:
+                    path === "fork"
+                        ? "pi --fork (background agent)"
+                        : "pi -p (background agent)",
                 // A fork is queued until the parent settles and receives its real
                 // PID then. Zero is intentionally omitted from jobDetails().
                 pid: 0,
                 startTime: Date.now(),
                 status: "running",
+                queued: path === "fork",
                 logPath,
                 toolCallId,
                 isBackgrounded: true,
@@ -545,6 +614,24 @@ export function registerAgentBackground(
                     conversationBytes,
                     contextWindowTokens,
                 };
+                pending.settleTimer = setTimeout(() => {
+                    if (state.pendingBackgroundAgents.get(jobId) !== pending) {
+                        return;
+                    }
+                    state.pendingBackgroundAgents.delete(jobId);
+                    const queuedJob = state.backgroundJobs.get(jobId);
+                    if (queuedJob && queuedJob.status === "running") {
+                        failAgentStart(
+                            queuedJob,
+                            promptFile,
+                            ctx,
+                            new Error(
+                                "parent turn never settled; background agent not started"
+                            )
+                        );
+                    }
+                }, PENDING_SETTLE_TIMEOUT_MS);
+                pending.settleTimer.unref();
                 state.pendingBackgroundAgents.set(jobId, pending);
             } else {
                 startAgentProcess(
@@ -568,7 +655,7 @@ export function registerAgentBackground(
                     {
                         type: "text" as const,
                         text:
-                            `Started background agent ${jobId} (${pathLabel})\n` +
+                            `${path === "fork" ? "Queued" : "Started"} background agent ${jobId} (${pathLabel})\n` +
                             `Prompt: ${params.prompt.slice(0, 100)}${params.prompt.length > 100 ? "…" : ""}\n` +
                             `PID: ${job.pid > 0 ? job.pid : "pending"}\n` +
                             `Output: ${logPath}\n` +

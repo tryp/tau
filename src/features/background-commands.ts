@@ -15,6 +15,7 @@ import { updateWidget, silenceJobAfterKill } from "./background.ts";
 import { captureReload } from "./reload.ts";
 import {
     MAX_OUTPUT_PREVIEW_CHARS,
+    cancelPendingBackgroundAgent,
     createJobDonePromise,
     formatDuration,
     killProcessGroup,
@@ -255,6 +256,12 @@ export function registerBackgroundCommands(
             }
 
             const job = runningJobs[0];
+            if (state.pendingBackgroundAgents.has(job.id)) {
+                cancelPendingBackgroundAgent(state, job.id);
+                ctx.ui.notify(`Killed queued agent ${job.id}`, "info");
+                updateWidget(state, ctx);
+                return;
+            }
             const tmuxCtx = getTmuxContext(job);
             if (tmuxCtx) {
                 killTmuxJob(job);

@@ -19,6 +19,7 @@ export interface PendingBackgroundAgent {
     sessionFile?: string;
     conversationBytes: number;
     contextWindowTokens: number;
+    settleTimer?: ReturnType<typeof setTimeout>;
 }
 
 /** Stable identifiers for indexed background-job output. */
@@ -31,6 +32,7 @@ export interface JobOutputIndex {
 export interface JobResultDetails {
     jobId?: string;
     status?: JobStatus;
+    queued?: boolean;
     exitCode?: number;
     logPath?: string;
     totalLines?: number;
@@ -74,6 +76,8 @@ export interface BackgroundJob {
     toolCallId: string;
     donePromise?: Promise<void>;
     resolveDone?: () => void;
+    /** True while an agent_bg fork is waiting for the parent turn to settle. */
+    queued?: boolean;
     /** True once the agent has consumed output via attach — suppresses completion notification. */
     outputConsumed?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */

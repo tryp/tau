@@ -14,6 +14,7 @@ import {
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { TauState } from "./state.ts";
 import type { BackgroundJob, JobStatus } from "./types.ts";
 
 // ─── Configuration constants ────────────────────────────────────────
@@ -95,6 +96,7 @@ export function markJobTerminal(
         return;
     }
     job.status = status;
+    delete job.queued;
     job.exitCode = exitCode;
     // Record when the job reached its terminal state so structured results
     // can expose lifecycle timing (endTime/durationMs) for the job.
@@ -104,6 +106,30 @@ export function markJobTerminal(
         job.resolveDone();
         delete job.resolveDone;
     }
+}
+
+/** Cancel an agent_bg fork that has not started yet. */
+export function cancelPendingBackgroundAgent(
+    state: TauState,
+    jobId: string
+): BackgroundJob | undefined {
+    const pending = state.pendingBackgroundAgents.get(jobId);
+    if (!pending) return undefined;
+
+    state.pendingBackgroundAgents.delete(jobId);
+    if (pending.settleTimer) clearTimeout(pending.settleTimer);
+    try {
+        unlinkSync(pending.promptFile);
+    } catch {
+        /* already gone */
+    }
+
+    const job = state.backgroundJobs.get(jobId);
+    if (job && job.status === "running") {
+        markJobTerminal(job, "killed");
+        job.outputConsumed = true;
+    }
+    return job;
 }
 
 // ─── Formatting ─────────────────────────────────────────────────────
@@ -117,16 +143,17 @@ export function formatDuration(ms: number): string {
 
 export function formatJobLine(job: BackgroundJob): string {
     const duration = formatDuration(Date.now() - job.startTime);
-    const status =
-        job.status === "running"
-            ? job.isBackgrounded
-                ? `◐ running (${duration})`
-                : `▶ running (${duration})`
-            : job.status === "completed"
-              ? "✅ completed"
-              : job.status === "failed"
-                ? "❌ failed"
-                : "🛑 killed";
+    const status = job.queued
+        ? `◒ queued (${duration})`
+        : job.status === "running"
+          ? job.isBackgrounded
+              ? `◐ running (${duration})`
+              : `▶ running (${duration})`
+          : job.status === "completed"
+            ? "✅ completed"
+            : job.status === "failed"
+              ? "❌ failed"
+              : "🛑 killed";
     return `${job.id}: ${job.command.slice(0, 80)} - ${status}`;
 }
 
