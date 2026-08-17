@@ -79,6 +79,7 @@ import {
     STALL_CHECK_INTERVAL_MS,
     STALL_TAIL_BYTES,
     STALL_THRESHOLD_MS,
+    cancelPendingBackgroundAgent,
     createJobDonePromise,
     detectBlockedSleep,
     formatDuration,
@@ -554,6 +555,7 @@ export function jobDetails(
     return {
         jobId: job.id,
         status: job.status,
+        ...(job.queued ? { queued: true } : {}),
         exitCode: job.exitCode,
         logPath: job.logPath,
         // Only expose a PID when the job is backed by a real direct process.
@@ -2092,6 +2094,20 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
 
+                    if (state.pendingBackgroundAgents.has(job.id)) {
+                        cancelPendingBackgroundAgent(state, job.id);
+                        clearPendingDecision(state, job);
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Killed queued background agent ${job.id} before it started.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
+
                     // Tmux jobs don't have proc — kill via tmux window.
                     const tmuxCtx = getTmuxContext(job);
                     if (tmuxCtx) {
@@ -2366,6 +2382,20 @@ export function registerBackgroundJobs(
 
             switch (params.decision) {
                 case "kill": {
+                    if (state.pendingBackgroundAgents.has(job.id)) {
+                        cancelPendingBackgroundAgent(state, job.id);
+                        state.pendingDecisionJobId = undefined;
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Killed queued background agent ${job.id} before it started.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
+
                     // Tmux jobs don't have proc — kill via tmux window.
                     const tmuxCtx = getTmuxContext(job);
                     if (tmuxCtx) {
