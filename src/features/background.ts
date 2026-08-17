@@ -2703,16 +2703,26 @@ async function executeTmuxForeground(
             job.isBackgrounded = true;
             state.currentlyRunningToolCallId = null;
 
-            // Start stall watchdog
-            startStallWatchdog(jobId, command, logPath, pi, state, () => {
-                killTmuxJob(job);
-            });
+            // Start stall watchdog and cancel it when the completion poller
+            // observes terminal state. Otherwise completed jobs emit stale
+            // bg-stall notifications on the next watchdog tick.
+            const cancelStall = startStallWatchdog(
+                jobId,
+                command,
+                logPath,
+                pi,
+                state,
+                () => {
+                    killTmuxJob(job);
+                }
+            );
 
             // Start background completion poller
             const bgPoller = setInterval(() => {
                 const result = pollTmuxCompletion(job);
                 if (!result.completed) return;
                 clearInterval(bgPoller);
+                cancelStall();
                 markJobTerminal(
                     job,
                     result.exitCode === 0 || result.exitCode === null
