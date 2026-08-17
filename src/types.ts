@@ -9,6 +9,18 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 export type JobStatus = "running" | "completed" | "failed" | "killed";
 
+/** Data retained while an agent_bg fork waits for the parent turn to settle. */
+export interface PendingBackgroundAgent {
+    jobId: string;
+    promptFile: string;
+    execCwd: string;
+    modelArg?: string;
+    thinkingLevel?: string;
+    sessionFile?: string;
+    conversationBytes: number;
+    contextWindowTokens: number;
+}
+
 /** Stable identifiers for indexed background-job output. */
 export interface JobOutputIndex {
     sourceId: string;

@@ -9,6 +9,7 @@
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import type {
     BackgroundJob,
+    PendingBackgroundAgent,
     RunningProcess,
     Task,
     WorkflowRun,
@@ -23,6 +24,7 @@ export class TauState {
     // ── Background jobs ──────────────────────────────────────────────
 
     backgroundJobs = new Map<string, BackgroundJob>();
+    pendingBackgroundAgents = new Map<string, PendingBackgroundAgent>();
     runningProcesses = new Map<string, RunningProcess>();
     jobCounter = 0;
     currentlyRunningToolCallId: string | null = null;

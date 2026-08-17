@@ -7,6 +7,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+    buildBackgroundSpawnArgs,
     chooseBackgroundPath,
     extractTextFromContent,
     extractLastAssistantSummary,
@@ -39,8 +40,65 @@ void describe("chooseBackgroundPath", () => {
         assert.equal(chooseBackgroundPath(205000, 128000), "summary");
     });
 
-    void it("defaults to fork for empty conversation", () => {
+    void it("defaults to fork for empty persisted conversation", () => {
         assert.equal(chooseBackgroundPath(0, 32768), "fork");
+    });
+
+    void it("uses summary mode when no session file is available", () => {
+        assert.equal(chooseBackgroundPath(0, 32768, false), "summary");
+    });
+
+    void it("uses summary mode for an invalid context window", () => {
+        assert.equal(chooseBackgroundPath(0, 0), "summary");
+    });
+});
+
+// ─── buildBackgroundSpawnArgs ────────────────────────────────────────
+
+void describe("buildBackgroundSpawnArgs", () => {
+    void it("adds --fork only for fork mode", () => {
+        assert.deepEqual(
+            buildBackgroundSpawnArgs({
+                mode: "fork",
+                sessionFile: "/tmp/source.jsonl",
+                modelArg: "provider/model",
+                thinkingLevel: "high",
+                promptFile: "/tmp/prompt.md",
+            }),
+            [
+                "--fork",
+                "/tmp/source.jsonl",
+                "-p",
+                "--mode",
+                "text",
+                "--model",
+                "provider/model",
+                "--thinking",
+                "high",
+                "@/tmp/prompt.md",
+            ]
+        );
+    });
+
+    void it("does not silently construct an invalid fork", () => {
+        assert.throws(
+            () =>
+                buildBackgroundSpawnArgs({
+                    mode: "fork",
+                    promptFile: "/tmp/prompt.md",
+                }),
+            /requires a persisted session file/
+        );
+    });
+
+    void it("omits fork and thinking flags in summary mode when unset", () => {
+        assert.deepEqual(
+            buildBackgroundSpawnArgs({
+                mode: "summary",
+                promptFile: "/tmp/prompt.md",
+            }),
+            ["-p", "--mode", "text", "@/tmp/prompt.md"]
+        );
     });
 });
 
@@ -176,6 +234,11 @@ void describe("estimateConversationBytes", () => {
         ];
         const result = estimateConversationBytes(entries);
         assert.equal(result, 10);
+    });
+
+    void it("counts UTF-8 bytes for text content", () => {
+        const entries = [makeMessage("user", "🙂")];
+        assert.equal(estimateConversationBytes(entries), 4);
     });
 
     void it("counts text block content", () => {
