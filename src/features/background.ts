@@ -79,6 +79,7 @@ import {
     STALL_CHECK_INTERVAL_MS,
     STALL_TAIL_BYTES,
     STALL_THRESHOLD_MS,
+    cancelPendingBackgroundAgent,
     createJobDonePromise,
     detectBlockedSleep,
     formatDuration,
@@ -554,6 +555,7 @@ export function jobDetails(
     return {
         jobId: job.id,
         status: job.status,
+        ...(job.queued ? { queued: true } : {}),
         exitCode: job.exitCode,
         logPath: job.logPath,
         // Only expose a PID when the job is backed by a real direct process.
@@ -1086,17 +1088,70 @@ export function registerBackgroundJob(
 
 // ── Default timeout timer (signal-based) ─────────────────────────────
 
+/** Return the job-control tools currently available to the agent. */
+export function getActiveBackgroundControlTools(pi: ExtensionAPI): string[] {
+    try {
+        return pi
+            .getActiveTools()
+            .filter((name) => name === "jobs" || name === "job_decide");
+    } catch {
+        // Older hosts/mocks may not expose active-tool introspection. Keep the
+        // historical behavior there; current pi always provides this method.
+        return ["jobs", "job_decide"];
+    }
+}
+
+function jobControlInstructions(pi: ExtensionAPI, jobId: string): string {
+    const controls = getActiveBackgroundControlTools(pi);
+    if (controls.includes("job_decide")) {
+        return (
+            `Use the job_decide tool with jobId "${jobId}" to decide:\n` +
+            `- decision "check": inspect the output first\n` +
+            `- decision "keep": let it continue running\n` +
+            `- decision "kill": terminate it`
+        );
+    }
+    return (
+        `Use the jobs tool with action "list", "output", "attach", or "kill" ` +
+        `and jobId "${jobId}" to manage it.`
+    );
+}
+
+function notifyBackgroundUnavailable(
+    pi: ExtensionAPI,
+    command: string,
+    timeoutMs: number
+): void {
+    pi.sendMessage(
+        {
+            customType: "bg-unavailable",
+            content:
+                `⏰ Command exceeded ${formatDuration(timeoutMs)} and was terminated ` +
+                `instead of backgrounded because no job-control tool is active.\n` +
+                `Command: ${command}\n\n` +
+                `Do not use shell kill/pkill cleanup. Enable the jobs or job_decide ` +
+                `tool, then rerun the command.`,
+            display: true,
+            details: { command, timeoutMs },
+        },
+        { deliverAs: "followUp", triggerTurn: true }
+    );
+}
+
 /**
  * Start a timer that resolves the background signal after timeoutMs.
- * If the command is not auto-backgroundable, kills the process instead.
- * Returns the timer handle so it can be cleared on early completion.
+ * If the command is not auto-backgroundable or no job-control tool is active,
+ * kills the process instead. Returns the timer handle so it can be cleared on
+ * early completion.
  */
 export function startTimeoutTimer(
     triggerBackground: () => void,
     command: string,
     state: TauState,
     toolCallId: string,
-    explicitTimeoutMs?: number
+    explicitTimeoutMs?: number,
+    canBackground: () => boolean = () => true,
+    onBackgroundUnavailable: () => void = () => {}
 ): NodeJS.Timeout {
     const timeoutMs = explicitTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -1115,6 +1170,16 @@ export function startTimeoutTimer(
         if (!isAutoBackgroundAllowed(command)) {
             const rp = state.runningProcesses.get(toolCallId);
             if (rp?.proc.pid) killProcessGroup(rp.proc.pid, "SIGTERM");
+            return;
+        }
+
+        // Never create an unmanageable background job. A pending decision
+        // gate blocks normal tools, so backgrounding without jobs/job_decide
+        // would strand the agent and encourage unsafe shell cleanup attempts.
+        if (!canBackground()) {
+            const rp = state.runningProcesses.get(toolCallId);
+            if (rp?.proc.pid) killProcessGroup(rp.proc.pid, "SIGTERM");
+            onBackgroundUnavailable();
             return;
         }
 
@@ -1332,7 +1397,16 @@ export function registerBackgroundJobs(
                 toolCallId,
                 typeof params.backgroundAfter === "number"
                     ? params.backgroundAfter * 1_000
-                    : undefined
+                    : undefined,
+                () => getActiveBackgroundControlTools(pi).length > 0,
+                () =>
+                    notifyBackgroundUnavailable(
+                        pi,
+                        command,
+                        typeof params.backgroundAfter === "number"
+                            ? params.backgroundAfter * 1_000
+                            : DEFAULT_TIMEOUT_MS
+                    )
             );
 
             // Background hint
@@ -1461,10 +1535,7 @@ export function registerBackgroundJobs(
                                 `Command: ${command}\n` +
                                 `PID: ${job.pid}\n` +
                                 `Output so far: ${job.logPath}\n\n` +
-                                `Use the job_decide tool with jobId "${job.id}" to decide:\n` +
-                                `- decision "check": inspect the output first\n` +
-                                `- decision "keep": let it continue running\n` +
-                                `- decision "kill": terminate it\n\n` +
+                                `${jobControlInstructions(pi, job.id)}\n\n` +
                                 `Use jobs action "attach" with a timeout to monitor its progress with periodic updates.`,
                             display: true,
                             details: {
@@ -2023,6 +2094,20 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
 
+                    if (state.pendingBackgroundAgents.has(job.id)) {
+                        cancelPendingBackgroundAgent(state, job.id);
+                        clearPendingDecision(state, job);
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Killed queued background agent ${job.id} before it started.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
+
                     // Tmux jobs don't have proc — kill via tmux window.
                     const tmuxCtx = getTmuxContext(job);
                     if (tmuxCtx) {
@@ -2297,6 +2382,20 @@ export function registerBackgroundJobs(
 
             switch (params.decision) {
                 case "kill": {
+                    if (state.pendingBackgroundAgents.has(job.id)) {
+                        cancelPendingBackgroundAgent(state, job.id);
+                        state.pendingDecisionJobId = undefined;
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Killed queued background agent ${job.id} before it started.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
+
                     // Tmux jobs don't have proc — kill via tmux window.
                     const tmuxCtx = getTmuxContext(job);
                     if (tmuxCtx) {
@@ -2476,6 +2575,11 @@ async function executeTmuxForeground(
             killTmuxJob(job);
             return;
         }
+        if (getActiveBackgroundControlTools(pi).length === 0) {
+            killTmuxJob(job);
+            notifyBackgroundUnavailable(pi, command, timeoutMs);
+            return;
+        }
         triggerBackground();
     }, timeoutMs);
     timer.unref();
@@ -2634,10 +2738,7 @@ async function executeTmuxForeground(
                         `Command: ${command}\n` +
                         `Tmux window: ${tmuxCtx.windowId}\n` +
                         `Output so far: ${logPath}\n\n` +
-                        `Use the job_decide tool with jobId "${jobId}" to decide:\n` +
-                        `- decision "check": inspect the output first\n` +
-                        `- decision "keep": let it continue running\n` +
-                        `- decision "kill": terminate it\n\n` +
+                        `${jobControlInstructions(pi, jobId)}\n\n` +
                         `You can attach to the tmux window with: tmux attach -t ${tmuxCtx.windowId}`,
                     display: true,
                     details: { jobId, logPath, command },

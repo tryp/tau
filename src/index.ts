@@ -36,7 +36,11 @@ import {
 } from "./features/titlebar.ts";
 
 // Existing features
-import { purgeSidecar, registerBackgroundJobs } from "./features/background.ts";
+import {
+    getActiveBackgroundControlTools,
+    purgeSidecar,
+    registerBackgroundJobs,
+} from "./features/background.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import {
@@ -283,22 +287,36 @@ export default function (pi: ExtensionAPI) {
             };
         }
 
-        // Pending job decision: block unrelated tools
-        if (
-            state.pendingDecisionJobId !== undefined &&
-            event.toolName !== "job_decide" &&
-            event.toolName !== "jobs" &&
-            event.toolName !== "bash"
-        ) {
+        // Pending job decision: block unrelated tools. If the control tools
+        // themselves are inactive, block bash too: allowing shell cleanup here
+        // turns a recoverable configuration mistake into a pkill/timeout loop.
+        if (state.pendingDecisionJobId !== undefined) {
             const job = state.backgroundJobs.get(state.pendingDecisionJobId);
             const status =
                 job?.status === "running"
                     ? "still running"
                     : (job?.status ?? "unknown");
-            return {
-                block: true,
-                reason: `A background job (${state.pendingDecisionJobId}) is awaiting your decision (${status}). Use job_decide or jobs first.`,
-            };
+            const controls = getActiveBackgroundControlTools(pi);
+            if (controls.length === 0) {
+                return {
+                    block: true,
+                    reason:
+                        `A background job (${state.pendingDecisionJobId}) is awaiting a decision (${status}), ` +
+                        "but this session has no active job-control tool (jobs/job_decide). " +
+                        "Do not run shell kill, pkill, or tmux cleanup commands. " +
+                        "Ask the operator to enable jobs/job_decide or clear the job externally.",
+                };
+            }
+            if (
+                event.toolName !== "job_decide" &&
+                event.toolName !== "jobs" &&
+                event.toolName !== "bash"
+            ) {
+                return {
+                    block: true,
+                    reason: `A background job (${state.pendingDecisionJobId}) is awaiting your decision (${status}). Use ${controls.join(" or ")} first.`,
+                };
+            }
         }
 
         // ── Permission system ──────────────────────────────────────
@@ -639,6 +657,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                       previousMode?: import("./features/permissions/types.js").PermissionMode;
                       enteredAt?: number;
                       reviewPending?: boolean;
+                      toolsBeforePlanMode?: string[];
                   };
               }
             | undefined;
@@ -653,23 +672,28 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 state.planReviewPending =
                     planModeEntry.data.reviewPending ?? false;
                 state.planEnteredAt = planModeEntry.data.enteredAt;
+                state.toolsBeforePlanMode =
+                    planModeEntry.data.toolsBeforePlanMode;
             } else {
                 state.planSlug = undefined;
                 state.planPreviousMode = undefined;
                 state.planReviewPending = false;
                 state.planEnteredAt = undefined;
+                state.toolsBeforePlanMode = undefined;
             }
-        }
-
-        if (state.permissionMode === "plan") {
-            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
         }
 
         // Restore task state
         reconstructTaskState(state, ctx);
 
-        // Restore tools-selector state
+        // Restore the user's normal tool selection before applying the
+        // temporary plan-mode restriction. This also gives restored plan
+        // sessions an exact selection to return to on approval/cancel.
         restoreToolsFromBranch(pi, state, ctx);
+        if (state.permissionMode === "plan") {
+            state.toolsBeforePlanMode ??= Array.from(state.enabledTools);
+            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
+        }
 
         // ── Permission state initialisation ────────────────────────
         const permState = await initPermissionState(ctx.cwd);

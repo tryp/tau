@@ -32,6 +32,7 @@ import {
 } from "./plan-preferences.ts";
 import { formatTaskTree, countIndependentBranches } from "./task.ts";
 import { captureReload } from "./reload.ts";
+import { NORMAL_MODE_TOOLS } from "../utils.ts";
 
 // ─── Tool parameter schemas ─────────────────────────────────────────
 
@@ -102,6 +103,31 @@ export const PLAN_MODE_ACTIVE_TOOLS = [
     "exit_plan_mode",
 ];
 
+/** Capture the user's active tool selection before plan mode narrows it. */
+export function captureToolsBeforePlanMode(
+    pi: ExtensionAPI,
+    state: TauState
+): void {
+    if (state.toolsBeforePlanMode === undefined) {
+        state.toolsBeforePlanMode = pi.getActiveTools();
+    }
+}
+
+/** Restore the exact pre-plan tool selection instead of a hard-coded subset. */
+export function restoreToolsAfterPlanMode(
+    pi: ExtensionAPI,
+    state: TauState
+): void {
+    const tools =
+        state.toolsBeforePlanMode ??
+        (state.enabledTools.size > 0
+            ? Array.from(state.enabledTools)
+            : NORMAL_MODE_TOOLS);
+    pi.setActiveTools(tools);
+    state.enabledTools = new Set(tools);
+    state.toolsBeforePlanMode = undefined;
+}
+
 // ─── Feature registration ───────────────────────────────────────────
 
 export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
@@ -133,6 +159,10 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             // Create plan file
             const planPath = createPlanFile(sessionDir, planId, title);
 
+            // Preserve the user's complete tool selection. Plan mode temporarily
+            // narrows tools; execution must restore this exact selection.
+            captureToolsBeforePlanMode(pi, state);
+
             // Store previous mode for restoration
             state.planSlug = planId;
             state.planPreviousMode = state.permissionMode;
@@ -158,6 +188,7 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                 previousMode: state.planPreviousMode,
                 enteredAt: Date.now(),
                 reviewPending: false,
+                toolsBeforePlanMode: state.toolsBeforePlanMode,
             });
 
             return {
@@ -412,7 +443,7 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             state.planExiting = true;
             state.planEnteredAt = undefined;
             state.permissionMode = previousMode;
-            pi.setActiveTools(["read", "bash", "edit", "write"]);
+            restoreToolsAfterPlanMode(pi, state);
 
             // Update status bar
             if (ctx.hasUI) {
@@ -631,7 +662,7 @@ export function cancelPlanMode(
     state.planExiting = false;
     state.planReviewPending = false;
     state.planEnteredAt = undefined;
-    pi.setActiveTools(["read", "bash", "edit", "write"]);
+    restoreToolsAfterPlanMode(pi, state);
 
     if (ctx.hasUI) {
         const colour = modeColour(previousMode);

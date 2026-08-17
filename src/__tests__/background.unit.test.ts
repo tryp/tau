@@ -645,6 +645,40 @@ void describe("startTimeoutTimer", () => {
         clearTimeout(timer);
     });
 
+    void it("does NOT background when no job-control tool is available", async () => {
+        const state = new TauState();
+        state.currentlyRunningToolCallId = "tc-no-control";
+        let triggered = false;
+        let unavailable = false;
+        state.runningProcesses.set("tc-no-control", {
+            toolCallId: "tc-no-control",
+            proc: { pid: -88887 } as never,
+            command: "npm test",
+            logPath: "/tmp/test-no-control.log",
+            triggerBackground: () => {},
+        });
+
+        const timer = startTimeoutTimer(
+            () => {
+                triggered = true;
+            },
+            "npm test",
+            state,
+            "tc-no-control",
+            50,
+            () => false,
+            () => {
+                unavailable = true;
+            }
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        assert.equal(triggered, false);
+        assert.equal(unavailable, true);
+        clearTimeout(timer);
+    });
+
     void it("does NOT trigger for disallowed commands (sleep)", async () => {
         const state = new TauState();
         state.currentlyRunningToolCallId = "tc-timeout-sleep";

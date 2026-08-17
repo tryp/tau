@@ -49,6 +49,7 @@ function makeAgentReviewHarness() {
 
     const tools = new Map<string, RegisteredTool>();
     const sentMessages: unknown[] = [];
+    const activeToolCalls: string[][] = [];
     let selectCalls = 0;
     const pi = {
         registerTool(definition: {
@@ -58,7 +59,9 @@ function makeAgentReviewHarness() {
             tools.set(definition.name, definition);
         },
         registerCommand() {},
-        setActiveTools() {},
+        setActiveTools(names: string[]) {
+            activeToolCalls.push(names);
+        },
         appendEntry() {},
         sendMessage(message: unknown) {
             sentMessages.push(message);
@@ -85,6 +88,7 @@ function makeAgentReviewHarness() {
         state,
         tools,
         sentMessages,
+        activeToolCalls,
         get selectCalls() {
             return selectCalls;
         },
@@ -112,7 +116,12 @@ void describe("agent-driven plan review", () => {
     void it("keeps subagent planning and review tools available", () => {
         assert.deepEqual(
             PLAN_MODE_ACTIVE_TOOLS.filter((tool) =>
-                ["subagent", "subagent_wait", "enter_plan_mode", "exit_plan_mode"].includes(tool)
+                [
+                    "subagent",
+                    "subagent_wait",
+                    "enter_plan_mode",
+                    "exit_plan_mode",
+                ].includes(tool)
             ),
             ["subagent", "subagent_wait", "enter_plan_mode", "exit_plan_mode"]
         );
@@ -147,6 +156,27 @@ void describe("agent-driven plan review", () => {
             assert.equal(approved.details?.approved, true);
             assert.equal(harness.state.permissionMode, "allow");
             assert.equal(harness.selectCalls, 0);
+        } finally {
+            harness.cleanup();
+        }
+    });
+
+    void it("restores the complete pre-plan tool selection after approval", async () => {
+        const harness = makeAgentReviewHarness();
+        try {
+            const toolsBeforePlan = [
+                "read",
+                "bash",
+                "subagent",
+                "jobs",
+                "job_decide",
+            ];
+            harness.state.toolsBeforePlanMode = toolsBeforePlan;
+            harness.state.enabledTools = new Set(toolsBeforePlan);
+            await callExit(harness, { action: "review" });
+            await callExit(harness, { action: "approve" });
+            assert.deepEqual(harness.activeToolCalls.at(-1), toolsBeforePlan);
+            assert.equal(harness.state.toolsBeforePlanMode, undefined);
         } finally {
             harness.cleanup();
         }

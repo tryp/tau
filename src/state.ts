@@ -115,6 +115,9 @@ export class TauState {
     enabledTools = new Set<string>();
     allTools: ToolInfo[] = [];
 
+    /** Active tools captured before entering plan mode, for exact restoration. */
+    toolsBeforePlanMode: string[] | undefined;
+
     // ── Feature toggle overrides ─────────────────────────────────────
     // Three in-memory layers (temporary, session) plus three file-based
     // layers (cwd, project, global). The `thread` layer is reconstructed

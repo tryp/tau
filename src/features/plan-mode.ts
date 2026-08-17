@@ -18,8 +18,11 @@ import { isFeatureEnabled } from "./features-helpers.ts";
 import type { PermissionMode } from "./permissions/types.js";
 import { modeStatusText, modeColour } from "./permissions/index.js";
 import { planIdFromSession, createPlanFile } from "./plan-file.ts";
-import { NORMAL_MODE_TOOLS } from "../utils.ts";
-import { PLAN_MODE_ACTIVE_TOOLS } from "./plan-tools.ts";
+import {
+    captureToolsBeforePlanMode,
+    PLAN_MODE_ACTIVE_TOOLS,
+    restoreToolsAfterPlanMode,
+} from "./plan-tools.ts";
 
 /**
  * Auto-exit plan mode after 30 minutes of inactivity.
@@ -48,7 +51,7 @@ export function togglePlanMode(
         state.planPreviousMode = undefined;
         state.planReviewPending = false;
         state.planEnteredAt = undefined;
-        pi.setActiveTools(NORMAL_MODE_TOOLS);
+        restoreToolsAfterPlanMode(pi, state);
 
         if (ctx.hasUI) {
             const colour = modeColour(previousMode);
@@ -71,6 +74,7 @@ export function togglePlanMode(
         state.planSlug = planId;
         state.planReviewPending = false;
         state.planEnteredAt = Date.now();
+        captureToolsBeforePlanMode(pi, state);
         pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
 
         if (ctx.hasUI) {
