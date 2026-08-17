@@ -4,6 +4,7 @@ import {
     registerBackgroundJobs,
     notifyCompletion,
     clearPendingDecision,
+    clearStalePendingDecision,
     clearAllCompletionBatches,
     formatJobOutput,
     getOutputMetadata,
@@ -240,6 +241,37 @@ void describe("lookupJob", () => {
 });
 
 // ─── clearPendingDecision ─────────────────────────────────────────────
+
+void describe("clearStalePendingDecision", () => {
+    void it("clears a pending decision for a missing job", () => {
+        const state = new TauState();
+        state.pendingDecisionJobId = "job-missing";
+        clearStalePendingDecision(state);
+        assert.equal(state.pendingDecisionJobId, undefined);
+    });
+
+    void it("clears a pending decision for a terminal job", () => {
+        const state = new TauState();
+        state.pendingDecisionJobId = "job-done";
+        state.backgroundJobs.set(
+            "job-done",
+            makeJob({ id: "job-done", status: "failed" })
+        );
+        clearStalePendingDecision(state);
+        assert.equal(state.pendingDecisionJobId, undefined);
+    });
+
+    void it("preserves a pending decision for a running job", () => {
+        const state = new TauState();
+        state.pendingDecisionJobId = "job-running";
+        state.backgroundJobs.set(
+            "job-running",
+            makeJob({ id: "job-running", status: "running" })
+        );
+        clearStalePendingDecision(state);
+        assert.equal(state.pendingDecisionJobId, "job-running");
+    });
+});
 
 void describe("clearPendingDecision", () => {
     void it("clears pendingDecisionJobId when it matches the job id", () => {

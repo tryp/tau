@@ -37,6 +37,7 @@ import {
 
 // Existing features
 import {
+    clearStalePendingDecision,
     getActiveBackgroundControlTools,
     purgeSidecar,
     registerBackgroundJobs,
@@ -287,9 +288,11 @@ export default function (pi: ExtensionAPI) {
             };
         }
 
-        // Pending job decision: block unrelated tools. If the control tools
-        // themselves are inactive, block bash too: allowing shell cleanup here
-        // turns a recoverable configuration mistake into a pkill/timeout loop.
+        // Pending job decision: block unrelated tools. Completion can arrive
+        // through a different lifecycle path (or a restored session), so clear
+        // terminal/missing jobs before applying the gate. Otherwise a stale
+        // notification can permanently block a session with no control tool.
+        clearStalePendingDecision(state);
         if (state.pendingDecisionJobId !== undefined) {
             const job = state.backgroundJobs.get(state.pendingDecisionJobId);
             const status =

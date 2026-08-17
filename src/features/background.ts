@@ -353,6 +353,24 @@ export function clearPendingDecision(
         state.pendingDecisionJobId = undefined;
 }
 
+/**
+ * Clear a pending decision that points at a terminal or missing job.
+ *
+ * The decision gate is persisted indirectly through the live state, while job
+ * completion can arrive through tmux callbacks, session restoration, or an
+ * older extension instance. Make the gate self-healing so a stale notification
+ * cannot permanently block the session when no control tool is available.
+ */
+export function clearStalePendingDecision(state: TauState): void {
+    const jobId = state.pendingDecisionJobId;
+    if (jobId === undefined) return;
+
+    const job = state.backgroundJobs.get(jobId);
+    if (!job || job.status !== "running") {
+        state.pendingDecisionJobId = undefined;
+    }
+}
+
 /** Maximum number of recent terminal jobs kept for output lookups. */
 const MAX_RECENT_TERMINAL = 100;
 
