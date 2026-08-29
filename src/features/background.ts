@@ -59,7 +59,10 @@ import type {
     AgentToolResult,
     AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+    ExtensionAPI,
+    ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
 import {
     createBashTool,
     type BashToolDetails,
@@ -344,6 +347,68 @@ export function lookupJob(
             (j) => j.id === jobId || j.id === `job-${jobId}`
         )
     );
+}
+
+/**
+ * Decide how the tool_call gate treats a tool call while a background job
+ * decision is pending.
+ *
+ * Session analysis of a deployed instance (45 days, ~220k edit results) showed
+ * blocking unrelated tool calls replaces their results with the gate reason —
+ * 3,905 polluted tool results in one window — wasting the call and hiding the
+ * real outcome from both the model and session analytics. Unrelated calls now
+ * proceed, and the model is steered once per pending decision instead; only
+ * the no-control-tools case still blocks, because there the model has no way
+ * to resolve the decision at all.
+ */
+export function evaluatePendingDecisionGate(
+    state: TauState,
+    pi: ExtensionAPI,
+    toolName: string
+): ToolCallEventResult {
+    clearStalePendingDecision(state);
+    if (state.pendingDecisionJobId === undefined) return {};
+
+    const job = state.backgroundJobs.get(state.pendingDecisionJobId);
+    const status =
+        job?.status === "running"
+            ? "still running"
+            : (job?.status ?? "unknown");
+    const controls = getActiveBackgroundControlTools(pi);
+    if (controls.length === 0) {
+        return {
+            block: true,
+            reason:
+                `A background job (${state.pendingDecisionJobId}) is awaiting a decision (${status}), ` +
+                "but this session has no active job-control tool (jobs/job_decide). " +
+                "Do not run shell kill, pkill, or tmux cleanup commands. " +
+                "Ask the operator to enable jobs/job_decide or clear the job externally.",
+        };
+    }
+    if (
+        toolName === "job_decide" ||
+        toolName === "jobs" ||
+        toolName === "bash"
+    ) {
+        return {};
+    }
+
+    // Let the call proceed; steer once per pending decision so the model
+    // handles it without losing work already in flight.
+    if (state.decisionSteerJobId !== state.pendingDecisionJobId) {
+        state.decisionSteerJobId = state.pendingDecisionJobId;
+        pi.sendMessage(
+            {
+                customType: "tau-pending-decision",
+                content:
+                    `A background job (${state.pendingDecisionJobId}) is awaiting your decision (${status}). ` +
+                    `Use ${controls.join(" or ")} before continuing with other work.`,
+                display: true,
+            },
+            { deliverAs: "steer" }
+        );
+    }
+    return {};
 }
 
 /**

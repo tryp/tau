@@ -30,6 +30,8 @@ export class TauState {
     currentlyRunningToolCallId: string | null = null;
     agentBackgrounded = false;
     pendingDecisionJobId: string | undefined;
+    /** Job id the pending-decision steer was last sent for (avoid repeat steers). */
+    decisionSteerJobId: string | undefined;
 
     /** Whether tmux is available for the tmux-backed bash backend. */
     tmuxAvailable = false;

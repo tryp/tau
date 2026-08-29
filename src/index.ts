@@ -37,8 +37,7 @@ import {
 
 // Existing features
 import {
-    clearStalePendingDecision,
-    getActiveBackgroundControlTools,
+    evaluatePendingDecisionGate,
     purgeSidecar,
     registerBackgroundJobs,
 } from "./features/background.ts";
@@ -288,38 +287,16 @@ export default function (pi: ExtensionAPI) {
             };
         }
 
-        // Pending job decision: block unrelated tools. Completion can arrive
-        // through a different lifecycle path (or a restored session), so clear
-        // terminal/missing jobs before applying the gate. Otherwise a stale
-        // notification can permanently block a session with no control tool.
-        clearStalePendingDecision(state);
-        if (state.pendingDecisionJobId !== undefined) {
-            const job = state.backgroundJobs.get(state.pendingDecisionJobId);
-            const status =
-                job?.status === "running"
-                    ? "still running"
-                    : (job?.status ?? "unknown");
-            const controls = getActiveBackgroundControlTools(pi);
-            if (controls.length === 0) {
-                return {
-                    block: true,
-                    reason:
-                        `A background job (${state.pendingDecisionJobId}) is awaiting a decision (${status}), ` +
-                        "but this session has no active job-control tool (jobs/job_decide). " +
-                        "Do not run shell kill, pkill, or tmux cleanup commands. " +
-                        "Ask the operator to enable jobs/job_decide or clear the job externally.",
-                };
-            }
-            if (
-                event.toolName !== "job_decide" &&
-                event.toolName !== "jobs" &&
-                event.toolName !== "bash"
-            ) {
-                return {
-                    block: true,
-                    reason: `A background job (${state.pendingDecisionJobId}) is awaiting your decision (${status}). Use ${controls.join(" or ")} first.`,
-                };
-            }
+        // Pending job decision: unrelated tools proceed and the model is
+        // steered once per decision (see evaluatePendingDecisionGate). Only
+        // the no-control-tools case still blocks.
+        const pendingDecisionGate = evaluatePendingDecisionGate(
+            state,
+            pi,
+            event.toolName
+        );
+        if (pendingDecisionGate.block) {
+            return pendingDecisionGate;
         }
 
         // ── Permission system ──────────────────────────────────────

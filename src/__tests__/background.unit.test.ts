@@ -1,6 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+    evaluatePendingDecisionGate,
     registerBackgroundJobs,
     notifyCompletion,
     clearPendingDecision,
@@ -1956,5 +1957,108 @@ void describe("job cleanup after completion", () => {
             }
         }
         assert.equal(state.recentTerminalJobs.length, 20);
+    });
+});
+
+// ─── evaluatePendingDecisionGate (steer instead of block) ─────────────
+
+void describe("evaluatePendingDecisionGate", () => {
+    function makeGateState(
+        job: BackgroundJob | undefined,
+        pendingId = "job-1-1"
+    ) {
+        const state = new TauState();
+        state.pendingDecisionJobId = pendingId;
+        if (job) state.backgroundJobs.set(job.id, job);
+        const sent: Array<{ message: unknown; options: unknown }> = [];
+        const pi = {
+            sendMessage: (message: unknown, options: unknown) => {
+                sent.push({ message, options });
+            },
+        } as unknown as Parameters<typeof evaluatePendingDecisionGate>[1];
+        return { state, pi, sent };
+    }
+
+    void it("allows unrelated tools and steers once per pending decision", () => {
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+
+        const first = evaluatePendingDecisionGate(state, pi, "edit");
+        assert.equal(
+            first.block,
+            undefined,
+            "unrelated tool must not be blocked"
+        );
+        assert.equal(sent.length, 1, "exactly one steer for the first call");
+        const [steer] = sent as Array<{
+            message: { customType: string; content: string };
+            options: { deliverAs: string };
+        }>;
+        assert.equal(steer.message.customType, "tau-pending-decision");
+        assert.match(steer.message.content, /awaiting your decision/);
+        assert.equal(steer.options.deliverAs, "steer");
+
+        const bashPass = evaluatePendingDecisionGate(state, pi, "bash");
+        assert.equal(bashPass.block, undefined, "bash must pass through");
+        assert.equal(sent.length, 1);
+
+        const second = evaluatePendingDecisionGate(state, pi, "read");
+        assert.equal(second.block, undefined);
+        assert.equal(
+            sent.length,
+            1,
+            "no duplicate steer for the same decision"
+        );
+
+        const control = evaluatePendingDecisionGate(state, pi, "job_decide");
+        assert.equal(control.block, undefined);
+        assert.equal(sent.length, 1);
+    });
+
+    void it("re-steers when a different job becomes pending", () => {
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        evaluatePendingDecisionGate(state, pi, "edit");
+
+        const job2 = makeJob({ id: "job-2-1", status: "running" });
+        state.backgroundJobs.set(job2.id, job2);
+        state.pendingDecisionJobId = "job-2-1";
+        evaluatePendingDecisionGate(state, pi, "edit");
+
+        assert.equal(sent.length, 2, "one steer per distinct pending decision");
+    });
+
+    void it("still blocks every tool when no control tool is available", () => {
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        // Explicit tool list without jobs/job_decide -> gate must block.
+        (pi as { getActiveTools: () => string[] }).getActiveTools = () => [
+            "bash",
+        ];
+        const result = evaluatePendingDecisionGate(state, pi, "edit");
+        assert.equal(result.block, true);
+        assert.match(String(result.reason), /no active job-control tool/);
+        assert.equal(sent.length, 0, "no steer in the blocking case");
+    });
+
+    void it("clears stale terminal jobs instead of steering on them", () => {
+        const job = makeJob({ id: "job-1-1", status: "completed" });
+        const { state, pi, sent } = makeGateState(job);
+        const result = evaluatePendingDecisionGate(state, pi, "edit");
+        assert.equal(result.block, undefined);
+        assert.equal(
+            state.pendingDecisionJobId,
+            undefined,
+            "stale decision cleared"
+        );
+        assert.equal(sent.length, 0, "no steer for an already-terminal job");
+    });
+
+    void it("control tools always pass through without steering", () => {
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        const result = evaluatePendingDecisionGate(state, pi, "jobs");
+        assert.equal(result.block, undefined);
+        assert.equal(sent.length, 0, "control tools do not trigger the steer");
     });
 });
