@@ -674,12 +674,15 @@ function preparedOutputDetails(
             : {}),
         ...(prepared.empty !== undefined ? { empty: prepared.empty } : {}),
         truncated: prepared.truncated,
-        ...(prepared.partial !== undefined ? { partial: prepared.partial } : {}),
+        ...(prepared.partial !== undefined
+            ? { partial: prepared.partial }
+            : {}),
         ...(prepared.indexOutcome
             ? {
                   sidecarIndexStatus: prepared.indexOutcome.status,
                   sidecarIndexReason: prepared.indexOutcome.reason,
-                  sidecarIndexErrorCategory: prepared.indexOutcome.errorCategory,
+                  sidecarIndexErrorCategory:
+                      prepared.indexOutcome.errorCategory,
               }
             : {}),
         ...(prepared.source
@@ -897,7 +900,11 @@ function deliverCompletionNotification(
                 customType: "job-completion",
                 content:
                     `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
-                    `Command: ${job.command}\nOutput: ${job.logPath}${resourceInfo}`,
+                    `Command: ${job.command}\nOutput: ${job.logPath}${
+                        job.sidecarIndexStatus === "failed"
+                            ? `\nWarning: sidecar indexing failed (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at the log path.`
+                            : ""
+                    }${resourceInfo}`,
                 display: true,
                 details: {
                     jobId: job.id,
@@ -908,6 +915,9 @@ function deliverCompletionNotification(
                     logPath: job.logPath,
                     sourceId: job.sourceId,
                     chunkIds: job.chunkIds,
+                    sidecarIndexStatus: job.sidecarIndexStatus,
+                    sidecarIndexReason: job.sidecarIndexReason,
+                    sidecarIndexErrorCategory: job.sidecarIndexErrorCategory,
                     outstandingJobs: outstandingCount,
                 },
             },
@@ -927,6 +937,10 @@ function deliverCompletionNotification(
         (j) =>
             `  ${j.emoji} ${j.job.id} ${j.job.status} (${j.duration})${
                 j.job.exitCode !== undefined ? `, exit ${j.job.exitCode}` : ""
+            }${
+                j.job.sidecarIndexStatus === "failed"
+                    ? `, sidecar indexing failed (${j.job.sidecarIndexErrorCategory ?? "unknown"})`
+                    : ""
             }`
     );
     const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
@@ -949,6 +963,9 @@ function deliverCompletionNotification(
                     logPath: b.job.logPath,
                     sourceId: b.job.sourceId,
                     chunkIds: b.job.chunkIds,
+                    sidecarIndexStatus: b.job.sidecarIndexStatus,
+                    sidecarIndexReason: b.job.sidecarIndexReason,
+                    sidecarIndexErrorCategory: b.job.sidecarIndexErrorCategory,
                 })),
                 outstandingJobs: outstandingCount,
             },
@@ -1068,6 +1085,12 @@ export function notifyCompletion(
             suppressedCompletionJobIds.delete(job.id)
         )
             return;
+        if (job.sidecarIndexStatus === "failed") {
+            ctx.ui.notify(
+                `Sidecar indexing failed for ${job.id} (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at ${job.logPath}`,
+                "warning"
+            );
+        }
         completionBatch.jobs.push({ job, duration, emoji });
         completionBatch.pi = pi;
         completionBatch.state = state;

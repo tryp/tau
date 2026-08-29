@@ -443,7 +443,10 @@ void describe("indexJobOutputInSidecar", () => {
 
     void it("reports indexed output and eligible coverage counters", async () => {
         createDb(tmpDir);
-        const job = testJob({ id: "job-index-outcome", logPath: writeLog("hello") });
+        const job = testJob({
+            id: "job-index-outcome",
+            logPath: writeLog("hello"),
+        });
         const outcome = await indexJobOutputWithOutcome(job, { cwd: tmpDir });
         assert.equal(outcome.status, "indexed");
         assert.equal(outcome.eligible, true);
@@ -461,8 +464,35 @@ void describe("indexJobOutputInSidecar", () => {
         });
     });
 
+    void it("classifies unreadable output as a non-eligible failure", async () => {
+        const job = testJob({
+            id: "job-read-failed",
+            logPath: join(tmpDir, "missing-output.log"),
+        });
+        const outcome = await indexJobOutputWithOutcome(job, {});
+        assert.deepEqual(outcome, {
+            status: "failed",
+            eligible: false,
+            reason: "read_failed",
+            errorCategory: "io",
+        });
+        assert.deepEqual(getSidecarIndexStats(), {
+            attempts: 1,
+            eligible: 0,
+            indexed: 0,
+            skipped: 0,
+            failed: 1,
+            emptySkipped: 0,
+            unavailableSkipped: 0,
+            schemaSkipped: 0,
+        });
+    });
+
     void it("keeps the legacy source-only API compatible", async () => {
-        const job = testJob({ id: "job-skip-legacy", logPath: writeLog("hello") });
+        const job = testJob({
+            id: "job-skip-legacy",
+            logPath: writeLog("hello"),
+        });
         assert.equal(await indexJobOutputInSidecar(job, {}), undefined);
     });
 

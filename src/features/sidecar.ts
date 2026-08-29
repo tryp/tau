@@ -556,9 +556,10 @@ export async function prepareInlineOutput(
     toolName = "bash"
 ): Promise<PreparedInlineOutput> {
     const bytes = Buffer.byteLength(output, "utf8");
-    const totalLines = output.length === 0
-        ? 0
-        : output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
+    const totalLines =
+        output.length === 0
+            ? 0
+            : output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
     const empty = output.trim().length === 0;
     if (!isLargeInlineOutput(output)) {
         return {
@@ -826,7 +827,6 @@ export async function indexJobOutputWithOutcome(
             reason: "read_failed",
             errorCategory: "io",
         };
-        sidecarIndexStats.eligible += 1;
         sidecarIndexStats.failed += 1;
         return outcome;
     }
@@ -865,7 +865,9 @@ export async function indexJobOutputWithOutcome(
             toolName,
             dbPath
         );
-        const sourceId = apiSourceId ?? await indexViaDirectDb(text, job, ctx, toolName, dbPath);
+        const sourceId =
+            apiSourceId ??
+            (await indexViaDirectDb(text, job, ctx, toolName, dbPath));
         if (!sourceId) {
             const outcome: SidecarIndexOutcome = {
                 status: "skipped",
@@ -889,9 +891,14 @@ export async function indexJobOutputWithOutcome(
         sidecarIndexStats.indexed += 1;
         return outcome;
     } catch (error) {
-        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        const message =
+            error instanceof Error
+                ? error.message.toLowerCase()
+                : String(error).toLowerCase();
         const errorCategory: SidecarIndexOutcome["errorCategory"] =
-            /no such table|no such column|malformed schema|fts5|constraint failed/.test(message)
+            /no such table|no such column|malformed schema|fts5|constraint failed/.test(
+                message
+            )
                 ? "schema"
                 : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(message)
                   ? "io"
@@ -919,7 +926,8 @@ export async function indexJobOutputInSidecar(
     ctx: SidecarContext,
     toolName: string = "bash_bg"
 ): Promise<string | undefined> {
-    return (await indexJobOutputWithOutcome(job, ctx, toolName)).source?.sourceId;
+    return (await indexJobOutputWithOutcome(job, ctx, toolName)).source
+        ?.sourceId;
 }
 
 /**

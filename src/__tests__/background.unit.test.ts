@@ -421,7 +421,10 @@ void describe("jobs output — structured details", () => {
             assert.equal(details.truncated, false);
             assert.equal(details.partial, true);
             assert.equal(details.omittedLines, 2);
-            assert.equal(details.byteCount, Buffer.byteLength("first\nsecond\nthird\n", "utf8"));
+            assert.equal(
+                details.byteCount,
+                Buffer.byteLength("first\nsecond\nthird\n", "utf8")
+            );
             assert.equal(details.empty, false);
             assert.equal(details.error, false);
             assert.equal(details.logPath, logPath);
@@ -1743,7 +1746,8 @@ void describe("bash tool — foreground completion cleanup", () => {
             assert.equal(typeof details.fullOutputPath, "string");
             assert.equal(details.sourceId, undefined);
         } finally {
-            if (previousRoot === undefined) delete process.env.PI_CODING_AGENT_DIR;
+            if (previousRoot === undefined)
+                delete process.env.PI_CODING_AGENT_DIR;
             else process.env.PI_CODING_AGENT_DIR = previousRoot;
             rmSync(sidecarRoot, { recursive: true, force: true });
         }
