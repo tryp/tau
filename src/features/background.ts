@@ -438,6 +438,12 @@ export interface OutputMetadata {
     totalLines: number;
     /** Whether the input already contained a truncation marker. */
     truncated: boolean;
+    /** Whether this response is only a view of the available output. */
+    partial: boolean;
+    /** Number of lines omitted by head/tail or grep filtering, when known. */
+    omittedLines?: number;
+    /** Original output size in UTF-8 bytes, when known. */
+    byteCount: number;
     /** Whether there is no meaningful output. */
     empty: boolean;
     /** Whether reading or formatting the output failed. */
@@ -473,6 +479,8 @@ export function getOutputMetadata(text: string, error = false): OutputMetadata {
     return {
         totalLines: lines.length,
         truncated: text.startsWith("...[truncated"),
+        partial: text.startsWith("...[truncated"),
+        byteCount: Buffer.byteLength(text, "utf8"),
         empty:
             emptyPlaceholder ||
             text.length === 0 ||
@@ -511,6 +519,8 @@ export function formatJobOutput(
                 text: `(grep error: invalid regex /${grepPattern}/i)`,
                 totalLines: 0,
                 truncated: inputMetadata.truncated,
+                partial: inputMetadata.partial,
+                byteCount: inputMetadata.byteCount,
                 empty: false,
                 error: true,
                 isTruncated: false,
@@ -522,6 +532,7 @@ export function formatJobOutput(
     }
 
     const totalLines = matched.length;
+    const filteredLines = lines.length - matched.length;
 
     if (matched.length === 0) {
         const text = grepPattern
@@ -531,6 +542,9 @@ export function formatJobOutput(
             text,
             totalLines,
             truncated: inputMetadata.truncated,
+            partial: inputMetadata.partial || lines.length > 0,
+            byteCount: inputMetadata.byteCount,
+            ...(lines.length > 0 ? { omittedLines: lines.length } : {}),
             empty: true,
             error: false,
             isTruncated: false,
@@ -563,10 +577,14 @@ export function formatJobOutput(
         result += `\n... (${hints.join(", ")}, use head=N or tail=N to see more${suggestion})`;
     }
 
+    const omittedLines = filteredLines + (totalLines - matched.length);
     return {
         text: result,
         totalLines,
         truncated: metadata.truncated,
+        partial: metadata.partial || omittedLines > 0,
+        ...(omittedLines > 0 ? { omittedLines } : {}),
+        byteCount: metadata.byteCount,
         empty: metadata.empty,
         error: false,
         isTruncated: metadata.truncated,
@@ -626,6 +644,36 @@ function outputDetails(
 
 function outputReadFailed(job: BackgroundJob, output: string): boolean {
     return output === "(no output yet)" && !existsSync(job.logPath);
+}
+
+/**
+ * Preserve the same structured output metadata for foreground bash results
+ * that jobs output already returns for background jobs. Short complete output
+ * stays lightweight; reduced output carries its recovery reference and size.
+ */
+function preparedOutputDetails(
+    prepared: Awaited<ReturnType<typeof prepareInlineOutput>>,
+    logPath: string
+): Partial<JobResultDetails> | undefined {
+    if (!prepared.truncated && !prepared.source) return undefined;
+    return {
+        ...(prepared.totalLines !== undefined
+            ? { totalLines: prepared.totalLines }
+            : {}),
+        ...(prepared.byteCount !== undefined
+            ? { byteCount: prepared.byteCount }
+            : {}),
+        ...(prepared.empty !== undefined ? { empty: prepared.empty } : {}),
+        truncated: prepared.truncated,
+        ...(prepared.partial !== undefined ? { partial: prepared.partial } : {}),
+        ...(prepared.source
+            ? {
+                  sourceId: prepared.source.sourceId,
+                  chunkIds: prepared.source.chunkIds,
+              }
+            : {}),
+        fullOutputPath: logPath,
+    };
 }
 
 /**
@@ -1502,9 +1550,7 @@ export function registerBackgroundJobs(
                         content: [
                             { type: "text" as const, text: prepared.text },
                         ],
-                        details: prepared.truncated
-                            ? { fullOutputPath: logPath }
-                            : undefined,
+                        details: preparedOutputDetails(prepared, logPath),
                     };
                 }
 
@@ -1623,9 +1669,7 @@ export function registerBackgroundJobs(
 
                 return {
                     content: [{ type: "text" as const, text: prepared.text }],
-                    details: prepared.truncated
-                        ? { fullOutputPath: logPath }
-                        : undefined,
+                    details: preparedOutputDetails(prepared, logPath),
                 };
             } finally {
                 clearInterval(pollTimer);
@@ -2033,6 +2077,11 @@ export function registerBackgroundJobs(
                         const metadata: OutputMetadata = {
                             totalLines: formatted.totalLines,
                             truncated: formatted.truncated,
+                            partial: formatted.partial,
+                            ...(formatted.omittedLines !== undefined
+                                ? { omittedLines: formatted.omittedLines }
+                                : {}),
+                            byteCount: formatted.byteCount,
                             empty: formatted.empty,
                             error:
                                 formatted.error ||
@@ -2695,9 +2744,7 @@ async function executeTmuxForeground(
             }
             return {
                 content: [{ type: "text" as const, text: prepared.text }],
-                details: prepared.truncated
-                    ? { fullOutputPath: logPath }
-                    : undefined,
+                details: preparedOutputDetails(prepared, logPath),
             };
         }
 
@@ -2833,9 +2880,7 @@ async function executeTmuxForeground(
 
         return {
             content: [{ type: "text" as const, text: prepared.text }],
-            details: prepared.truncated
-                ? { fullOutputPath: logPath }
-                : undefined,
+            details: preparedOutputDetails(prepared, logPath),
         };
     } finally {
         clearInterval(pollTimer);

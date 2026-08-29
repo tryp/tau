@@ -305,17 +305,21 @@ void describe("jobs output — structured details", () => {
         assert.deepEqual(getOutputMetadata(""), {
             totalLines: 0,
             truncated: false,
+            partial: false,
+            byteCount: 0,
             empty: true,
             error: false,
         });
         assert.equal(getOutputMetadata(" \n\t").empty, true);
         assert.equal(formatJobOutput({ text: " \n\t" }).empty, true);
         assert.equal(formatJobOutput({ text: "one\n" }).totalLines, 1);
-        assert.equal(formatJobOutput({ text: "one\ntwo\n" }).totalLines, 2);
-        assert.equal(
-            formatJobOutput({ text: "...[truncated]\none\n" }).truncated,
-            true
-        );
+        const sliced = formatJobOutput({ text: "one\ntwo\n", headCount: 1 });
+        assert.equal(sliced.totalLines, 2);
+        assert.equal(sliced.partial, true);
+        assert.equal(sliced.omittedLines, 1);
+        const marked = formatJobOutput({ text: "...[truncated]\none\n" });
+        assert.equal(marked.truncated, true);
+        assert.equal(marked.partial, true);
         assert.equal(
             formatJobOutput({
                 text: "...[truncated]\none\n",
@@ -415,6 +419,9 @@ void describe("jobs output — structured details", () => {
             assert.equal(details.exitCode, 0);
             assert.equal(details.totalLines, 3);
             assert.equal(details.truncated, false);
+            assert.equal(details.partial, true);
+            assert.equal(details.omittedLines, 2);
+            assert.equal(details.byteCount, Buffer.byteLength("first\nsecond\nthird\n", "utf8"));
             assert.equal(details.empty, false);
             assert.equal(details.error, false);
             assert.equal(details.logPath, logPath);
@@ -1711,6 +1718,35 @@ void describe("bash tool — foreground completion cleanup", () => {
             0,
             "foreground job must be removed from backgroundJobs after quick completion"
         );
+    });
+
+    void it("returns structured recovery metadata for large foreground output", async () => {
+        const { mkdtempSync, rmSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const sidecarRoot = mkdtempSync("/tmp/pi-tau-no-sidecar-");
+        const previousRoot = process.env.PI_CODING_AGENT_DIR;
+        process.env.PI_CODING_AGENT_DIR = sidecarRoot;
+        try {
+            const result = await captureBashTool(new TauState()).execute(
+                "tc-large-foreground",
+                { command: "python3 -c \"print('x' * 40000)\"" },
+                null,
+                null,
+                { cwd: tmpdir() }
+            );
+            const details = result.details as Record<string, unknown>;
+            assert.equal(details.truncated, true);
+            assert.equal(details.partial, true);
+            assert.equal(details.totalLines, 1);
+            assert.equal(details.byteCount, 40001);
+            assert.equal(details.empty, false);
+            assert.equal(typeof details.fullOutputPath, "string");
+            assert.equal(details.sourceId, undefined);
+        } finally {
+            if (previousRoot === undefined) delete process.env.PI_CODING_AGENT_DIR;
+            else process.env.PI_CODING_AGENT_DIR = previousRoot;
+            rmSync(sidecarRoot, { recursive: true, force: true });
+        }
     });
 });
 

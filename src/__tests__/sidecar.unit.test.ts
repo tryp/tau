@@ -572,6 +572,10 @@ void describe("indexJobOutputInSidecar", () => {
         );
 
         assert.equal(prepared.truncated, true);
+        assert.equal(prepared.partial, true);
+        assert.equal(prepared.byteCount, Buffer.byteLength(output, "utf8"));
+        assert.equal(prepared.totalLines, 2);
+        assert.equal(prepared.empty, false);
         assert.ok(prepared.source);
         assert.match(prepared.text, /\[context-sidecar\]/);
         assert.ok(prepared.text.length < 10_000);
@@ -588,7 +592,9 @@ void describe("indexJobOutputInSidecar", () => {
         const prepared = await prepareInlineOutput(job, {}, output, "bash");
 
         assert.equal(prepared.truncated, true);
+        assert.equal(prepared.partial, true);
         assert.equal(prepared.source, undefined);
+        assert.equal(prepared.empty, false);
         assert.ok(prepared.text.length <= INLINE_FALLBACK_MAX_CHARS + 100);
         assert.match(prepared.text, /\[truncated/);
     });

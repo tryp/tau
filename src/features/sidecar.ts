@@ -56,7 +56,16 @@ export interface SidecarSourceMatch extends JobOutputIndex {
 
 export interface PreparedInlineOutput {
     text: string;
+    /** Original output was reduced before being returned inline. */
     truncated: boolean;
+    /** This response is a view of the output rather than the complete output. */
+    partial?: boolean;
+    /** Number of lines in the original output, when known. */
+    totalLines?: number;
+    /** Original output size in UTF-8 bytes, when known. */
+    byteCount?: number;
+    /** Whether the original output contained no meaningful content. */
+    empty?: boolean;
     source?: JobOutputIndex;
 }
 
@@ -511,12 +520,22 @@ export async function prepareInlineOutput(
     output: string,
     toolName = "bash"
 ): Promise<PreparedInlineOutput> {
+    const bytes = Buffer.byteLength(output, "utf8");
+    const totalLines = output.length === 0
+        ? 0
+        : output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
+    const empty = output.trim().length === 0;
     if (!isLargeInlineOutput(output)) {
-        return { text: output || "(no output)", truncated: false };
+        return {
+            text: output || "(no output)",
+            truncated: false,
+            totalLines,
+            byteCount: bytes,
+            empty,
+        };
     }
 
-    const bytes = Buffer.byteLength(output, "utf8");
-    const lines = output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
+    const lines = totalLines;
     const sourceId = await indexJobOutputInSidecar(job, ctx, toolName);
     const source = sourceId
         ? (findJobSourceDetailsInSidecar(job.id) ?? { sourceId, chunkIds: [] })
@@ -525,11 +544,22 @@ export async function prepareInlineOutput(
         return {
             text: formatSidecarReceipt(toolName, source, bytes, lines),
             truncated: true,
+            partial: true,
+            totalLines: lines,
+            byteCount: bytes,
+            empty,
             source,
         };
     }
 
-    return { text: truncateInlineFallback(output), truncated: true };
+    return {
+        text: truncateInlineFallback(output),
+        truncated: true,
+        partial: true,
+        totalLines: lines,
+        byteCount: bytes,
+        empty,
+    };
 }
 
 /**

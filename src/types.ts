@@ -60,6 +60,14 @@ export interface JobResultDetails {
     sourceId?: string;
     /** Stable context-sidecar chunk IDs for the indexed output. */
     chunkIds?: string[];
+    /** Original output was reduced before being returned inline. */
+    partial?: boolean;
+    /** Number of lines omitted by a head/tail or grep view, when known. */
+    omittedLines?: number;
+    /** Original output size in UTF-8 bytes, when known. */
+    byteCount?: number;
+    /** Durable output path for foreground results when sidecar indexing is unavailable. */
+    fullOutputPath?: string;
 }
 
 export interface BackgroundJob {
