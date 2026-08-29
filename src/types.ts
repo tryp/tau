@@ -28,6 +28,35 @@ export interface JobOutputIndex {
     chunkIds: string[];
 }
 
+export type SidecarIndexStatus = "indexed" | "skipped" | "failed";
+
+/** Outcome of an optional sidecar indexing operation. */
+export interface SidecarIndexOutcome {
+    status: SidecarIndexStatus;
+    /** A non-empty result that would benefit from durable recovery. */
+    eligible: boolean;
+    source?: JobOutputIndex;
+    reason?:
+        | "empty_output"
+        | "sidecar_unavailable"
+        | "schema_unavailable"
+        | "read_failed"
+        | "index_failed";
+    errorCategory?: "io" | "schema" | "unavailable" | "unknown";
+}
+
+/** Cumulative sidecar indexing counters for diagnostics and analysis. */
+export interface SidecarIndexStats {
+    attempts: number;
+    eligible: number;
+    indexed: number;
+    skipped: number;
+    failed: number;
+    emptySkipped: number;
+    unavailableSkipped: number;
+    schemaSkipped: number;
+}
+
 /** Machine-readable metadata returned by background job tools. */
 export interface JobResultDetails {
     jobId?: string;
@@ -60,6 +89,12 @@ export interface JobResultDetails {
     sourceId?: string;
     /** Stable context-sidecar chunk IDs for the indexed output. */
     chunkIds?: string[];
+    /** Outcome of optional durable output indexing. */
+    sidecarIndexStatus?: SidecarIndexStatus;
+    /** Reason an output was skipped or failed to index. */
+    sidecarIndexReason?: SidecarIndexOutcome["reason"];
+    /** Sanitized category for an indexing failure or unavailable sidecar. */
+    sidecarIndexErrorCategory?: SidecarIndexOutcome["errorCategory"];
     /** Original output was reduced before being returned inline. */
     partial?: boolean;
     /** Number of lines omitted by a head/tail or grep view, when known. */
@@ -102,6 +137,10 @@ export interface BackgroundJob {
     chunkIds?: string[];
     /** Resolves when terminal output indexing finishes. */
     outputIndexPromise?: Promise<JobOutputIndex | undefined>;
+    /** Outcome of optional terminal-output indexing. */
+    sidecarIndexStatus?: SidecarIndexStatus;
+    sidecarIndexReason?: SidecarIndexOutcome["reason"];
+    sidecarIndexErrorCategory?: SidecarIndexOutcome["errorCategory"];
     /** Optional triggers that fire async events when conditions are met. */
     triggers?: JobTrigger[];
     /** Stops the active trigger monitor, if one is running. */

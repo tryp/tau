@@ -28,8 +28,11 @@ import { dirname, resolve as resolvePath } from "node:path";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
+    getSidecarIndexStats,
     indexJobOutputInSidecar,
+    indexJobOutputWithOutcome,
     purgeSidecar,
+    resetSidecarIndexStats,
     readJobOutputDetailsFromSidecar,
     prepareInlineOutput,
     readJobOutputFromSidecar,
@@ -40,8 +43,11 @@ import {
 export {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
+    getSidecarIndexStats,
     indexJobOutputInSidecar,
+    indexJobOutputWithOutcome,
     purgeSidecar,
+    resetSidecarIndexStats,
     readJobOutputDetailsFromSidecar,
     prepareInlineOutput,
     readJobOutputFromSidecar,
@@ -611,6 +617,9 @@ export function jobDetails(
         durationMs: (job.endTime ?? Date.now()) - job.startTime,
         sourceId: job.sourceId,
         chunkIds: job.chunkIds,
+        sidecarIndexStatus: job.sidecarIndexStatus,
+        sidecarIndexReason: job.sidecarIndexReason,
+        sidecarIndexErrorCategory: job.sidecarIndexErrorCategory,
         ...overrides,
     };
 }
@@ -666,6 +675,13 @@ function preparedOutputDetails(
         ...(prepared.empty !== undefined ? { empty: prepared.empty } : {}),
         truncated: prepared.truncated,
         ...(prepared.partial !== undefined ? { partial: prepared.partial } : {}),
+        ...(prepared.indexOutcome
+            ? {
+                  sidecarIndexStatus: prepared.indexOutcome.status,
+                  sidecarIndexReason: prepared.indexOutcome.reason,
+                  sidecarIndexErrorCategory: prepared.indexOutcome.errorCategory,
+              }
+            : {}),
         ...(prepared.source
             ? {
                   sourceId: prepared.source.sourceId,

@@ -14,7 +14,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import type { JobOutputIndex } from "../types.ts";
+import type {
+    JobOutputIndex,
+    SidecarIndexOutcome,
+    SidecarIndexStats,
+} from "../types.ts";
 
 /** Inline output limits mirror the context sidecar's baseline capture policy. */
 export const INLINE_CONTEXT_MAX_BYTES = 24 * 1024;
@@ -54,6 +58,17 @@ export interface SidecarSourceMatch extends JobOutputIndex {
     inputSummary: string;
 }
 
+let sidecarIndexStats: SidecarIndexStats = {
+    attempts: 0,
+    eligible: 0,
+    indexed: 0,
+    skipped: 0,
+    failed: 0,
+    emptySkipped: 0,
+    unavailableSkipped: 0,
+    schemaSkipped: 0,
+};
+
 export interface PreparedInlineOutput {
     text: string;
     /** Original output was reduced before being returned inline. */
@@ -67,6 +82,26 @@ export interface PreparedInlineOutput {
     /** Whether the original output contained no meaningful content. */
     empty?: boolean;
     source?: JobOutputIndex;
+    /** Outcome of the optional sidecar indexing attempt. */
+    indexOutcome?: SidecarIndexOutcome;
+}
+
+export function getSidecarIndexStats(): SidecarIndexStats {
+    return { ...sidecarIndexStats };
+}
+
+/** Reset process-local counters; intended for tests and isolated diagnostics. */
+export function resetSidecarIndexStats(): void {
+    sidecarIndexStats = {
+        attempts: 0,
+        eligible: 0,
+        indexed: 0,
+        skipped: 0,
+        failed: 0,
+        emptySkipped: 0,
+        unavailableSkipped: 0,
+        schemaSkipped: 0,
+    };
 }
 
 /**
@@ -536,10 +571,8 @@ export async function prepareInlineOutput(
     }
 
     const lines = totalLines;
-    const sourceId = await indexJobOutputInSidecar(job, ctx, toolName);
-    const source = sourceId
-        ? (findJobSourceDetailsInSidecar(job.id) ?? { sourceId, chunkIds: [] })
-        : undefined;
+    const indexOutcome = await indexJobOutputWithOutcome(job, ctx, toolName);
+    const source = indexOutcome.source;
     if (source) {
         return {
             text: formatSidecarReceipt(toolName, source, bytes, lines),
@@ -549,9 +582,9 @@ export async function prepareInlineOutput(
             byteCount: bytes,
             empty,
             source,
+            indexOutcome,
         };
     }
-
     return {
         text: truncateInlineFallback(output),
         truncated: true,
@@ -559,6 +592,7 @@ export async function prepareInlineOutput(
         totalLines: lines,
         byteCount: bytes,
         empty,
+        indexOutcome,
     };
 }
 
@@ -763,16 +797,117 @@ async function indexViaDirectDb(
 }
 
 /**
- * Index a completed job's output into the context sidecar SQLite database.
+ * Index a completed job's output and classify the result for diagnostics.
  *
- * Prefers pi-context's public ContextStore.index_external_output API when the
- * @spences10/pi-context package is available at runtime. Falls back to a direct
- * SQLite write using the same schema that context_search / context_get / context_list
- * expect. Skips silently if the DB or the sidecar tables don't exist.
- *
- * Each non-empty job gets its own source row so the jobId-to-source mapping
- * remains stable even when multiple jobs produce identical output.
+ * Non-empty output is eligible for durable recovery. Empty output is an
+ * intentional skip; an unavailable sidecar is also a skip, while read and
+ * schema/I/O failures are failed outcomes. The primary job result remains
+ * successful when this optional operation fails.
  */
+export async function indexJobOutputWithOutcome(
+    job: {
+        id: string;
+        command: string;
+        logPath: string;
+        exitCode?: number;
+        status?: string;
+    },
+    ctx: SidecarContext,
+    toolName: string = "bash_bg"
+): Promise<SidecarIndexOutcome> {
+    sidecarIndexStats.attempts += 1;
+    let text: string;
+    try {
+        text = await readFile(job.logPath, "utf-8");
+    } catch {
+        const outcome: SidecarIndexOutcome = {
+            status: "failed",
+            eligible: false,
+            reason: "read_failed",
+            errorCategory: "io",
+        };
+        sidecarIndexStats.eligible += 1;
+        sidecarIndexStats.failed += 1;
+        return outcome;
+    }
+
+    if (!text.trim()) {
+        const outcome: SidecarIndexOutcome = {
+            status: "skipped",
+            eligible: false,
+            reason: "empty_output",
+        };
+        sidecarIndexStats.skipped += 1;
+        sidecarIndexStats.emptySkipped += 1;
+        return outcome;
+    }
+
+    sidecarIndexStats.eligible += 1;
+    const dbPath = sidecarDbPath();
+    if (!existsSync(dbPath)) {
+        const outcome: SidecarIndexOutcome = {
+            status: "skipped",
+            eligible: true,
+            reason: "sidecar_unavailable",
+            errorCategory: "unavailable",
+        };
+        sidecarIndexStats.skipped += 1;
+        sidecarIndexStats.unavailableSkipped += 1;
+        return outcome;
+    }
+
+    try {
+        // Try pi-context's public external-indexing API first.
+        const apiSourceId = await tryIndexViaExternalApi(
+            text,
+            job,
+            ctx,
+            toolName,
+            dbPath
+        );
+        const sourceId = apiSourceId ?? await indexViaDirectDb(text, job, ctx, toolName, dbPath);
+        if (!sourceId) {
+            const outcome: SidecarIndexOutcome = {
+                status: "skipped",
+                eligible: true,
+                reason: "schema_unavailable",
+                errorCategory: "schema",
+            };
+            sidecarIndexStats.skipped += 1;
+            sidecarIndexStats.schemaSkipped += 1;
+            return outcome;
+        }
+        const source = findJobSourceDetailsInSidecar(job.id) ?? {
+            sourceId,
+            chunkIds: [],
+        };
+        const outcome: SidecarIndexOutcome = {
+            status: "indexed",
+            eligible: true,
+            source,
+        };
+        sidecarIndexStats.indexed += 1;
+        return outcome;
+    } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        const errorCategory: SidecarIndexOutcome["errorCategory"] =
+            /no such table|no such column|malformed schema|fts5|constraint failed/.test(message)
+                ? "schema"
+                : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(message)
+                  ? "io"
+                  : "unknown";
+        const outcome: SidecarIndexOutcome = {
+            status: "failed",
+            eligible: true,
+            reason: "index_failed",
+            errorCategory,
+        };
+        sidecarIndexStats.failed += 1;
+        return outcome;
+    }
+}
+
+/** Backward-compatible source-only indexing API. */
 export async function indexJobOutputInSidecar(
     job: {
         id: string;
@@ -784,30 +919,7 @@ export async function indexJobOutputInSidecar(
     ctx: SidecarContext,
     toolName: string = "bash_bg"
 ): Promise<string | undefined> {
-    try {
-        const text = await readFile(job.logPath, "utf-8").catch(() => "");
-        if (!text) return;
-
-        const dbPath = sidecarDbPath();
-        if (!existsSync(dbPath)) {
-            return;
-        }
-
-        // Try pi-context's public external-indexing API first.
-        const apiSourceId = await tryIndexViaExternalApi(
-            text,
-            job,
-            ctx,
-            toolName,
-            dbPath
-        );
-        if (apiSourceId) return apiSourceId;
-
-        // Fallback: direct SQLite write.
-        return await indexViaDirectDb(text, job, ctx, toolName, dbPath);
-    } catch {
-        // DB unavailable or schema mismatch — skip silently
-    }
+    return (await indexJobOutputWithOutcome(job, ctx, toolName)).source?.sourceId;
 }
 
 /**
@@ -819,6 +931,9 @@ export function trackJobOutputIndex(
         sourceId?: string;
         chunkIds?: string[];
         outputIndexPromise?: Promise<JobOutputIndex | undefined>;
+        sidecarIndexStatus?: SidecarIndexOutcome["status"];
+        sidecarIndexReason?: SidecarIndexOutcome["reason"];
+        sidecarIndexErrorCategory?: SidecarIndexOutcome["errorCategory"];
     } & {
         id: string;
         command: string;
@@ -835,15 +950,14 @@ export function trackJobOutputIndex(
     if (job.outputIndexPromise) return job.outputIndexPromise;
 
     const promise = (outputReady ?? Promise.resolve()).then(() =>
-        indexJobOutputInSidecar(job, ctx, toolName).then((sourceId) => {
-            if (!sourceId) return undefined;
-            const details = findJobSourceDetailsInSidecar(job.id) ?? {
-                sourceId,
-                chunkIds: [],
-            };
-            job.sourceId = details.sourceId;
-            job.chunkIds = details.chunkIds;
-            return details;
+        indexJobOutputWithOutcome(job, ctx, toolName).then((outcome) => {
+            job.sidecarIndexStatus = outcome.status;
+            job.sidecarIndexReason = outcome.reason;
+            job.sidecarIndexErrorCategory = outcome.errorCategory;
+            if (!outcome.source) return undefined;
+            job.sourceId = outcome.source.sourceId;
+            job.chunkIds = outcome.source.chunkIds;
+            return outcome.source;
         })
     );
     job.outputIndexPromise = promise;

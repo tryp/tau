@@ -8,10 +8,13 @@ import { DatabaseSync } from "node:sqlite";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
+    getSidecarIndexStats,
+    indexJobOutputWithOutcome,
     purgeSidecar,
     readJobOutputFromSidecar,
     readJobOutputDetailsFromSidecar,
     indexJobOutputInSidecar,
+    resetSidecarIndexStats,
     searchSidecarSources,
     trackJobOutputIndex,
 } from "../features/background.ts";
@@ -153,6 +156,7 @@ function insertChunk(
 // ─── beforeEach / afterEach ─────────────────────────────────────────
 
 beforeEach(() => {
+    resetSidecarIndexStats();
     tmpDir = setupTempDir();
     process.env.PI_CODING_AGENT_DIR = tmpDir;
 });
@@ -402,10 +406,64 @@ void describe("indexJobOutputInSidecar", () => {
         return p;
     }
 
-    void it("skips silently when context.db does not exist", async () => {
+    void it("classifies an unavailable sidecar without failing the job", async () => {
         const job = testJob({ id: "job-skip-1", logPath: writeLog("hello") });
-        await indexJobOutputInSidecar(job, {});
-        // No throw — pass
+        const outcome = await indexJobOutputWithOutcome(job, {});
+        assert.deepEqual(outcome, {
+            status: "skipped",
+            eligible: true,
+            reason: "sidecar_unavailable",
+            errorCategory: "unavailable",
+        });
+        assert.deepEqual(getSidecarIndexStats(), {
+            attempts: 1,
+            eligible: 1,
+            indexed: 0,
+            skipped: 1,
+            failed: 0,
+            emptySkipped: 0,
+            unavailableSkipped: 1,
+            schemaSkipped: 0,
+        });
+    });
+
+    void it("classifies empty output as intentionally ineligible", async () => {
+        createDb(tmpDir);
+        const job = testJob({ id: "job-empty-outcome", logPath: writeLog("") });
+        const outcome = await indexJobOutputWithOutcome(job, {});
+        assert.deepEqual(outcome, {
+            status: "skipped",
+            eligible: false,
+            reason: "empty_output",
+        });
+        assert.equal(getSidecarIndexStats().emptySkipped, 1);
+        assert.equal(getSidecarIndexStats().schemaSkipped, 0);
+        assert.equal(getSidecarIndexStats().eligible, 0);
+    });
+
+    void it("reports indexed output and eligible coverage counters", async () => {
+        createDb(tmpDir);
+        const job = testJob({ id: "job-index-outcome", logPath: writeLog("hello") });
+        const outcome = await indexJobOutputWithOutcome(job, { cwd: tmpDir });
+        assert.equal(outcome.status, "indexed");
+        assert.equal(outcome.eligible, true);
+        assert.ok(outcome.source?.sourceId);
+        const stats = getSidecarIndexStats();
+        assert.deepEqual(stats, {
+            attempts: 1,
+            eligible: 1,
+            indexed: 1,
+            skipped: 0,
+            failed: 0,
+            emptySkipped: 0,
+            unavailableSkipped: 0,
+            schemaSkipped: 0,
+        });
+    });
+
+    void it("keeps the legacy source-only API compatible", async () => {
+        const job = testJob({ id: "job-skip-legacy", logPath: writeLog("hello") });
+        assert.equal(await indexJobOutputInSidecar(job, {}), undefined);
     });
 
     void it("skips silently when context_sources table does not exist", async () => {
