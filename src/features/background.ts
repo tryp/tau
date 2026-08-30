@@ -2857,14 +2857,15 @@ export function registerBackgroundJobs(
     // Inject guidance about bash_bg + remindDelay into the remind tool.
     // This belongs here (the bg module) rather than hardcoded in callbacks.ts
     // because it's guidance about bg workflow, cross-cutting two tools.
-    (
+    const registerToolPromptGuidelines = (
         pi as ExtensionAPI & {
-            registerToolPromptGuidelines: (
+            registerToolPromptGuidelines?: (
                 toolName: string,
                 guidelines: string[]
             ) => void;
         }
-    ).registerToolPromptGuidelines("remind", [
+    ).registerToolPromptGuidelines;
+    registerToolPromptGuidelines?.call(pi, "remind", [
         "Use bash_bg with remindDelay instead of manual remind() for job progress checks — " +
             "the callback auto-cancels when the job completes.",
         "When you do use manual remind() to check on a running job, pass the jobId parameter " +
