@@ -54,6 +54,31 @@ function job(id: string, status: BackgroundJob["status"]): BackgroundJob {
     };
 }
 
+const BACKGROUND_WORK_REGISTRY_KEY = Symbol.for(
+    "pi-subagents.background-work.v1"
+);
+
+function installBackgroundWorkRegistry(value: unknown): () => void {
+    const globalObject = globalThis as Record<PropertyKey, unknown>;
+    const previous = globalObject[BACKGROUND_WORK_REGISTRY_KEY];
+    globalObject[BACKGROUND_WORK_REGISTRY_KEY] = value;
+    return () => {
+        if (previous === undefined)
+            delete globalObject[BACKGROUND_WORK_REGISTRY_KEY];
+        else globalObject[BACKGROUND_WORK_REGISTRY_KEY] = previous;
+    };
+}
+
+function attentionRegistry(provider: Record<string, unknown>): {
+    version: number;
+    providers: Map<string, unknown>;
+} {
+    return {
+        version: 1,
+        providers: new Map([[provider.name as string, provider]]),
+    };
+}
+
 void describe("autonomous wake evaluation", () => {
     void beforeEach(() =>
         mock.timers.enable({ apis: ["setInterval", "Date"] })
@@ -88,6 +113,147 @@ void describe("autonomous wake evaluation", () => {
         state.backgroundJobs.set("run", job("run", "running"));
         assert.equal(evaluateWakeup(queue.pi, state), false);
         assert.equal(queue.sent.length, 0);
+    });
+
+    void it("fails closed for an absent or malformed provider registry", () => {
+        const state = new TauState();
+        const queue = makePi();
+        const restoreAbsent = installBackgroundWorkRegistry(undefined);
+        try {
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), false);
+        } finally {
+            restoreAbsent();
+        }
+
+        const restoreMalformedRegistry = installBackgroundWorkRegistry({
+            version: 1,
+            providers: [],
+        });
+        try {
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), false);
+        } finally {
+            restoreMalformedRegistry();
+        }
+
+        state.recentTerminalJobs.push(job("done", "failed"));
+        const restoreMalformedProvider = installBackgroundWorkRegistry({
+            version: 1,
+            providers: new Map([
+                ["bad", { name: "bad", listAttentionWork: 1 }],
+            ]),
+        });
+        try {
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.match(queue.sent[0].message.content, /done/);
+        } finally {
+            restoreMalformedProvider();
+        }
+    });
+
+    void it("filters provider attention to the exact session", () => {
+        const provider = {
+            name: "subagents",
+            listActiveWork: () => [{ id: "running", sessionId: "current" }],
+            listAttentionWork: () => [
+                { id: "other", sessionId: "other-session" },
+                { id: "current", sessionId: "current-session" },
+            ],
+        };
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry(provider)
+        );
+        try {
+            const queue = makePi();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "current-session"),
+                true
+            );
+            assert.match(queue.sent[0].message.content, /subagents\/current/);
+            assert.doesNotMatch(queue.sent[0].message.content, /other/);
+        } finally {
+            restore();
+        }
+    });
+
+    void it("includes and deduplicates provider attention without waking for active work", () => {
+        let activeCalls = 0;
+        const provider = {
+            name: "subagents",
+            listActiveWork: () => {
+                activeCalls++;
+                return [{ id: "healthy", sessionId: "session" }];
+            },
+            listAttentionWork: () => [
+                { id: "needs-review", sessionId: "session" },
+                { id: "needs-review", sessionId: "session" },
+            ],
+        };
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry(provider)
+        );
+        try {
+            const queue = makePi();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "session"),
+                true
+            );
+            assert.equal(activeCalls, 0);
+            assert.equal(
+                (queue.sent[0].message.content.match(/needs-review/g) ?? [])
+                    .length,
+                1
+            );
+        } finally {
+            restore();
+        }
+    });
+
+    void it("fails closed when a provider throws", () => {
+        const provider = {
+            name: "broken",
+            listActiveWork: () => [],
+            listAttentionWork: () => {
+                throw new Error("provider unavailable");
+            },
+        };
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry(provider)
+        );
+        try {
+            const state = new TauState();
+            const queue = makePi();
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), false);
+            state.recentTerminalJobs.push(job("local", "failed"));
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.doesNotMatch(
+                queue.sent[0].message.content,
+                /provider unavailable/
+            );
+        } finally {
+            restore();
+        }
+    });
+
+    void it("does not enqueue a duplicate wake for an unchanged provider item", () => {
+        const provider = {
+            name: "subagents",
+            listActiveWork: () => [],
+            listAttentionWork: () => [
+                { id: "needs-review", sessionId: "session" },
+            ],
+        };
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry(provider)
+        );
+        try {
+            const queue = makePi();
+            const state = new TauState();
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), false);
+            assert.equal(queue.sent.length, 1);
+        } finally {
+            restore();
+        }
     });
 
     void it("delivers one keyed follow-up across busy, settlement, and idle boundaries", () => {
@@ -204,6 +370,7 @@ void describe("autonomous wake evaluation", () => {
 
     void it("starts on session_start only when enabled and stops on shutdown", async () => {
         const cwd = mkdtempSync(join("/tmp", "pi-tau-wakeup-"));
+        let restoreRegistry = (): void => {};
         try {
             mkdirSync(join(cwd, ".pi"));
             writeFileSync(
@@ -220,27 +387,53 @@ void describe("autonomous wake evaluation", () => {
             const state = new TauState();
             state.recentTerminalJobs.push(job("done", "failed"));
             const queue = makePi();
+            restoreRegistry = installBackgroundWorkRegistry(
+                attentionRegistry({
+                    name: "subagents",
+                    listActiveWork: () => [],
+                    listAttentionWork: () => [
+                        { id: "session-item", sessionId: "session-current" },
+                    ],
+                })
+            );
             const handlers = new Map<
                 string,
-                (event: unknown, ctx: { cwd: string }) => unknown
+                (
+                    event: unknown,
+                    ctx: {
+                        cwd: string;
+                        sessionManager: { getSessionId(): string };
+                    }
+                ) => unknown
             >();
             (
                 queue.pi as unknown as {
                     on: (
                         event: string,
-                        fn: (event: unknown, ctx: { cwd: string }) => unknown
+                        fn: (
+                            event: unknown,
+                            ctx: {
+                                cwd: string;
+                                sessionManager: { getSessionId(): string };
+                            }
+                        ) => unknown
                     ) => void;
                 }
             ).on = (event, fn) => handlers.set(event, fn);
             registerWakeup(queue.pi, state);
-            await handlers.get("session_start")?.({}, { cwd });
+            const sessionContext = {
+                cwd,
+                sessionManager: { getSessionId: () => "session-current" },
+            };
+            await handlers.get("session_start")?.({}, sessionContext);
             mock.timers.tick(WAKEUP_MIN_INTERVAL_MS);
             assert.equal(queue.sent.length, 1);
-            await handlers.get("session_shutdown")?.({}, { cwd });
+            await handlers.get("session_shutdown")?.({}, sessionContext);
             assert.ok(queue.cancelled.includes(WAKEUP_QUEUE_KEY));
             mock.timers.tick(WAKEUP_MIN_INTERVAL_MS * 2);
             assert.equal(queue.sent.length, 1);
         } finally {
+            restoreRegistry();
             rmSync(cwd, { recursive: true, force: true });
         }
     });

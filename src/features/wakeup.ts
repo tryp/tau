@@ -36,6 +36,93 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const BACKGROUND_WORK_REGISTRY_KEY = "pi-subagents.background-work.v1";
+const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
+
+type ProviderAttentionAction = {
+    kind: "provider-attention";
+    provider: string;
+    id: string;
+};
+
+/**
+ * Read the optional background-work attention contract without importing its
+ * owning extension. Any malformed registry/provider/item disables this
+ * integration for the current evaluation while preserving local Tau wakes.
+ */
+function collectProviderAttention(
+    sessionId: string | undefined
+): ProviderAttentionAction[] {
+    if (!sessionId) return [];
+
+    try {
+        const globalObject = globalThis as Record<PropertyKey, unknown>;
+        const registry = globalObject[Symbol.for(BACKGROUND_WORK_REGISTRY_KEY)];
+        if (
+            !isRecord(registry) ||
+            registry.version !== BACKGROUND_WORK_PROTOCOL_VERSION ||
+            !(registry.providers instanceof Map)
+        ) {
+            return [];
+        }
+
+        const actions: ProviderAttentionAction[] = [];
+        const keys = new Set<string>();
+        for (const [registryKey, candidate] of registry.providers) {
+            if (
+                typeof registryKey !== "string" ||
+                !isRecord(candidate) ||
+                typeof candidate.name !== "string" ||
+                candidate.name.length === 0 ||
+                candidate.name.length > 128 ||
+                candidate.name.trim() !== candidate.name ||
+                candidate.name.includes("\\0") ||
+                candidate.name !== registryKey ||
+                typeof candidate.listActiveWork !== "function"
+            ) {
+                return [];
+            }
+            if (candidate.listAttentionWork === undefined) continue;
+            if (typeof candidate.listAttentionWork !== "function") return [];
+
+            const listAttentionWork = candidate.listAttentionWork as (
+                this: Record<string, unknown>
+            ) => unknown;
+            const items = listAttentionWork.call(candidate);
+            if (!Array.isArray(items)) return [];
+            for (const item of items) {
+                if (
+                    !isRecord(item) ||
+                    typeof item.id !== "string" ||
+                    item.id.length === 0 ||
+                    item.id.length > 256 ||
+                    item.id.trim() !== item.id ||
+                    item.id.includes("\\0") ||
+                    typeof item.sessionId !== "string" ||
+                    item.sessionId.length === 0 ||
+                    item.sessionId.length > 256 ||
+                    item.sessionId.trim() !== item.sessionId ||
+                    item.sessionId.includes("\\0")
+                ) {
+                    return [];
+                }
+                if (item.sessionId !== sessionId) continue;
+                const key = `${candidate.name}:${item.id}`;
+                if (keys.has(key)) continue;
+                keys.add(key);
+                actions.push({
+                    kind: "provider-attention",
+                    provider: candidate.name,
+                    id: item.id,
+                });
+            }
+        }
+        return actions;
+    } catch {
+        return [];
+    }
+}
+
 function clampInterval(value: number): number {
     return Math.min(
         WAKEUP_MAX_INTERVAL_MS,
@@ -135,7 +222,8 @@ export type WakeupAction =
     | { kind: "pending-decision"; id: string }
     | { kind: "pending-agent"; id: string }
     | { kind: "paused" }
-    | { kind: "terminal-job"; job: BackgroundJob };
+    | { kind: "terminal-job"; job: BackgroundJob }
+    | ProviderAttentionAction;
 
 function terminalJobs(state: TauState): BackgroundJob[] {
     const jobs = new Map<string, BackgroundJob>();
@@ -153,7 +241,10 @@ function terminalJobs(state: TauState): BackgroundJob[] {
 }
 
 /** Return actionable state; ordinary healthy running jobs are excluded. */
-export function collectWakeupActions(state: TauState): WakeupAction[] {
+export function collectWakeupActions(
+    state: TauState,
+    sessionId?: string
+): WakeupAction[] {
     const actions: WakeupAction[] = [];
     const decisionId = state.pendingDecisionJobId;
     if (decisionId !== undefined) {
@@ -170,6 +261,7 @@ export function collectWakeupActions(state: TauState): WakeupAction[] {
     for (const job of terminalJobs(state)) {
         actions.push({ kind: "terminal-job", job });
     }
+    actions.push(...collectProviderAttention(sessionId));
     return actions;
 }
 
@@ -183,6 +275,8 @@ function actionKey(action: WakeupAction): string {
             return "paused";
         case "terminal-job":
             return `terminal:${action.job.id}:${action.job.status}`;
+        case "provider-attention":
+            return `provider:${action.provider}:${action.id}`;
     }
 }
 
@@ -196,6 +290,8 @@ function actionText(action: WakeupAction): string {
             return "The agent is paused and needs to be resumed or inspected.";
         case "terminal-job":
             return `Background job ${action.job.id} ${action.job.status} and its output has not been acknowledged.`;
+        case "provider-attention":
+            return `Background work ${action.provider}/${action.id} needs attention.`;
     }
 }
 
@@ -243,7 +339,11 @@ export function cancelQueuedWakeup(pi: ExtensionAPI): boolean {
 }
 
 /** Evaluate now. Returns true when a wake follow-up was queued. */
-export function evaluateWakeup(pi: ExtensionAPI, state: TauState): boolean {
+export function evaluateWakeup(
+    pi: ExtensionAPI,
+    state: TauState,
+    sessionId?: string
+): boolean {
     // Without deterministic queue cancellation, a changed or resolved snapshot
     // could leave a stale follow-up (or enqueue a duplicate) on older hosts.
     // Disable autonomous delivery rather than pretending replacement worked.
@@ -252,7 +352,7 @@ export function evaluateWakeup(pi: ExtensionAPI, state: TauState): boolean {
         return false;
     }
 
-    const actions = collectWakeupActions(state);
+    const actions = collectWakeupActions(state, sessionId);
     const signature = actions.map(actionKey).sort().join("|");
     if (!signature) {
         cancelQueuedWakeup(pi);
@@ -283,11 +383,13 @@ export function evaluateWakeup(pi: ExtensionAPI, state: TauState): boolean {
 export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
     let timer: ReturnType<typeof setInterval> | undefined;
     let active = false;
+    let sessionId: string | undefined;
 
     const stop = (): void => {
         if (timer) clearInterval(timer);
         timer = undefined;
         active = false;
+        sessionId = undefined;
         state.wakeupLastSignature = undefined;
         cancelQueuedWakeup(pi);
     };
@@ -295,7 +397,7 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
     // Existing lifecycle handlers can request an immediate re-evaluation after
     // pending-decision/completion cancellation without importing this module.
     state.wakeupEvaluate = () => {
-        if (active) evaluateWakeup(pi, state);
+        if (active) evaluateWakeup(pi, state, sessionId);
     };
     state.wakeupCancel = stop;
 
@@ -307,8 +409,12 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
         // expose it, so leave the feature inactive rather than delivering wakes
         // that cannot be retracted when their state is acknowledged.
         if (!hasWakeupCancellation(pi)) return;
+        sessionId = ctx.sessionManager.getSessionId();
         active = true;
-        timer = setInterval(() => evaluateWakeup(pi, state), config.intervalMs);
+        timer = setInterval(
+            () => evaluateWakeup(pi, state, sessionId),
+            config.intervalMs
+        );
         timer.unref();
     });
 

@@ -191,6 +191,13 @@ The interval is bounded to 10 seconds through 1 hour. Wake follow-ups are
 coalesced with the keyed `tau:wakeup` queue entry and are cancelled at session
 shutdown or when no actionable work remains.
 
+When the optional `pi-subagents` extension is loaded, Tau also consumes its
+process-local background-work attention registry (`Symbol.for("pi-subagents.background-work.v1")`).
+Only attention items for the current session are included; healthy running work
+is ignored. This integration is defensive and optional: missing or malformed
+registries, providers, and provider failures leave Tau's local wake behavior
+unchanged. Tau does not depend on or import `pi-subagents`.
+
 ## Tools
 
 | Tool | Purpose |
