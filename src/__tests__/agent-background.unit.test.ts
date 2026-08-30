@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import {
     buildBackgroundSpawnArgs,
     chooseBackgroundPath,
+    registerAgentBackground,
     extractTextFromContent,
     extractLastAssistantSummary,
     extractOriginalPrompt,
@@ -20,6 +21,7 @@ import {
 } from "../features/agent-background.ts";
 import { TauState } from "../state.ts";
 import { cancelPendingBackgroundAgent } from "../utils.ts";
+import { evaluateWakeup, WAKEUP_QUEUE_KEY } from "../features/wakeup.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 // ─── chooseBackgroundPath ────────────────────────────────────────────
@@ -146,6 +148,54 @@ void describe("cancelPendingBackgroundAgent", () => {
         } catch {
             /* already removed */
         }
+    });
+});
+
+// ─── pending agent wake lifecycle ────────────────────────────────────
+
+void describe("pending agent wake lifecycle", () => {
+    void it("retracts its wake when settlement starts the pending agent", async () => {
+        const state = new TauState();
+        const handlers = new Map<
+            string,
+            (event: unknown, ctx: unknown) => unknown
+        >();
+        const cancelled: string[] = [];
+        const pi = {
+            on(
+                event: string,
+                handler: (event: unknown, ctx: unknown) => unknown
+            ) {
+                handlers.set(event, handler);
+            },
+            registerTool() {},
+            registerToolPromptGuidelines() {},
+            cancelQueuedMessage(key: string) {
+                cancelled.push(key);
+            },
+            sendMessage() {},
+        } as never;
+        registerAgentBackground(pi, state);
+        state.pendingBackgroundAgents.set("job-pending", {
+            jobId: "job-pending",
+            promptFile: "/tmp/pi-tau-missing-prompt",
+            execCwd: tmpdir(),
+            conversationBytes: 0,
+            contextWindowTokens: 32768,
+        });
+        state.wakeupLastSignature = "agent:job-pending";
+        state.wakeupEvaluate = () => evaluateWakeup(pi, state);
+
+        await handlers.get("agent_settled")?.(
+            {},
+            {
+                isIdle: () => true,
+            }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        assert.deepEqual(cancelled, [WAKEUP_QUEUE_KEY]);
+        assert.equal(state.wakeupLastSignature, undefined);
     });
 });
 

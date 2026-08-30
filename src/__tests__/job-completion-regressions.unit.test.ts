@@ -164,6 +164,61 @@ void describe("job completion regression coverage", () => {
         assert.equal(sentMessages.length, 1);
     });
 
+    void it("does not let a stale index callback delete a re-notified completion", async () => {
+        const state = new TauState();
+        const { pi, sentMessages } = registerTestTools(state);
+        let resolveIndex!: () => void;
+        const indexPromise = new Promise<undefined>((resolve) => {
+            resolveIndex = () => resolve(undefined);
+        });
+        const job = makeJob({
+            id: "job-stale-index-callback",
+            status: "failed",
+            wantsCompletionNotification: true,
+            outputIndexPromise: indexPromise,
+        });
+
+        notifyCompletion(job, state, pi as never, notificationContext());
+        state.cancelCompletionBatchForJob?.(job.id);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        resolveIndex();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.equal(job.completionNotified, true);
+        state.cancelCompletionBatchForJob?.(job.id);
+        flushCompletionBatch();
+        assert.equal(job.completionNotified, false);
+        assert.equal(sentMessages.length, 0);
+    });
+
+    void it("restores an unacknowledged success when its failed batch item is cancelled", async () => {
+        const state = new TauState();
+        const { pi, sentMessages, invoke } = registerTestTools(state);
+        const failed = makeJob({
+            id: "job-mixed-failed",
+            status: "failed",
+            wantsCompletionNotification: true,
+        });
+        const completed = makeJob({
+            id: "job-mixed-completed",
+            status: "completed",
+        });
+        const wakeEvaluations: number[] = [];
+        state.wakeupEvaluate = () => wakeEvaluations.push(1);
+
+        await invoke("agent_start");
+        notifyCompletion(failed, state, pi as never, notificationContext());
+        notifyCompletion(completed, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        state.cancelCompletionBatchForJob?.(failed.id);
+
+        assert.equal(completed.completionNotified, false);
+        assert.ok(wakeEvaluations.length > 0);
+        assert.equal(sentMessages.length, 0);
+        await invoke("session_shutdown");
+    });
+
     void it("holds completion delivery until the session is settled", async () => {
         const state = new TauState();
         const { pi, sentMessages, sentMessageOptions, invoke } =

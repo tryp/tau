@@ -147,7 +147,8 @@ function terminalJobs(state: TauState): BackgroundJob[] {
         (job) =>
             (job.status === "failed" || job.status === "completed") &&
             !job.outputConsumed &&
-            !job.completionNotified
+            !job.completionNotified &&
+            !job.suppressAutonomousWake
     );
 }
 

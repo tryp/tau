@@ -570,6 +570,7 @@ export function handleTmuxCompletion(
         job.wantsCompletionNotification = true;
         notifyCompletion(job, state, pi, ctx);
     } else {
+        job.suppressAutonomousWake = true;
         removeJob(state, job);
     }
     killTmuxJob(job);
@@ -970,6 +971,34 @@ function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
     return jobs.some((j) => j.job.status !== "completed");
 }
 
+function completionNeedsDelivery(jobs: CompletionBatchItem[]): boolean {
+    return (
+        hasFailedCompletion(jobs) ||
+        jobs.some(
+            ({ job }) =>
+                job.status === "completed" &&
+                (job.wantsCompletionNotification ||
+                    hasLinkedCallbacksForJob(job.id))
+        )
+    );
+}
+
+function restoreCompletionForWake(
+    job: BackgroundJob,
+    wakeStates: Set<TauState>,
+    state?: TauState
+): void {
+    if (deliveringCompletionJobIds.has(job.id)) return;
+    pendingCompletionJobs.delete(job.id);
+    completionNotifiedJobs.delete(job);
+    job.completionNotified = false;
+    completionJobGenerations.set(
+        job.id,
+        (completionJobGenerations.get(job.id) ?? 0) + 1
+    );
+    if (state) wakeStates.add(state);
+}
+
 function pruneConsumedCompletions(
     jobs: CompletionBatchItem[]
 ): CompletionBatchItem[] {
@@ -1221,7 +1250,24 @@ export function clearJobFromCompletionBatch(jobId: string): void {
     const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
     if (idx !== -1) {
         completionBatch.jobs.splice(idx, 1);
-        if (completionBatch.jobs.length === 0) {
+        if (
+            completionBatch.jobs.length > 0 &&
+            !completionNeedsDelivery(completionBatch.jobs)
+        ) {
+            const remaining = completionBatch.jobs.splice(0);
+            const batchState = completionBatch.state;
+            const wakeStates = new Set<TauState>();
+            for (const { job: remainingJob } of remaining) {
+                restoreCompletionForWake(remainingJob, wakeStates, batchState);
+            }
+            if (completionBatch.timer) {
+                clearTimeout(completionBatch.timer);
+                completionBatch.timer = undefined;
+            }
+            completionBatch.pi = undefined;
+            completionBatch.state = undefined;
+            if (batchState) batchState.wakeupEvaluate?.();
+        } else if (completionBatch.jobs.length === 0) {
             if (completionBatch.timer) {
                 clearTimeout(completionBatch.timer);
                 completionBatch.timer = undefined;
@@ -1234,8 +1280,17 @@ export function clearJobFromCompletionBatch(jobId: string): void {
     for (let i = pendingCompletionDeliveries.length - 1; i >= 0; i--) {
         const delivery = pendingCompletionDeliveries[i];
         delivery.jobs = delivery.jobs.filter((j) => j.job.id !== jobId);
-        if (!hasFailedCompletion(delivery.jobs)) {
+        if (!completionNeedsDelivery(delivery.jobs)) {
+            const wakeStates = new Set<TauState>();
+            for (const { job: remainingJob } of delivery.jobs) {
+                restoreCompletionForWake(
+                    remainingJob,
+                    wakeStates,
+                    delivery.state
+                );
+            }
             pendingCompletionDeliveries.splice(i, 1);
+            for (const state of wakeStates) state.wakeupEvaluate?.();
         }
     }
     if (restored) wakeState?.wakeupEvaluate?.();
@@ -1322,7 +1377,12 @@ export function notifyCompletion(
             completionJobGenerations.get(job.id) !== jobGeneration ||
             job.outputConsumed
         ) {
-            pendingCompletionJobs.delete(job.id);
+            // Only clear the pending entry if this callback still owns the
+            // current generation. A stale indexing callback must not delete a
+            // newer re-notification for the same job.
+            if (completionJobGenerations.get(job.id) === jobGeneration) {
+                pendingCompletionJobs.delete(job.id);
+            }
             return;
         }
         if (job.sidecarIndexStatus === "failed") {
@@ -2137,7 +2197,10 @@ export function registerBackgroundJobs(
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
-                else removeJob(state, job);
+                else {
+                    job.suppressAutonomousWake = true;
+                    removeJob(state, job);
+                }
                 updateWidget(state, ctx);
             });
 
@@ -2149,7 +2212,10 @@ export function registerBackgroundJobs(
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
                 if (shouldNotify) notifyCompletion(job, state, pi, ctx);
-                else removeJob(state, job);
+                else {
+                    job.suppressAutonomousWake = true;
+                    removeJob(state, job);
+                }
                 updateWidget(state, ctx);
             });
 

@@ -125,6 +125,8 @@ export interface BackgroundJob {
     outputConsumed?: boolean;
     /** True once the normal completion notification has been queued. */
     completionNotified?: boolean;
+    /** True when notify:false suppresses both completion delivery and autonomous wake. */
+    suppressAutonomousWake?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
     isBackgrounded: boolean;
     /**

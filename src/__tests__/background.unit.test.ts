@@ -21,6 +21,7 @@ import { TauState } from "../state.ts";
 import type { BackgroundJob, RunningProcess } from "../types.ts";
 import { createJobDonePromise, markJobTerminal } from "../utils.ts";
 import { silenceJobAfterKill } from "../features/background.ts";
+import { evaluateWakeup } from "../features/wakeup.ts";
 
 /** Helper to create a BackgroundJob with all required fields. */
 function makeJob(
@@ -1495,6 +1496,18 @@ void describe(
             assert.equal(sentMessages.length, 0);
             assert.equal(state.backgroundJobs.has(job.id), false);
             assert.equal(state.completedJobCount, 1);
+            assert.equal(job.suppressAutonomousWake, true);
+            assert.equal(
+                evaluateWakeup(
+                    {
+                        sendMessage() {},
+                        cancelQueuedMessage() {},
+                    } as never,
+                    state
+                ),
+                false,
+                "notify:false must not expose an autonomous wake"
+            );
         });
 
         void it("suppresses tmux completion when output consumed before delivery", async () => {
@@ -1787,6 +1800,18 @@ void describe("bash cwd validation", () => {
         assert.equal(state.backgroundJobs.has(job.id), false);
         assert.equal(state.completedJobCount, 1);
         assert.equal(sentMessages.length, 0);
+        assert.equal(job.suppressAutonomousWake, true);
+        assert.equal(
+            evaluateWakeup(
+                {
+                    sendMessage() {},
+                    cancelQueuedMessage() {},
+                } as never,
+                state
+            ),
+            false,
+            "notify:false must not expose an autonomous wake"
+        );
     });
 });
 

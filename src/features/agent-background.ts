@@ -370,6 +370,10 @@ export function registerAgentBackground(
 
         const pending = Array.from(state.pendingBackgroundAgents.values());
         state.pendingBackgroundAgents.clear();
+        // Retract a queued autonomous wake now that these pending actions are
+        // transitioning into child processes, then re-evaluate any remaining
+        // actionable state.
+        state.wakeupEvaluate?.();
         for (const request of pending) {
             if (request.settleTimer) clearTimeout(request.settleTimer);
             const job = state.backgroundJobs.get(request.jobId);
@@ -427,6 +431,9 @@ export function registerAgentBackground(
                     state.pendingBackgroundAgents.values()
                 );
                 state.pendingBackgroundAgents.clear();
+                // Retract a queued autonomous wake now that these pending
+                // actions are transitioning into child processes.
+                state.wakeupEvaluate?.();
                 for (const request of pending) {
                     if (request.settleTimer) clearTimeout(request.settleTimer);
                     const job = state.backgroundJobs.get(request.jobId);
