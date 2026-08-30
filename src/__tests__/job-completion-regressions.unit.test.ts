@@ -156,6 +156,7 @@ void describe("job completion regression coverage", () => {
         assert.deepEqual(sentMessageOptions[0], {
             deliverAs: "followUp",
             triggerTurn: true,
+            queueKey: "tau:bg:job-settlement-boundary:completion",
         });
     });
 

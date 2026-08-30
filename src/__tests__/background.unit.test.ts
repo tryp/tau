@@ -1,5 +1,8 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
     evaluatePendingDecisionGate,
     registerBackgroundJobs,
@@ -16,7 +19,7 @@ import {
 import { registerBackgroundCommands } from "../features/background-commands.ts";
 import { TauState } from "../state.ts";
 import type { BackgroundJob, RunningProcess } from "../types.ts";
-import { createJobDonePromise } from "../utils.ts";
+import { createJobDonePromise, markJobTerminal } from "../utils.ts";
 import { silenceJobAfterKill } from "../features/background.ts";
 
 /** Helper to create a BackgroundJob with all required fields. */
@@ -522,7 +525,10 @@ void describe("Ctrl+X kill — outputConsumed", () => {
 
 // ─── TUI kill (showTaskDetail) ──────────────────────────────────────────
 
-function captureTasksInterface(state: TauState) {
+function captureTasksInterface(
+    state: TauState,
+    piOverrides: Record<string, unknown> = {}
+) {
     let captured:
         | ((ctx: {
               ui: {
@@ -548,6 +554,7 @@ function captureTasksInterface(state: TauState) {
         },
         registerCommand: () => {},
         registerTool: () => {},
+        ...piOverrides,
     } as never;
 
     registerBackgroundCommands(pi, state);
@@ -589,6 +596,85 @@ void describe("TUI kill — outputConsumed", () => {
         });
 
         assert.equal(job.outputConsumed, true);
+    });
+});
+
+// ─── TUI attach — cancels superseded queued notifications ────────────
+
+void describe("TUI attach — cancels superseded queued notifications", () => {
+    void it("posts bg-attach and cancels timeout/stall/completion keys", async () => {
+        const state = new TauState();
+        const logDir = mkdtempSync(join(tmpdir(), "tau-attach-test-"));
+        const logPath = join(logDir, "job.log");
+        writeFileSync(logPath, "line1\nline2\n");
+        const job = makeJob({
+            id: "job-99999-5",
+            command: "sleep 999",
+            pid: -999995,
+            startTime: Date.now(),
+            status: "running",
+            toolCallId: "tc-tui-attach-1",
+            proc: { pid: -999995 } as never,
+            logPath,
+        });
+        state.backgroundJobs.set("job-99999-5", job);
+
+        const sent: Array<{
+            customType: string;
+            details?: { jobId?: string };
+        }> = [];
+        const cancelledKeys: string[] = [];
+        const handler = captureTasksInterface(state, {
+            sendMessage: (message: {
+                customType: string;
+                details?: { jobId?: string };
+            }) => {
+                sent.push(message);
+            },
+            cancelQueuedMessage: (queueKey: string) => {
+                cancelledKeys.push(queueKey);
+                return true;
+            },
+        });
+
+        let selectCallCount = 0;
+        try {
+            await handler({
+                ui: {
+                    notify: () => {},
+                    setWidget: () => {},
+                    setStatus: () => {},
+                    theme: { fg: () => "" },
+                    select: async (_title: string, options: string[]) => {
+                        selectCallCount++;
+                        if (selectCallCount === 1) {
+                            return options.find((o) =>
+                                o.includes("job-99999-5")
+                            );
+                        }
+                        // Resolve the job while the attach path waits on
+                        // donePromise. Use a macrotask: a microtask would run
+                        // before the handler resumes and creates donePromise.
+                        setTimeout(() => {
+                            markJobTerminal(job, "completed", 0);
+                        }, 10);
+                        return options.find((o) => o.startsWith("Attach"));
+                    },
+                    editor: async () => "",
+                },
+            });
+        } finally {
+            rmSync(logDir, { recursive: true, force: true });
+        }
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].customType, "bg-attach");
+        assert.equal(sent[0].details?.jobId, "job-99999-5");
+        assert.deepEqual([...cancelledKeys].sort(), [
+            "tau:bg:job-99999-5:completion",
+            "tau:bg:job-99999-5:stall",
+            "tau:bg:job-99999-5:timeout",
+        ]);
     });
 });
 
