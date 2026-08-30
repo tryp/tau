@@ -38,6 +38,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const BACKGROUND_WORK_REGISTRY_KEY = "pi-subagents.background-work.v1";
 const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
+const BACKGROUND_WORK_MAX_PROVIDERS = 100;
+const BACKGROUND_WORK_MAX_ITEMS_PER_PROVIDER = 10_000;
 
 type ProviderAttentionAction = {
     kind: "provider-attention";
@@ -61,7 +63,8 @@ function collectProviderAttention(
         if (
             !isRecord(registry) ||
             registry.version !== BACKGROUND_WORK_PROTOCOL_VERSION ||
-            !(registry.providers instanceof Map)
+            !(registry.providers instanceof Map) ||
+            registry.providers.size > BACKGROUND_WORK_MAX_PROVIDERS
         ) {
             return [];
         }
@@ -76,7 +79,7 @@ function collectProviderAttention(
                 candidate.name.length === 0 ||
                 candidate.name.length > 128 ||
                 candidate.name.trim() !== candidate.name ||
-                candidate.name.includes("\\0") ||
+                candidate.name.includes("\0") ||
                 candidate.name !== registryKey ||
                 typeof candidate.listActiveWork !== "function"
             ) {
@@ -89,7 +92,12 @@ function collectProviderAttention(
                 this: Record<string, unknown>
             ) => unknown;
             const items = listAttentionWork.call(candidate);
-            if (!Array.isArray(items)) return [];
+            if (
+                !Array.isArray(items) ||
+                items.length > BACKGROUND_WORK_MAX_ITEMS_PER_PROVIDER
+            ) {
+                return [];
+            }
             for (const item of items) {
                 if (
                     !isRecord(item) ||
@@ -97,17 +105,17 @@ function collectProviderAttention(
                     item.id.length === 0 ||
                     item.id.length > 256 ||
                     item.id.trim() !== item.id ||
-                    item.id.includes("\\0") ||
+                    item.id.includes("\0") ||
                     typeof item.sessionId !== "string" ||
                     item.sessionId.length === 0 ||
                     item.sessionId.length > 256 ||
                     item.sessionId.trim() !== item.sessionId ||
-                    item.sessionId.includes("\\0")
+                    item.sessionId.includes("\0")
                 ) {
                     return [];
                 }
                 if (item.sessionId !== sessionId) continue;
-                const key = `${candidate.name}:${item.id}`;
+                const key = JSON.stringify([candidate.name, item.id]);
                 if (keys.has(key)) continue;
                 keys.add(key);
                 actions.push({
@@ -276,7 +284,7 @@ function actionKey(action: WakeupAction): string {
         case "terminal-job":
             return `terminal:${action.job.id}:${action.job.status}`;
         case "provider-attention":
-            return `provider:${action.provider}:${action.id}`;
+            return `provider:${JSON.stringify([action.provider, action.id])}`;
     }
 }
 

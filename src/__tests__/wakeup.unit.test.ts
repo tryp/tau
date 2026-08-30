@@ -175,6 +175,151 @@ void describe("autonomous wake evaluation", () => {
         }
     });
 
+    void it("fails closed for actual NUL characters in provider input", () => {
+        const nul = String.fromCharCode(0);
+        const state = new TauState();
+        state.recentTerminalJobs.push(job("local", "failed"));
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry({
+                name: `bad${nul}provider`,
+                listActiveWork: () => [],
+                listAttentionWork: () => [{ id: "item", sessionId: "session" }],
+            })
+        );
+        try {
+            const queue = makePi();
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.match(queue.sent[0].message.content, /local/);
+            assert.doesNotMatch(queue.sent[0].message.content, /bad/);
+        } finally {
+            restore();
+        }
+
+        const itemProvider = {
+            name: "provider",
+            listActiveWork: () => [],
+            listAttentionWork: () => [
+                { id: `bad${nul}item`, sessionId: "session" },
+            ],
+        };
+        const itemState = new TauState();
+        itemState.recentTerminalJobs.push(job("local", "failed"));
+        const restoreItem = installBackgroundWorkRegistry(
+            attentionRegistry(itemProvider)
+        );
+        try {
+            const queue = makePi();
+            assert.equal(evaluateWakeup(queue.pi, itemState, "session"), true);
+            assert.match(queue.sent[0].message.content, /local/);
+            assert.doesNotMatch(queue.sent[0].message.content, /bad/);
+        } finally {
+            restoreItem();
+        }
+    });
+
+    void it("keeps provider and item identifiers distinct when they contain colons", () => {
+        const providers = new Map([
+            [
+                "a:b",
+                {
+                    name: "a:b",
+                    listActiveWork: () => [],
+                    listAttentionWork: () => [
+                        { id: "c", sessionId: "session" },
+                    ],
+                },
+            ],
+            [
+                "a",
+                {
+                    name: "a",
+                    listActiveWork: () => [],
+                    listAttentionWork: () => [
+                        { id: "b:c", sessionId: "session" },
+                    ],
+                },
+            ],
+        ]);
+        const restore = installBackgroundWorkRegistry({
+            version: 1,
+            providers,
+        });
+        try {
+            const queue = makePi();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "session"),
+                true
+            );
+            assert.match(queue.sent[0].message.content, /a:b\/c/);
+            assert.match(queue.sent[0].message.content, /a\/b:c/);
+        } finally {
+            restore();
+        }
+    });
+
+    void it("fails closed before iterating an oversized provider registry", () => {
+        let calls = 0;
+        const providers = new Map(
+            Array.from({ length: 101 }, (_, index) => {
+                const name = `provider-${index}`;
+                return [
+                    name,
+                    {
+                        name,
+                        listActiveWork: () => [],
+                        listAttentionWork: () => {
+                            calls++;
+                            return [];
+                        },
+                    },
+                ];
+            })
+        );
+        const restore = installBackgroundWorkRegistry({
+            version: 1,
+            providers,
+        });
+        try {
+            const state = new TauState();
+            state.recentTerminalJobs.push(job("local", "failed"));
+            const queue = makePi();
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.equal(calls, 0);
+            assert.match(queue.sent[0].message.content, /local/);
+        } finally {
+            restore();
+        }
+    });
+
+    void it("fails closed before iterating an oversized provider item list", () => {
+        let itemAccesses = 0;
+        const items = Array<{ id: string; sessionId: string }>(10_001);
+        Object.defineProperty(items, "0", {
+            enumerable: true,
+            get: () => {
+                itemAccesses++;
+                return { id: "item", sessionId: "session" };
+            },
+        });
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry({
+                name: "provider",
+                listActiveWork: () => [],
+                listAttentionWork: () => items,
+            })
+        );
+        try {
+            const state = new TauState();
+            state.recentTerminalJobs.push(job("local", "failed"));
+            const queue = makePi();
+            assert.equal(evaluateWakeup(queue.pi, state, "session"), true);
+            assert.equal(itemAccesses, 0);
+            assert.match(queue.sent[0].message.content, /local/);
+        } finally {
+            restore();
+        }
+    });
+
     void it("includes and deduplicates provider attention without waking for active work", () => {
         let activeCalls = 0;
         const provider = {
