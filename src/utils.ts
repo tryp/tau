@@ -43,8 +43,11 @@ export function resolveNonInteractiveStallWakeMs(
 ): number {
     const raw = env.PI_TAU_STALL_WAKE_MS;
     if (raw !== undefined) {
-        const parsed = Number.parseInt(raw, 10);
-        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+        const normalized = raw.trim();
+        if (/^\d+$/.test(normalized)) {
+            const parsed = Number(normalized);
+            if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+        }
     }
     return NONINTERACTIVE_STALL_WAKE_MS;
 }

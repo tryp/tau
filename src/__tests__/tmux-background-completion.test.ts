@@ -123,6 +123,46 @@ void describe(
             rmSync(TEST_RUN_DIR, { recursive: true, force: true });
         });
 
+        void it("wakes non-interactive silent tmux commands and preserves a newer tool owner", async () => {
+            const state = new TauState();
+            state.tmuxAvailable = true;
+            state.nonInteractive = true;
+            const { tool } = captureBashTool(state);
+            const previousWakeMs = process.env.PI_TAU_STALL_WAKE_MS;
+            process.env.PI_TAU_STALL_WAKE_MS = "100";
+
+            try {
+                const execution = tool.execute(
+                    "tc-stall-wake-tmux",
+                    { command: "tail -f /dev/null" },
+                    null,
+                    null,
+                    { cwd: TEST_RUN_DIR, ui: stubUi }
+                );
+                setTimeout(() => {
+                    state.currentlyRunningToolCallId = "newer-tool-call";
+                }, 100);
+
+                await assert.rejects(
+                    execution,
+                    /Possibly stuck: no output.*bash_bg/s
+                );
+                assert.equal(
+                    state.currentlyRunningToolCallId,
+                    "newer-tool-call",
+                    "stall cleanup must not clear a newer tool call's ownership"
+                );
+                const stalledJob = [...state.backgroundJobs.values()].find(
+                    (job) => job.command === "tail -f /dev/null"
+                );
+                assert.equal(stalledJob?.status, "killed");
+            } finally {
+                if (previousWakeMs === undefined)
+                    delete process.env.PI_TAU_STALL_WAKE_MS;
+                else process.env.PI_TAU_STALL_WAKE_MS = previousWakeMs;
+            }
+        });
+
         void it("honors backgroundAfter and reaches terminal status so linked callbacks auto-cancel", async () => {
             const state = new TauState();
             state.tmuxAvailable = true;

@@ -13,9 +13,9 @@
  * the log grows, and can be cancelled.
  */
 
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -53,85 +53,127 @@ void describe("resolveNonInteractiveStallWakeMs", () => {
             resolveNonInteractiveStallWakeMs({ PI_TAU_STALL_WAKE_MS: "-5" }),
             NONINTERACTIVE_STALL_WAKE_MS
         );
+        assert.equal(
+            resolveNonInteractiveStallWakeMs({ PI_TAU_STALL_WAKE_MS: "1e6" }),
+            NONINTERACTIVE_STALL_WAKE_MS
+        );
+        assert.equal(
+            resolveNonInteractiveStallWakeMs({
+                PI_TAU_STALL_WAKE_MS: "5000abc",
+            }),
+            NONINTERACTIVE_STALL_WAKE_MS
+        );
     });
 });
 
 void describe("startNoOutputWatchdog", () => {
+    const tempDirs: string[] = [];
     const makeLog = (): string => {
         const dir = mkdtempSync(join(tmpdir(), "tau-no-output-"));
+        tempDirs.push(dir);
         return join(dir, "job.log");
     };
 
-    void it("fires once after the stall budget of silence", async () => {
-        const logPath = makeLog();
-        let fired = 0;
-        const cancel = startNoOutputWatchdog(
-            logPath,
-            120,
-            () => {
-                fired += 1;
-            },
-            30
-        );
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        cancel();
-        assert.equal(fired, 1);
+    beforeEach(() => {
+        mock.timers.enable({ apis: ["setInterval", "Date"] });
     });
 
-    void it("does not fire while the log keeps growing", async () => {
+    afterEach(() => {
+        mock.timers.reset();
+        for (const dir of tempDirs.splice(0)) {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("fires once after the stall budget of silence", () => {
         const logPath = makeLog();
         let fired = 0;
         const cancel = startNoOutputWatchdog(
             logPath,
-            200,
+            400,
             () => {
                 fired += 1;
             },
-            30
+            50
+        );
+        for (let i = 0; i < 8; i++) mock.timers.tick(50);
+        assert.equal(fired, 1);
+        mock.timers.tick(500);
+        assert.equal(fired, 1, "a fired watchdog must clear its interval");
+        cancel();
+    });
+
+    void it("does not fire while the log keeps growing", () => {
+        const logPath = makeLog();
+        let fired = 0;
+        const cancel = startNoOutputWatchdog(
+            logPath,
+            500,
+            () => {
+                fired += 1;
+            },
+            50
         );
         for (let i = 0; i < 8; i++) {
-            // Append distinct-length lines so the file size grows each write.
-            writeFileSync(
-                logPath,
-                `"${logPath}" line ${i} ${"x".repeat(i + 1)}\n`,
-                { flag: "a" }
-            );
-            await new Promise((resolve) => setTimeout(resolve, 60));
+            // Append distinct-length lines before each tick so growth is
+            // observed at every interval, even when all lines have similar text.
+            writeFileSync(logPath, `line ${i} ${"x".repeat(i + 1)}\n`, {
+                flag: "a",
+            });
+            mock.timers.tick(50);
         }
-        cancel();
         assert.equal(fired, 0);
+        cancel();
     });
 
-    void it("does not fire after cancel", async () => {
+    void it("fires when an existing log stops growing", () => {
+        const logPath = makeLog();
+        writeFileSync(logPath, "initial output\n");
+        let fired = 0;
+        const cancel = startNoOutputWatchdog(
+            logPath,
+            400,
+            () => {
+                fired += 1;
+            },
+            50
+        );
+        // The first tick establishes the existing file size as the baseline.
+        for (let i = 0; i < 9; i++) mock.timers.tick(50);
+        assert.equal(fired, 1);
+        cancel();
+    });
+
+    void it("does not fire after cancel", () => {
         const logPath = makeLog();
         let fired = 0;
         const cancel = startNoOutputWatchdog(
             logPath,
-            100,
+            400,
             () => {
                 fired += 1;
             },
-            30
+            50
         );
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        mock.timers.tick(50);
         cancel();
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        mock.timers.tick(800);
         assert.equal(fired, 0);
     });
 
-    void it("treats a missing log file as no output", async () => {
+    void it("treats a missing log file as no output", () => {
         const logPath = makeLog(); // never written
         let fired = 0;
         const cancel = startNoOutputWatchdog(
             logPath,
-            120,
+            400,
             () => {
                 fired += 1;
             },
-            30
+            50
         );
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        cancel();
+        for (let i = 0; i < 8; i++) mock.timers.tick(50);
         assert.equal(fired, 1);
+        cancel();
     });
 });

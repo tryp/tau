@@ -113,6 +113,13 @@ import {
 } from "./bash-tmux.ts";
 import { captureOutput } from "../tmux.ts";
 
+class PossiblyStuckError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "PossiblyStuckError";
+    }
+}
+
 export function resolveExecutionCwd(
     perCallCwd: unknown,
     baseCwd: string
@@ -1743,7 +1750,11 @@ export function registerBackgroundJobs(
                         state,
                         pi
                     );
-                } catch {
+                } catch (error) {
+                    // Only spawn/setup failures should fall through. A
+                    // PossiblyStuckError is the intentional tool result from
+                    // a running tmux command and must wake the agent directly.
+                    if (error instanceof PossiblyStuckError) throw error;
                     // tmux spawn failed (not in git repo, server error, etc.)
                     // Fall through to direct-spawn path.
                 }
@@ -1964,12 +1975,12 @@ export function registerBackgroundJobs(
                     state.backgroundJobs.delete(jobId);
                     killProcessGroup(proc.pid, "SIGTERM");
                     const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
-                    throw new Error(
+                    throw new PossiblyStuckError(
                         `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
                             `Killed the command so the session can continue.\n` +
                             `Command: ${command}\n` +
                             `Output (${logPath}):\n${tail}\n` +
-                            `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run.`
+                            `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run, or use bash_bg for a long-running command.`
                     );
                 }
 
@@ -3193,17 +3204,19 @@ async function executeTmuxForeground(
             clearTimeout(timer);
             clearTimeout(hintTimer);
             state.runningProcesses.delete(toolCallId);
-            state.currentlyRunningToolCallId = null;
+            if (state.currentlyRunningToolCallId === toolCallId) {
+                state.currentlyRunningToolCallId = null;
+            }
             silenceJobAfterKill(job);
             killTmuxJob(job);
             updateWidget(state, ctx);
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
-            throw new Error(
+            throw new PossiblyStuckError(
                 `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
                     `Killed tmux job ${jobId} so the session can continue.\n` +
                     `Command: ${command}\n` +
                     `Output (${logPath}):\n${tail}\n` +
-                    `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run.`
+                    `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run, or use bash_bg for a long-running command.`
             );
         }
 
