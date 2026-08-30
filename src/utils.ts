@@ -27,6 +27,27 @@ export const STALL_TAIL_BYTES = 1024;
 export const MAX_OUTPUT_PREVIEW_CHARS = 12_000;
 /** Maximum log file size before the stall watchdog kills the job. */
 export const MAX_LOG_BYTES = 100 * 1024 * 1024; // 100 MiB
+/**
+ * Non-interactive sessions (subagent workers, `pi -p`) never auto-background a
+ * foreground command — the auto-background timer deliberately no-ops there —
+ * so a command that goes silent would block the agent loop forever (observed:
+ * a 14h session hang caused by a deadlocked test binary). After this much
+ * output silence, the command is killed and a possibly-stuck notice is
+ * returned as the tool result so the agent can decide what to do next.
+ * Override with PI_TAU_STALL_WAKE_MS (milliseconds).
+ */
+export const NONINTERACTIVE_STALL_WAKE_MS = 240_000;
+
+export function resolveNonInteractiveStallWakeMs(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = env.PI_TAU_STALL_WAKE_MS;
+    if (raw !== undefined) {
+        const parsed = Number.parseInt(raw, 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return NONINTERACTIVE_STALL_WAKE_MS;
+}
 export const NOTIFICATION_BODY_MAX = 200;
 
 // ─── Plan mode tools ────────────────────────────────────────────────

@@ -100,6 +100,7 @@ import {
     markJobTerminal,
     readOutputTail,
     readOutputTailSync,
+    resolveNonInteractiveStallWakeMs,
     formatJobLine,
 } from "../utils.ts";
 import {
@@ -172,6 +173,44 @@ function spawnBashProcess(
 export function silenceJobAfterKill(job: BackgroundJob): void {
     markJobTerminal(job, "killed");
     job.outputConsumed = true;
+}
+
+// ─── No-output watchdog (non-interactive foreground) ────────────────
+
+/**
+ * Watch a foreground command's log for output silence. Fires `onStall` once
+ * when no file growth has been observed for `stallMs`. Non-interactive
+ * sessions never auto-background, so without this a silent or deadlocked
+ * command would block the agent loop forever. The interval self-clears when
+ * it fires; callers must cancel the returned function on every other exit.
+ */
+export function startNoOutputWatchdog(
+    logPath: string,
+    stallMs: number,
+    onStall: () => void,
+    checkIntervalMs = STALL_CHECK_INTERVAL_MS
+): () => void {
+    let lastSize = -1;
+    let lastGrowth = Date.now();
+    const timer = setInterval(() => {
+        let size: number | undefined;
+        try {
+            size = statSync(logPath).size;
+        } catch {
+            // Log not created yet — counts as no output.
+        }
+        if (size !== undefined && size !== lastSize) {
+            lastSize = size;
+            lastGrowth = Date.now();
+            return;
+        }
+        if (Date.now() - lastGrowth >= stallMs) {
+            clearInterval(timer);
+            onStall();
+        }
+    }, checkIntervalMs);
+    timer.unref();
+    return () => clearInterval(timer);
 }
 
 // ─── Deterministic queued notification lifecycle ─────────────────────
@@ -1816,6 +1855,11 @@ export function registerBackgroundJobs(
             // File-polling for foreground progress
             const PROGRESS_POLL_MS = 1_000;
             let pollTimer: NodeJS.Timeout | undefined;
+            let cancelNoOutputWatchdog: (() => void) | undefined;
+            let noOutputResolve: (() => void) | null = null;
+            const noOutputSignal = new Promise<void>((resolve) => {
+                noOutputResolve = resolve;
+            });
             const startPolling = (): void => {
                 pollTimer = setInterval(() => {
                     try {
@@ -1882,6 +1926,18 @@ export function registerBackgroundJobs(
                 // Command still running — start polling for progress
                 startPolling();
 
+                // Non-interactive: the auto-background timer no-ops here, so a
+                // silent or deadlocked command would block the agent loop
+                // forever. Arm a no-output watchdog and race it — a stuck
+                // command wakes the agent with a possibly-stuck notice instead.
+                if (state.nonInteractive) {
+                    cancelNoOutputWatchdog = startNoOutputWatchdog(
+                        logPath,
+                        resolveNonInteractiveStallWakeMs(),
+                        () => noOutputResolve?.()
+                    );
+                }
+
                 // Race: completion vs background signal
                 const raceResult = await Promise.race([
                     procResult.then((r) => ({
@@ -1891,7 +1947,31 @@ export function registerBackgroundJobs(
                     backgroundSignal.then(() => ({
                         type: "backgrounded" as const,
                     })),
+                    noOutputSignal.then(() => ({
+                        type: "stalled" as const,
+                    })),
                 ]);
+
+                if (raceResult.type === "stalled") {
+                    clearInterval(pollTimer);
+                    clearTimeout(timer);
+                    clearTimeout(hintTimer);
+                    state.runningProcesses.delete(toolCallId);
+                    if (state.currentlyRunningToolCallId === toolCallId) {
+                        state.currentlyRunningToolCallId = null;
+                    }
+                    // Remove foreground job registration
+                    state.backgroundJobs.delete(jobId);
+                    killProcessGroup(proc.pid, "SIGTERM");
+                    const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
+                    throw new Error(
+                        `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
+                            `Killed the command so the session can continue.\n` +
+                            `Command: ${command}\n` +
+                            `Output (${logPath}):\n${tail}\n` +
+                            `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run.`
+                    );
+                }
 
                 if (raceResult.type === "backgrounded") {
                     // Clean up foreground state
@@ -1975,6 +2055,7 @@ export function registerBackgroundJobs(
                 clearInterval(pollTimer);
                 clearTimeout(timer);
                 clearTimeout(hintTimer);
+                cancelNoOutputWatchdog?.();
             }
         },
     });
@@ -2990,6 +3071,11 @@ async function executeTmuxForeground(
     // Progress polling
     const PROGRESS_POLL_MS = 1_000;
     let pollTimer: NodeJS.Timeout | undefined;
+    let cancelNoOutputWatchdog: (() => void) | undefined;
+    let noOutputResolve: (() => void) | null = null;
+    const noOutputSignal = new Promise<void>((resolve) => {
+        noOutputResolve = resolve;
+    });
     const startPolling = (): void => {
         pollTimer = setInterval(() => {
             try {
@@ -3074,6 +3160,18 @@ async function executeTmuxForeground(
         // Command still running — start polling for progress
         startPolling();
 
+        // Non-interactive: the auto-background timer no-ops here, so a silent
+        // or deadlocked command would block the agent loop forever. Arm a
+        // no-output watchdog and race it — a stuck command wakes the agent
+        // with a possibly-stuck notice instead.
+        if (state.nonInteractive) {
+            cancelNoOutputWatchdog = startNoOutputWatchdog(
+                logPath,
+                resolveNonInteractiveStallWakeMs(),
+                () => noOutputResolve?.()
+            );
+        }
+
         // Race: completion vs background signal
         const raceResult = await Promise.race([
             completionPromise.then((code) => ({
@@ -3084,7 +3182,30 @@ async function executeTmuxForeground(
                 type: "backgrounded" as const,
                 code: undefined as number | undefined,
             })),
+            noOutputSignal.then(() => ({
+                type: "stalled" as const,
+            })),
         ]);
+
+        if (raceResult.type === "stalled") {
+            clearInterval(pollTimer);
+            clearInterval(checkTimer);
+            clearTimeout(timer);
+            clearTimeout(hintTimer);
+            state.runningProcesses.delete(toolCallId);
+            state.currentlyRunningToolCallId = null;
+            silenceJobAfterKill(job);
+            killTmuxJob(job);
+            updateWidget(state, ctx);
+            const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
+            throw new Error(
+                `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
+                    `Killed tmux job ${jobId} so the session can continue.\n` +
+                    `Command: ${command}\n` +
+                    `Output (${logPath}):\n${tail}\n` +
+                    `If this command is expected to stay silent longer, set PI_TAU_STALL_WAKE_MS (ms) higher and re-run.`
+            );
+        }
 
         if (raceResult.type === "backgrounded") {
             clearInterval(pollTimer);
@@ -3195,6 +3316,7 @@ async function executeTmuxForeground(
         clearInterval(checkTimer);
         clearTimeout(timer);
         clearTimeout(hintTimer);
+        cancelNoOutputWatchdog?.();
     }
 }
 
