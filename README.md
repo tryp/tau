@@ -169,6 +169,28 @@ On-disk format in `.pi/settings.json`:
 
 Some features (instructions, git-checkpoint) bootstrap at session start; toggling them at runtime requires `/reload` to take full effect. The TUI flags these with a reload indicator.
 
+### Autonomous wake evaluation
+
+Autonomous wake evaluation is opt-in and periodically checks for background work
+that needs attention (pending decisions, queued agents, paused state, or
+unacknowledged terminal jobs). Healthy running jobs do not wake the agent.
+Configure it in global or project `.pi/settings.json` (project settings win):
+
+```json
+{
+  "tau": {
+    "wakeup": {
+      "enabled": true,
+      "intervalMs": 240000
+    }
+  }
+}
+```
+
+The interval is bounded to 10 seconds through 1 hour. Wake follow-ups are
+coalesced with the keyed `tau:wakeup` queue entry and are cancelled at session
+shutdown or when no actionable work remains.
+
 ## Tools
 
 | Tool | Purpose |
@@ -237,6 +259,7 @@ src/
     task.ts             task tool, /tasks command (nesting, links, status)
     tools-selector.ts   /tools command, state persistence
     notifications.ts    /notifications, agent_end notification, DnD support
+    wakeup.ts           Opt-in autonomous background-work wake evaluation
     bookmark.ts         /bookmark, /unbookmark
     context-files.ts    project instructions, rules, and memory loading
     custom-footer.ts    /footer command

@@ -533,6 +533,10 @@ function removeJob(state: TauState, job: BackgroundJob): void {
     if (state.recentTerminalJobs.length > MAX_RECENT_TERMINAL) {
         state.recentTerminalJobs.shift();
     }
+    // A terminal transition can make a queued wake obsolete (for example,
+    // after a job_decide keep/kill). The wake feature remains optional and
+    // communicates through this state hook to avoid a module dependency.
+    state.wakeupEvaluate?.();
 }
 
 /**
@@ -934,7 +938,13 @@ export function flushCompletionBatch(): void {
                 hasLinkedCallbacksForJob(j.job.id) ||
                 j.job.wantsCompletionNotification
         );
-        if (!hasLinked) return;
+        if (!hasLinked) {
+            // No normal follow-up is emitted for an unlinked successful
+            // completion. Leave it visible to the optional autonomous wake
+            // evaluator as an unacknowledged terminal result.
+            for (const item of batch) item.job.completionNotified = false;
+            return;
+        }
     }
 
     queueCompletionDelivery(batch, pi, state);
@@ -1217,6 +1227,7 @@ export function notifyCompletion(
     // skip notification entirely — the killing path already sent one.
     if (job.outputConsumed || completionNotifiedJobs.has(job)) return;
     completionNotifiedJobs.add(job);
+    job.completionNotified = true;
 
     // Linked callbacks (remindDelay) are NOT cancelled here — delivery
     // is deferred to flushCompletionBatch which decides whether to
@@ -2603,6 +2614,7 @@ export function registerBackgroundJobs(
             const job = lookupJob(state, params.jobId);
             if (!job) {
                 state.pendingDecisionJobId = undefined;
+                state.wakeupEvaluate?.();
                 return {
                     content: [
                         {
@@ -2621,6 +2633,7 @@ export function registerBackgroundJobs(
                     if (state.pendingBackgroundAgents.has(job.id)) {
                         cancelPendingBackgroundAgent(state, job.id);
                         state.pendingDecisionJobId = undefined;
+                        state.wakeupEvaluate?.();
                         return {
                             content: [
                                 {
@@ -2642,6 +2655,7 @@ export function registerBackgroundJobs(
                     silenceJobAfterKill(job);
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     state.pendingDecisionJobId = undefined;
+                    state.wakeupEvaluate?.();
                     return {
                         content: [{ type: "text", text: `Killed ${job.id}.` }],
                         details: jobDetails(job),
@@ -2649,6 +2663,7 @@ export function registerBackgroundJobs(
                 }
                 case "keep": {
                     state.pendingDecisionJobId = undefined;
+                    state.wakeupEvaluate?.();
                     return {
                         content: [
                             {
@@ -2674,6 +2689,7 @@ export function registerBackgroundJobs(
                     if (job.status !== "running") {
                         job.outputConsumed = true;
                         cancelCallbacksForJob(job.id);
+                        state.wakeupEvaluate?.();
                     }
                     return {
                         content: [

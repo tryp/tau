@@ -90,6 +90,7 @@ import {
     PLAN_MODE_ACTIVE_TOOLS,
 } from "./features/plan-tools.js";
 import { registerTauCommand } from "./features/features-register.ts";
+import { registerWakeup } from "./features/wakeup.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
 import { isTmuxAvailable } from "./tmux.ts";
 import {
@@ -208,6 +209,7 @@ export default function (pi: ExtensionAPI) {
     registerPlanTools(pi, state);
     registerGoal(pi, state);
     registerWorkflow(pi, state);
+    registerWakeup(pi, state);
     registerTauCommand(pi, state);
 
     // ── Agent events (cross-cutting) ──────────────────────────────────

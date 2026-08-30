@@ -123,6 +123,8 @@ export interface BackgroundJob {
     queued?: boolean;
     /** True once the agent has consumed output via attach — suppresses completion notification. */
     outputConsumed?: boolean;
+    /** True once the normal completion notification has been queued. */
+    completionNotified?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
     isBackgrounded: boolean;
     /**

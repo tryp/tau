@@ -156,6 +156,15 @@ export class TauState {
     /** Clear all pending-completion notifications from the debounced batch. */
     cancelAllCompletionBatches?: () => void;
 
+    // ── Autonomous wake hooks (set by wakeup.ts) ───────────────────
+
+    /** Re-evaluate actionable background work after a lifecycle change. */
+    wakeupEvaluate?: () => void;
+    /** Stop the wake timer and retract its queued follow-up. */
+    wakeupCancel?: () => void;
+    /** Signature of the last actionable snapshot sent as a wake follow-up. */
+    wakeupLastSignature?: string;
+
     /**
      * Test-only: force-flush the completion delivery batch.
      * Avoids waiting for the real debounce timer (which is .unref()'d and
