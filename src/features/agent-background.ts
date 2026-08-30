@@ -312,6 +312,7 @@ export function registerAgentBackground(
                 if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                 silenceJobAfterKill(job);
                 cancelQueuedBackgroundNotifications(pi, job.id);
+                state.wakeupEvaluate?.();
             }
         );
 

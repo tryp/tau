@@ -220,16 +220,37 @@ function sendWakeup(pi: ExtensionAPI, content: string): void {
     );
 }
 
-export function cancelQueuedWakeup(pi: ExtensionAPI): void {
-    (
+function hasWakeupCancellation(pi: ExtensionAPI): boolean {
+    return (
+        typeof (
+            pi as ExtensionAPI & {
+                cancelQueuedMessage?: (queueKey: string) => void;
+            }
+        ).cancelQueuedMessage === "function"
+    );
+}
+
+export function cancelQueuedWakeup(pi: ExtensionAPI): boolean {
+    const cancel = (
         pi as ExtensionAPI & {
             cancelQueuedMessage?: (queueKey: string) => void;
         }
-    ).cancelQueuedMessage?.(WAKEUP_QUEUE_KEY);
+    ).cancelQueuedMessage;
+    if (typeof cancel !== "function") return false;
+    cancel(WAKEUP_QUEUE_KEY);
+    return true;
 }
 
 /** Evaluate now. Returns true when a wake follow-up was queued. */
 export function evaluateWakeup(pi: ExtensionAPI, state: TauState): boolean {
+    // Without deterministic queue cancellation, a changed or resolved snapshot
+    // could leave a stale follow-up (or enqueue a duplicate) on older hosts.
+    // Disable autonomous delivery rather than pretending replacement worked.
+    if (!hasWakeupCancellation(pi)) {
+        state.wakeupLastSignature = undefined;
+        return false;
+    }
+
     const actions = collectWakeupActions(state);
     const signature = actions.map(actionKey).sort().join("|");
     if (!signature) {
@@ -238,6 +259,10 @@ export function evaluateWakeup(pi: ExtensionAPI, state: TauState): boolean {
         return false;
     }
     if (state.wakeupLastSignature === signature) return false;
+
+    // A changed snapshot replaces the prior queued wake, preventing two
+    // autonomous turns from representing successive snapshots.
+    if (state.wakeupLastSignature !== undefined) cancelQueuedWakeup(pi);
 
     const lines = actions.map(actionText).join("\n");
     const content =
@@ -277,6 +302,10 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
         stop();
         const config = loadWakeupConfig(ctx.cwd);
         if (!config.enabled) return;
+        // Autonomous delivery requires queue cancellation. Older hosts do not
+        // expose it, so leave the feature inactive rather than delivering wakes
+        // that cannot be retracted when their state is acknowledged.
+        if (!hasWakeupCancellation(pi)) return;
         active = true;
         timer = setInterval(() => evaluateWakeup(pi, state), config.intervalMs);
         timer.unref();

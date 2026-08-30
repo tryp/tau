@@ -39,6 +39,7 @@ export async function handleBackgroundShortcut(
         ctx.ui.setStatus("agent-backgrounded", undefined);
         updateWidget(state, ctx);
         ctx.ui.notify("▶ Resumed", "success");
+        state.wakeupEvaluate?.();
 
         pi.sendMessage(
             {
@@ -121,7 +122,9 @@ async function showTaskDetail(
             );
             // The posted attach result gives the agent equivalent knowledge;
             // suppress only matching queued notifications.
+            if (job.status !== "running") job.outputConsumed = true;
             cancelQueuedBackgroundNotifications(pi, job.id);
+            state.wakeupEvaluate?.();
             ctx.ui.notify(`Attached ${job.id}`, "info");
         } else if (action === actions[1]) {
             const output = await readOutputTail(
@@ -143,6 +146,7 @@ async function showTaskDetail(
             }
             silenceJobAfterKill(job);
             cancelQueuedBackgroundNotifications(pi, job.id);
+            state.wakeupEvaluate?.();
             ctx.ui.notify(`Killed ${job.id}`, "info");
             updateWidget(state, ctx);
         }
@@ -168,6 +172,7 @@ async function showTaskDetail(
             );
         } else if (action === actions[1]) {
             state.backgroundJobs.delete(job.id);
+            state.wakeupEvaluate?.();
             ctx.ui.notify(`Removed ${job.id}`, "info");
             updateWidget(state, ctx);
         }
@@ -266,6 +271,7 @@ export function registerBackgroundCommands(
             const job = runningJobs[0];
             if (state.pendingBackgroundAgents.has(job.id)) {
                 cancelPendingBackgroundAgent(state, job.id);
+                state.wakeupEvaluate?.();
                 ctx.ui.notify(`Killed queued agent ${job.id}`, "info");
                 updateWidget(state, ctx);
                 return;
@@ -278,6 +284,7 @@ export function registerBackgroundCommands(
             }
             silenceJobAfterKill(job);
             cancelQueuedBackgroundNotifications(pi, job.id);
+            state.wakeupEvaluate?.();
             ctx.ui.notify(`Killed ${job.id}`, "info");
             updateWidget(state, ctx);
         },
@@ -355,7 +362,9 @@ export function registerBackgroundCommands(
                 );
                 // The /fg result is added to the session context; it is not
                 // merely a UI toast.
+                if (job.status !== "running") job.outputConsumed = true;
                 cancelQueuedBackgroundNotifications(pi, job.id);
+                state.wakeupEvaluate?.();
                 ctx.ui.notify(`Attached output posted for ${job.id}`, "info");
             } finally {
                 ctx.ui.setStatus("bg-fg", undefined);

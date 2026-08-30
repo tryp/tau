@@ -496,8 +496,10 @@ export function clearPendingDecision(
     state: TauState,
     job: BackgroundJob
 ): void {
-    if (state.pendingDecisionJobId === job.id)
+    if (state.pendingDecisionJobId === job.id) {
         state.pendingDecisionJobId = undefined;
+        state.wakeupEvaluate?.();
+    }
 }
 
 /**
@@ -515,6 +517,7 @@ export function clearStalePendingDecision(state: TauState): void {
     const job = state.backgroundJobs.get(jobId);
     if (!job || job.status !== "running") {
         state.pendingDecisionJobId = undefined;
+        state.wakeupEvaluate?.();
     }
 }
 
@@ -902,10 +905,18 @@ let completionAgentBusy = false;
 let completionLifecycleToken = 0;
 let settledCompletionFlushTimer: NodeJS.Timeout | undefined;
 // Prevent duplicate notifications when both error and close handlers fire.
-const completionNotifiedJobs = new WeakSet<BackgroundJob>();
+// A Set (rather than WeakSet) lets cancellation restore a completion that was
+// marked before asynchronous indexing/enqueueing finished.
+const completionNotifiedJobs = new Set<BackgroundJob>();
+// Jobs marked for completion notification but not yet delivered. Cancellation
+// removes them here so autonomous wake evaluation can expose them again.
+const pendingCompletionJobs = new Map<string, BackgroundJob>();
+const deliveringCompletionJobIds = new Set<string>();
+// Per-job generations invalidate asynchronous indexing callbacks after a
+// completion is cancelled and then potentially re-notified.
+const completionJobGenerations = new Map<string, number>();
 // Invalidates asynchronous indexing callbacks after a batch is cleared.
 let completionBatchGeneration = 0;
-const suppressedCompletionJobIds = new Set<string>();
 
 /** Count currently running background jobs (excluding any completed/failed/killed). */
 function countOutstandingJobs(state: TauState): number {
@@ -942,7 +953,12 @@ export function flushCompletionBatch(): void {
             // No normal follow-up is emitted for an unlinked successful
             // completion. Leave it visible to the optional autonomous wake
             // evaluator as an unacknowledged terminal result.
-            for (const item of batch) item.job.completionNotified = false;
+            for (const item of batch) {
+                item.job.completionNotified = false;
+                completionNotifiedJobs.delete(item.job);
+                pendingCompletionJobs.delete(item.job.id);
+            }
+            state.wakeupEvaluate?.();
             return;
         }
     }
@@ -1033,9 +1049,18 @@ function deliverCompletionNotification(
     delivery: PendingCompletionDelivery
 ): void {
     const batch = pruneConsumedCompletions(delivery.jobs);
-    if (batch.length === 0) return;
+    if (batch.length === 0) {
+        for (const { job } of delivery.jobs)
+            pendingCompletionJobs.delete(job.id);
+        return;
+    }
 
     const { pi, state } = delivery;
+    // The message is now being handed to pi; cancellation after this point
+    // must not restore it as an autonomous wake.
+    for (const { job } of delivery.jobs) {
+        pendingCompletionJobs.delete(job.id);
+    }
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
@@ -1154,9 +1179,14 @@ function queueCompletionDelivery(
     if (jobsToDeliver.length === 0) return;
 
     // Cancel linked callbacks for all delivered jobs — we're about to
-    // send the result to the agent, so remind callbacks are now stale.
-    for (const { job } of jobsToDeliver) {
-        cancelCallbacksForJob(job.id);
+    // send the result to the agent, so remind callbacks are now stale. Guard
+    // this internal cancellation: it must not retract the delivery itself.
+    for (const { job } of jobsToDeliver) deliveringCompletionJobIds.add(job.id);
+    try {
+        for (const { job } of jobsToDeliver) cancelCallbacksForJob(job.id);
+    } finally {
+        for (const { job } of jobsToDeliver)
+            deliveringCompletionJobIds.delete(job.id);
     }
     pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
     flushPendingCompletionDeliveries();
@@ -1168,8 +1198,26 @@ function queueCompletionDelivery(
  * notifications for jobs the agent has already acknowledged.
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
-    // The indexing promise may not have queued the job yet.
-    suppressedCompletionJobIds.add(jobId);
+    // The indexing promise may not have queued the job yet. Invalidate that
+    // callback and restore the terminal result unless delivery is already in
+    // progress (where this cancellation is only clearing linked callbacks).
+    const pendingJob = pendingCompletionJobs.get(jobId);
+    const wakeState =
+        completionBatch.state ??
+        pendingCompletionDeliveries.find((delivery) =>
+            delivery.jobs.some((item) => item.job.id === jobId)
+        )?.state;
+    let restored = false;
+    if (pendingJob && !deliveringCompletionJobIds.has(jobId)) {
+        pendingCompletionJobs.delete(jobId);
+        completionNotifiedJobs.delete(pendingJob);
+        pendingJob.completionNotified = false;
+        completionJobGenerations.set(
+            jobId,
+            (completionJobGenerations.get(jobId) ?? 0) + 1
+        );
+        restored = true;
+    }
     const idx = completionBatch.jobs.findIndex((j) => j.job.id === jobId);
     if (idx !== -1) {
         completionBatch.jobs.splice(idx, 1);
@@ -1190,6 +1238,7 @@ export function clearJobFromCompletionBatch(jobId: string): void {
             pendingCompletionDeliveries.splice(i, 1);
         }
     }
+    if (restored) wakeState?.wakeupEvaluate?.();
 }
 
 /**
@@ -1199,7 +1248,24 @@ export function clearJobFromCompletionBatch(jobId: string): void {
  */
 export function clearAllCompletionBatches(): void {
     completionBatchGeneration++;
-    suppressedCompletionJobIds.clear();
+    const wakeStates = new Set<TauState>();
+    for (const [jobId, job] of pendingCompletionJobs) {
+        if (deliveringCompletionJobIds.has(jobId)) continue;
+        completionNotifiedJobs.delete(job);
+        job.completionNotified = false;
+        completionJobGenerations.set(
+            jobId,
+            (completionJobGenerations.get(jobId) ?? 0) + 1
+        );
+        const wakeState =
+            completionBatch.state ??
+            pendingCompletionDeliveries.find((delivery) =>
+                delivery.jobs.some((item) => item.job.id === jobId)
+            )?.state;
+        if (wakeState) wakeStates.add(wakeState);
+    }
+    pendingCompletionJobs.clear();
+    for (const state of wakeStates) state?.wakeupEvaluate?.();
     if (completionBatch.timer) {
         clearTimeout(completionBatch.timer);
         completionBatch.timer = undefined;
@@ -1228,6 +1294,9 @@ export function notifyCompletion(
     if (job.outputConsumed || completionNotifiedJobs.has(job)) return;
     completionNotifiedJobs.add(job);
     job.completionNotified = true;
+    const jobGeneration = (completionJobGenerations.get(job.id) ?? 0) + 1;
+    completionJobGenerations.set(job.id, jobGeneration);
+    pendingCompletionJobs.set(job.id, job);
 
     // Linked callbacks (remindDelay) are NOT cancelled here — delivery
     // is deferred to flushCompletionBatch which decides whether to
@@ -1250,10 +1319,12 @@ export function notifyCompletion(
     const enqueue = (): void => {
         if (
             generation !== completionBatchGeneration ||
-            job.outputConsumed ||
-            suppressedCompletionJobIds.delete(job.id)
-        )
+            completionJobGenerations.get(job.id) !== jobGeneration ||
+            job.outputConsumed
+        ) {
+            pendingCompletionJobs.delete(job.id);
             return;
+        }
         if (job.sidecarIndexStatus === "failed") {
             ctx.ui.notify(
                 `Sidecar indexing failed for ${job.id} (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at ${job.logPath}`,
@@ -1338,6 +1409,7 @@ export function registerBackgroundJob(
             if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
             silenceJobAfterKill(job);
             cancelQueuedBackgroundNotifications(pi, job.id);
+            state.wakeupEvaluate?.();
         }
     );
 
@@ -2026,6 +2098,7 @@ export function registerBackgroundJobs(
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                     silenceJobAfterKill(job);
                     cancelQueuedBackgroundNotifications(pi, job.id);
+                    state.wakeupEvaluate?.();
                 }
             );
 
@@ -2236,6 +2309,7 @@ export function registerBackgroundJobs(
                             job.outputConsumed = true;
                             cancelCallbacksForJob(job.id);
                             cancelQueuedBackgroundNotifications(pi, job.id);
+                            state.wakeupEvaluate?.();
                         }
                         const formatted = formatJobOutput({
                             text: output,
@@ -2364,6 +2438,7 @@ export function registerBackgroundJobs(
                     silenceJobAfterKill(job);
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     clearPendingDecision(state, job);
+                    state.wakeupEvaluate?.();
                     return {
                         content: [
                             {
@@ -2397,6 +2472,7 @@ export function registerBackgroundJobs(
                         );
                         job.outputConsumed = true;
                         cancelQueuedBackgroundNotifications(pi, job.id);
+                        state.wakeupEvaluate?.();
                         return {
                             content: [
                                 {
@@ -2518,8 +2594,9 @@ export function registerBackgroundJobs(
                         outputReadFailed(job, output)
                     );
                     const source = await sourceDetailsForJob(job);
-                    job.outputConsumed = true;
+                    if (job.status !== "running") job.outputConsumed = true;
                     cancelQueuedBackgroundNotifications(pi, job.id);
+                    state.wakeupEvaluate?.();
 
                     if (signal?.aborted) {
                         return {

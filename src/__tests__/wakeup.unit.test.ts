@@ -146,15 +146,49 @@ void describe("autonomous wake evaluation", () => {
         );
     });
 
-    void it("coalesces an unchanged snapshot and sends a new one when work changes", () => {
+    void it("replaces the queued wake when the actionable snapshot changes", () => {
         const state = new TauState();
         const queue = makePi();
+        const queued: SentMessage[] = [];
+        (
+            queue.pi as unknown as {
+                sendMessage: (
+                    message: SentMessage["message"],
+                    options: SentMessage["options"]
+                ) => void;
+                cancelQueuedMessage: (key: string) => void;
+            }
+        ).sendMessage = (message, options) => queued.push({ message, options });
+        (
+            queue.pi as unknown as {
+                cancelQueuedMessage: (key: string) => void;
+            }
+        ).cancelQueuedMessage = (key) => {
+            queue.cancelled.push(key);
+            for (let i = queued.length - 1; i >= 0; i--) {
+                if (queued[i].options.queueKey === key) queued.splice(i, 1);
+            }
+        };
         state.recentTerminalJobs.push(job("done", "completed"));
         assert.equal(evaluateWakeup(queue.pi, state), true);
         assert.equal(evaluateWakeup(queue.pi, state), false);
         state.recentTerminalJobs.push(job("done-2", "completed"));
         assert.equal(evaluateWakeup(queue.pi, state), true);
-        assert.equal(queue.sent.length, 2);
+        assert.equal(queued.length, 1);
+        assert.match(queued[0].message.content, /done-2/);
+        assert.deepEqual(queue.cancelled, [WAKEUP_QUEUE_KEY]);
+    });
+
+    void it("disables autonomous delivery on hosts without queue cancellation", () => {
+        const state = new TauState();
+        const queue = makePi();
+        delete (queue.pi as unknown as { cancelQueuedMessage?: unknown })
+            .cancelQueuedMessage;
+        state.recentTerminalJobs.push(job("done", "completed"));
+        assert.equal(evaluateWakeup(queue.pi, state), false);
+        state.recentTerminalJobs.push(job("done-2", "completed"));
+        assert.equal(evaluateWakeup(queue.pi, state), false);
+        assert.equal(queue.sent.length, 0);
     });
 
     void it("cancels queued wake state after terminal work is acknowledged", () => {

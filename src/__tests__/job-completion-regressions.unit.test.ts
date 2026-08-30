@@ -126,6 +126,44 @@ void describe("job completion regression coverage", () => {
         );
     });
 
+    void it("restores a cancelled completion for autonomous wake evaluation", () => {
+        const state = new TauState();
+        const { pi, sentMessages } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-cancelled-completion",
+            status: "completed",
+            wantsCompletionNotification: true,
+        });
+        const wakeEvaluations: number[] = [];
+        state.wakeupEvaluate = () => wakeEvaluations.push(1);
+
+        notifyCompletion(job, state, pi as never, notificationContext());
+        assert.equal(job.completionNotified, true);
+        state.cancelCompletionBatchForJob?.(job.id);
+        flushCompletionBatch();
+
+        assert.equal(job.completionNotified, false);
+        assert.ok(wakeEvaluations.length >= 1);
+        assert.equal(sentMessages.length, 0);
+    });
+
+    void it("can re-notify a completion after its queued delivery is cancelled", () => {
+        const state = new TauState();
+        const { pi, sentMessages } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-renotify-completion",
+            status: "failed",
+            wantsCompletionNotification: true,
+        });
+
+        notifyCompletion(job, state, pi as never, notificationContext());
+        state.cancelCompletionBatchForJob?.(job.id);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+
+        assert.equal(sentMessages.length, 1);
+    });
+
     void it("holds completion delivery until the session is settled", async () => {
         const state = new TauState();
         const { pi, sentMessages, sentMessageOptions, invoke } =

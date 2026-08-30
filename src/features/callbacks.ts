@@ -183,6 +183,7 @@ export function cancelCallbacksForJob(jobId: string): number {
     if (count > 0) persistState();
     // Also clear any pending completion notification for this job
     _tauState?.cancelCompletionBatchForJob?.(jobId);
+    _tauState?.wakeupEvaluate?.();
     return count;
 }
 
@@ -565,6 +566,7 @@ function cancelCallback(id: string): boolean {
     // Also clear any pending completion notification for the linked job
     if (linkedJobId) {
         _tauState?.cancelCompletionBatchForJob?.(linkedJobId);
+        _tauState?.wakeupEvaluate?.();
     }
     return true;
 }
