@@ -5,7 +5,7 @@
  * The real session observed bg-timeout/bg-stall messages 5.8–73 minutes
  * after their jobs had completed or been killed. pi-tau emits these messages
  * with deliverAs: "followUp"; pi-mono queues them until the agent settles.
- * This test models that queue boundary and records the current bug.
+ * These tests model that queue boundary and enforce deterministic cancellation.
  */
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
@@ -13,7 +13,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startStallWatchdog } from "../features/background.ts";
+import {
+    cancelQueuedBackgroundNotification,
+    startStallWatchdog,
+} from "../features/background.ts";
 import { TauState } from "../state.ts";
 import { STALL_CHECK_INTERVAL_MS, STALL_THRESHOLD_MS } from "../utils.ts";
 import type { BackgroundJob } from "../types.ts";
@@ -26,7 +29,11 @@ interface Message {
 
 interface QueuedMessage {
     message: Message;
-    options?: { deliverAs?: string; triggerTurn?: boolean };
+    options?: {
+        deliverAs?: string;
+        triggerTurn?: boolean;
+        queueKey?: string;
+    };
 }
 
 function makeQueuedPi(): {
@@ -45,6 +52,12 @@ function makeQueuedPi(): {
                 if (busy && options?.deliverAs === "followUp")
                     queued.push(item);
                 else delivered.push(item);
+            },
+            cancelQueuedMessage(queueKey: string) {
+                const remaining = queued.filter(
+                    (item) => item.options?.queueKey !== queueKey
+                );
+                queued.splice(0, queued.length, ...remaining);
             },
         } as never,
         queued,
@@ -77,7 +90,7 @@ void describe("queued background notification race", () => {
         rmSync(dir, { recursive: true, force: true });
     });
 
-    void it("REPRODUCER: delivers a queued stall warning after the job is terminal", () => {
+    void it("cancels a queued stall warning when terminal knowledge supersedes it", () => {
         const state = new TauState();
         const job: BackgroundJob = {
             id: "job-queued-stall",
@@ -107,21 +120,39 @@ void describe("queued background notification race", () => {
         assert.equal(queue.queued.length, 1);
         assert.equal(queue.delivered.length, 0);
 
-        // The completion path wins before the agent settles. pi-tau's
-        // sendMessage call is already inside pi-mono's follow-up queue and
-        // cannot currently be retracted.
+        // The completion path wins before the agent settles. The terminal
+        // result supersedes the queued warning at a deterministic boundary.
         job.status = "completed";
+        cancelQueuedBackgroundNotification(queue.pi, job.id, "stall");
+        assert.equal(queue.queued.length, 0);
         queue.settle();
 
-        assert.equal(queue.delivered.length, 1);
-        assert.equal(queue.delivered[0]?.message.customType, "bg-stall");
-        assert.match(
-            queue.delivered[0]?.message.content ?? "",
-            /job-queued-stall/
-        );
+        assert.equal(queue.delivered.length, 0);
     });
 
-    void it.todo(
-        "suppresses queued bg-timeout/bg-stall messages when their job becomes terminal before delivery"
-    );
+    void it("cannot retract a warning after the delivery boundary", () => {
+        const queue = makeQueuedPi();
+        (
+            queue.pi as {
+                sendMessage(
+                    message: Message,
+                    options?: QueuedMessage["options"]
+                ): void;
+            }
+        ).sendMessage(
+            {
+                customType: "bg-stall",
+                content: "already delivered",
+            },
+            {
+                deliverAs: "followUp",
+                queueKey: "tau:bg:job-delivered:stall",
+            }
+        );
+        queue.settle();
+
+        cancelQueuedBackgroundNotification(queue.pi, "job-delivered", "stall");
+        assert.equal(queue.delivered.length, 1);
+        assert.equal(queue.delivered[0]?.message.content, "already delivered");
+    });
 });

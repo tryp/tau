@@ -11,7 +11,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
 import type { BackgroundJob, UiContext } from "../types.ts";
-import { updateWidget, silenceJobAfterKill } from "./background.ts";
+import {
+    updateWidget,
+    silenceJobAfterKill,
+    cancelQueuedBackgroundNotifications,
+} from "./background.ts";
 import { captureReload } from "./reload.ts";
 import {
     MAX_OUTPUT_PREVIEW_CHARS,
@@ -115,6 +119,9 @@ async function showTaskDetail(
                 },
                 { deliverAs: "steer", triggerTurn: false }
             );
+            // The posted attach result gives the agent equivalent knowledge;
+            // suppress only matching queued notifications.
+            cancelQueuedBackgroundNotifications(pi, job.id);
             ctx.ui.notify(`Attached ${job.id}`, "info");
         } else if (action === actions[1]) {
             const output = await readOutputTail(
@@ -135,6 +142,7 @@ async function showTaskDetail(
                 killProcessGroup(job.proc.pid!, "SIGTERM");
             }
             silenceJobAfterKill(job);
+            cancelQueuedBackgroundNotifications(pi, job.id);
             ctx.ui.notify(`Killed ${job.id}`, "info");
             updateWidget(state, ctx);
         }
@@ -269,6 +277,7 @@ export function registerBackgroundCommands(
                 killProcessGroup(job.proc.pid!, "SIGTERM");
             }
             silenceJobAfterKill(job);
+            cancelQueuedBackgroundNotifications(pi, job.id);
             ctx.ui.notify(`Killed ${job.id}`, "info");
             updateWidget(state, ctx);
         },
@@ -344,6 +353,9 @@ export function registerBackgroundCommands(
                     },
                     { deliverAs: "steer", triggerTurn: false }
                 );
+                // The /fg result is added to the session context; it is not
+                // merely a UI toast.
+                cancelQueuedBackgroundNotifications(pi, job.id);
                 ctx.ui.notify(`Attached output posted for ${job.id}`, "info");
             } finally {
                 ctx.ui.setStatus("bg-fg", undefined);

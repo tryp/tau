@@ -35,7 +35,7 @@ function killTestSession(): void {
     }
 }
 
-/** Record sendMessage calls so tests can assert bg-timeout content. */
+/** Record sendMessage calls so tests can assert no duplicate timeout notice. */
 interface CapturedMessage {
     type: string;
     content: string;
@@ -153,10 +153,13 @@ void describe(
                 /Process backgrounded as/
             );
 
-            // The bg-timeout message should report the ~1s duration.
-            const bgMsg = messages.find((m) => m.type === "bg-timeout");
-            assert.ok(bgMsg, "bg-timeout message should be sent");
-            assert.match(bgMsg.content, /timed out after 1s/);
+            // The tool result is the authoritative backgrounding notice; no
+            // duplicate bg-timeout follow-up should wake the model.
+            assert.equal(
+                messages.some((m) => m.type === "bg-timeout"),
+                false,
+                "bg-timeout should not be sent as a duplicate follow-up"
+            );
 
             // The backgrounded job is tracked in state.
             const job = [...state.backgroundJobs.values()].find(

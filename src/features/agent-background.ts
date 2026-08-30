@@ -41,6 +41,7 @@ import {
 } from "../utils.ts";
 import {
     silenceJobAfterKill,
+    cancelQueuedBackgroundNotifications,
     startStallWatchdog,
     clearPendingDecision,
     notifyCompletion,
@@ -310,6 +311,7 @@ export function registerAgentBackground(
             () => {
                 if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                 silenceJobAfterKill(job);
+                cancelQueuedBackgroundNotifications(pi, job.id);
             }
         );
 

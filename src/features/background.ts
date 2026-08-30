@@ -174,6 +174,67 @@ export function silenceJobAfterKill(job: BackgroundJob): void {
     job.outputConsumed = true;
 }
 
+// ─── Deterministic queued notification lifecycle ─────────────────────
+
+export type BackgroundNotificationKind = "timeout" | "stall" | "completion";
+
+export function backgroundNotificationKey(
+    jobId: string,
+    kind: BackgroundNotificationKind
+): string {
+    return `tau:bg:${jobId}:${kind}`;
+}
+
+/**
+ * Cancel a queued notification without relying on a time-based expiry.
+ * Older pi hosts may not expose cancellation; in that case the notification
+ * remains available rather than being silently discarded.
+ */
+export function cancelQueuedBackgroundNotification(
+    pi: ExtensionAPI,
+    jobId: string,
+    kind: BackgroundNotificationKind
+): void {
+    const cancel = (
+        pi as ExtensionAPI & {
+            cancelQueuedMessage?: (queueKey: string) => void;
+        }
+    ).cancelQueuedMessage;
+    cancel?.(backgroundNotificationKey(jobId, kind));
+}
+
+export function cancelQueuedBackgroundNotifications(
+    pi: ExtensionAPI,
+    jobId: string
+): void {
+    cancelQueuedBackgroundNotification(pi, jobId, "timeout");
+    cancelQueuedBackgroundNotification(pi, jobId, "stall");
+    // Completion batches intentionally have no per-job key. This cancellation
+    // is effective only for single-job completion messages.
+    cancelQueuedBackgroundNotification(pi, jobId, "completion");
+}
+
+type QueuedMessageOptions = {
+    deliverAs: "steer" | "followUp" | "nextTurn";
+    triggerTurn?: boolean;
+    queueKey?: string;
+};
+
+function sendQueuedMessage(
+    pi: ExtensionAPI,
+    message: Parameters<ExtensionAPI["sendMessage"]>[0],
+    options: QueuedMessageOptions
+): void {
+    (
+        pi as ExtensionAPI & {
+            sendMessage: (
+                message: Parameters<ExtensionAPI["sendMessage"]>[0],
+                options: QueuedMessageOptions
+            ) => void;
+        }
+    ).sendMessage(message, options);
+}
+
 // ─── Stall watchdog ─────────────────────────────────────────────────
 
 export function startStallWatchdog(
@@ -205,14 +266,19 @@ export function startStallWatchdog(
                 clearInterval(timer);
                 if (onOversize) onOversize();
                 const suffix = outstandingJobsSuffix(state, jobId);
-                pi.sendMessage(
+                sendQueuedMessage(
+                    pi,
                     {
                         customType: "bg-stall",
                         content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.${suffix}`,
                         display: true,
                         details: { jobId, logPath, command },
                     },
-                    { deliverAs: "followUp", triggerTurn: true }
+                    {
+                        deliverAs: "followUp",
+                        triggerTurn: true,
+                        queueKey: backgroundNotificationKey(jobId, "stall"),
+                    }
                 );
                 return;
             }
@@ -237,14 +303,19 @@ export function startStallWatchdog(
                     `Last output:\n${tail.trimEnd()}\n\n` +
                     `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
                     `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
-                pi.sendMessage(
+                sendQueuedMessage(
+                    pi,
                     {
                         customType: "bg-stall",
                         content: `⚠️ ${summary}${suffix}`,
                         display: true,
                         details: { jobId, logPath, command },
                     },
-                    { deliverAs: "followUp", triggerTurn: true }
+                    {
+                        deliverAs: "followUp",
+                        triggerTurn: true,
+                        queueKey: backgroundNotificationKey(jobId, "stall"),
+                    }
                 );
                 return;
             }
@@ -260,14 +331,19 @@ export function startStallWatchdog(
                 `Command: ${command}\n\n` +
                 `The job may be spinning, hung, or silently computing. Use job_decide ` +
                 `to keep it running or kill it.`;
-            pi.sendMessage(
+            sendQueuedMessage(
+                pi,
                 {
                     customType: "bg-stall",
                     content: `⚠️ ${summary}${suffix}`,
                     display: true,
                     details: { jobId, logPath, command },
                 },
-                { deliverAs: "followUp", triggerTurn: true }
+                {
+                    deliverAs: "followUp",
+                    triggerTurn: true,
+                    queueKey: backgroundNotificationKey(jobId, "stall"),
+                }
             );
         } catch {
             // File may not exist yet — skip this tick
@@ -476,6 +552,9 @@ export function handleTmuxCompletion(
     ctx: UiContext,
     shouldNotify: boolean
 ): void {
+    // A terminal tmux result supersedes any queued warning for this job.
+    cancelQueuedBackgroundNotification(pi, job.id, "timeout");
+    cancelQueuedBackgroundNotification(pi, job.id, "stall");
     if (shouldNotify) {
         // bash_bg's notify option is an explicit request for a completion
         // turn. Preserve it through the shared successful-completion
@@ -960,7 +1039,8 @@ function deliverCompletionNotification(
         const gpuLine = readGpuSnapshot();
         const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
-        pi.sendMessage(
+        sendQueuedMessage(
+            pi,
             {
                 customType: "job-completion",
                 content:
@@ -986,7 +1066,11 @@ function deliverCompletionNotification(
                     outstandingJobs: outstandingCount,
                 },
             },
-            { deliverAs: "followUp", triggerTurn: true }
+            {
+                deliverAs: "followUp",
+                triggerTurn: true,
+                queueKey: backgroundNotificationKey(job.id, "completion"),
+            }
         );
         return;
     }
@@ -1013,7 +1097,8 @@ function deliverCompletionNotification(
     const gpuLine = readGpuSnapshot();
     const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
-    pi.sendMessage(
+    sendQueuedMessage(
+        pi,
         {
             customType: "job-completion",
             content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}${resourceInfo}`,
@@ -1035,7 +1120,10 @@ function deliverCompletionNotification(
                 outstandingJobs: outstandingCount,
             },
         },
-        { deliverAs: "followUp", triggerTurn: true }
+        {
+            deliverAs: "followUp",
+            triggerTurn: true,
+        }
     );
 }
 
@@ -1120,6 +1208,11 @@ export function notifyCompletion(
     pi: ExtensionAPI,
     ctx: UiContext
 ): void {
+    // A terminal result supersedes any queued timeout/stall warning for the
+    // same job. This is deterministic cancellation, not a time-based expiry.
+    cancelQueuedBackgroundNotification(pi, job.id, "timeout");
+    cancelQueuedBackgroundNotification(pi, job.id, "stall");
+
     // If the job was already silenced (killed by watchdog, tool, etc.),
     // skip notification entirely — the killing path already sent one.
     if (job.outputConsumed || completionNotifiedJobs.has(job)) return;
@@ -1233,6 +1326,7 @@ export function registerBackgroundJob(
         () => {
             if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
             silenceJobAfterKill(job);
+            cancelQueuedBackgroundNotifications(pi, job.id);
         }
     );
 
@@ -1276,22 +1370,6 @@ export function getActiveBackgroundControlTools(pi: ExtensionAPI): string[] {
         // historical behavior there; current pi always provides this method.
         return ["jobs", "job_decide"];
     }
-}
-
-function jobControlInstructions(pi: ExtensionAPI, jobId: string): string {
-    const controls = getActiveBackgroundControlTools(pi);
-    if (controls.includes("job_decide")) {
-        return (
-            `Use the job_decide tool with jobId "${jobId}" to decide:\n` +
-            `- decision "check": inspect the output first\n` +
-            `- decision "keep": let it continue running\n` +
-            `- decision "kill": terminate it`
-        );
-    }
-    return (
-        `Use the jobs tool with action "list", "output", "attach", or "kill" ` +
-        `and jobId "${jobId}" to manage it.`
-    );
 }
 
 function notifyBackgroundUnavailable(
@@ -1696,34 +1774,9 @@ export function registerBackgroundJobs(
 
                     state.pendingDecisionJobId = job.id;
 
-                    const duration = formatDuration(
-                        typeof params.backgroundAfter === "number"
-                            ? params.backgroundAfter * 1_000
-                            : DEFAULT_TIMEOUT_MS
-                    );
-                    const bgSuffix = outstandingJobsSuffix(state, job.id);
-                    pi.sendMessage(
-                        {
-                            customType: "bg-timeout",
-                            content:
-                                `⏰ Command timed out after ${duration} and has been backgrounded as ${job.id}${bgSuffix}.\n` +
-                                `Command: ${command}\n` +
-                                `PID: ${job.pid}\n` +
-                                `Output so far: ${job.logPath}\n\n` +
-                                `${jobControlInstructions(pi, job.id)}\n\n` +
-                                `Use jobs action "attach" with a timeout to monitor its progress with periodic updates.`,
-                            display: true,
-                            details: {
-                                jobId: job.id,
-                                logPath: job.logPath,
-                                command,
-                                pid: job.pid,
-                                startTime: job.startTime,
-                            },
-                        },
-                        { deliverAs: "followUp", triggerTurn: true }
-                    );
-
+                    // The tool result below is the authoritative backgrounding
+                    // notice. Do not enqueue a second model turn with the same
+                    // facts; the UI already received the backgrounded toast.
                     return {
                         content: [
                             {
@@ -1961,6 +2014,7 @@ export function registerBackgroundJobs(
                 () => {
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
                     silenceJobAfterKill(job);
+                    cancelQueuedBackgroundNotifications(pi, job.id);
                 }
             );
 
@@ -2170,6 +2224,7 @@ export function registerBackgroundJobs(
                         if (job.status !== "running") {
                             job.outputConsumed = true;
                             cancelCallbacksForJob(job.id);
+                            cancelQueuedBackgroundNotifications(pi, job.id);
                         }
                         const formatted = formatJobOutput({
                             text: output,
@@ -2296,6 +2351,7 @@ export function registerBackgroundJobs(
                         throw new Error(`Job is not running: ${job.id}`);
                     }
                     silenceJobAfterKill(job);
+                    cancelQueuedBackgroundNotifications(pi, job.id);
                     clearPendingDecision(state, job);
                     return {
                         content: [
@@ -2329,6 +2385,7 @@ export function registerBackgroundJobs(
                             outputReadFailed(job, output)
                         );
                         job.outputConsumed = true;
+                        cancelQueuedBackgroundNotifications(pi, job.id);
                         return {
                             content: [
                                 {
@@ -2451,6 +2508,7 @@ export function registerBackgroundJobs(
                     );
                     const source = await sourceDetailsForJob(job);
                     job.outputConsumed = true;
+                    cancelQueuedBackgroundNotifications(pi, job.id);
 
                     if (signal?.aborted) {
                         return {
@@ -2582,6 +2640,7 @@ export function registerBackgroundJobs(
                         killProcessGroup(job.proc.pid!, "SIGTERM");
                     }
                     silenceJobAfterKill(job);
+                    cancelQueuedBackgroundNotifications(pi, job.id);
                     state.pendingDecisionJobId = undefined;
                     return {
                         content: [{ type: "text", text: `Killed ${job.id}.` }],
@@ -2915,23 +2974,8 @@ async function executeTmuxForeground(
 
             state.pendingDecisionJobId = jobId;
 
-            const duration = formatDuration(timeoutMs);
-            pi.sendMessage(
-                {
-                    customType: "bg-timeout",
-                    content:
-                        `⏰ Command timed out after ${duration} and has been backgrounded as ${jobId}.\n` +
-                        `Command: ${command}\n` +
-                        `Tmux window: ${tmuxCtx.windowId}\n` +
-                        `Output so far: ${logPath}\n\n` +
-                        `${jobControlInstructions(pi, jobId)}\n\n` +
-                        `You can attach to the tmux window with: tmux attach -t ${tmuxCtx.windowId}`,
-                    display: true,
-                    details: { jobId, logPath, command },
-                },
-                { deliverAs: "followUp", triggerTurn: true }
-            );
-
+            // The tool result below is the authoritative backgrounding
+            // notice. Do not enqueue a duplicate model turn.
             updateWidget(state, ctx);
 
             return {
