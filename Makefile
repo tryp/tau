@@ -5,11 +5,14 @@
 # Never edit files in the runtime copy directly; change them here and run
 # `make deploy` to push them out, or `make verify` to check for drift.
 #
-#   make deploy            # copy to runtime, stamp .deployed-commit, verify
+#   make deploy            # copy, stamp, verify, and smoke-test the runtime
 #   make verify            # content + commit marker must match this checkout
+#   make smoke-test        # load only this deployed extension in a fresh pi
 #   make deployed-commit   # show what is deployed
 
 RUNTIME_DIR ?= $(HOME)/.pi/agent/local/pi-tau
+SMOKE_SCRIPT ?= /home/dev/src/pi-session-analysis/scripts/predeploy_smoke.py
+SMOKE_TIMEOUT ?= 90
 
 # Files that are intentionally runtime-only and never deployed:
 #   .deployed-commit  — deploy stamp (source commit + timestamp + notice)
@@ -23,9 +26,10 @@ RSYNC_EXCLUDES := \
 	--exclude '.deployed-commit' \
 	--exclude 'README.md'
 
-.PHONY: deploy verify deployed-commit
+.PHONY: deploy verify smoke-test deployed-commit
 
-deploy:  ## Copy this checkout to the local pi runtime, stamp it, and verify
+deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
+	@test -z "$$(git status --porcelain)" || { echo "ERROR: commit source changes before deploying" >&2; git status --short >&2; exit 1; }
 	@test -d "$(RUNTIME_DIR)" || mkdir -p "$(RUNTIME_DIR)"
 	@deleting=$$(rsync -nrc --delete $(RSYNC_EXCLUDES) ./ "$(RUNTIME_DIR)/" | grep '^deleting ' || true); \
 	if [ -n "$$deleting" ]; then \
@@ -39,6 +43,12 @@ deploy:  ## Copy this checkout to the local pi runtime, stamp it, and verify
 		"$(CURDIR)" "$$(git rev-parse --abbrev-ref HEAD)" "$$(git rev-parse HEAD)" "$$(date '+%Y-%m-%d %H:%M:%S %z')" \
 		> "$(RUNTIME_DIR)/.deployed-commit"
 	@$(MAKE) --no-print-directory verify
+	@$(MAKE) --no-print-directory smoke-test
+
+smoke-test:  ## Load only the deployed extension in a fresh pi process
+	python3 "$(SMOKE_SCRIPT)" --extension "$(RUNTIME_DIR)" --tool jobs \
+		--timeout "$(SMOKE_TIMEOUT)" \
+		--prompt 'Call jobs with action list, report that it loaded, and stop.'
 
 verify:  ## Verify runtime files match this checkout (content + commit marker)
 	@test -d "$(RUNTIME_DIR)" || { echo "ERROR: $(RUNTIME_DIR) missing" >&2; exit 1; }
