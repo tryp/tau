@@ -1710,6 +1710,34 @@ void describe("bash cwd validation", () => {
         assert.equal(state.backgroundJobs.size, 0);
     });
 
+    void it("wakes a silent non-interactive direct-spawn command", async () => {
+        const state = new TauState();
+        state.tmuxAvailable = false;
+        state.nonInteractive = true;
+        const bashTool = captureBashTool(state);
+        const previousWakeMs = process.env.PI_TAU_STALL_WAKE_MS;
+        process.env.PI_TAU_STALL_WAKE_MS = "100";
+        const context = { cwd: process.cwd(), ui: { notify: () => {} } };
+
+        try {
+            await assert.rejects(
+                bashTool.execute(
+                    "tc-stall-wake-direct",
+                    { command: "tail -f /dev/null" },
+                    undefined,
+                    undefined,
+                    context
+                ),
+                /Possibly stuck: no output.*bash_bg/s
+            );
+            assert.equal(state.runningProcesses.size, 0);
+        } finally {
+            if (previousWakeMs === undefined)
+                delete process.env.PI_TAU_STALL_WAKE_MS;
+            else process.env.PI_TAU_STALL_WAKE_MS = previousWakeMs;
+        }
+    });
+
     void it("resolves relative per-call cwd against the session cwd", async () => {
         const state = new TauState();
         const bashTool = captureBashTool(state);
