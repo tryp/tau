@@ -26,7 +26,7 @@ RSYNC_EXCLUDES := \
 	--exclude '.deployed-commit' \
 	--exclude 'README.md'
 
-.PHONY: deploy verify smoke-test deployed-commit
+.PHONY: deploy runtime-deps verify smoke-test deployed-commit
 
 deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
 	@test -z "$$(git status --porcelain)" || { echo "ERROR: commit source changes before deploying" >&2; git status --short >&2; exit 1; }
@@ -39,11 +39,17 @@ deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
 		exit 1; \
 	fi
 	rsync -a $(RSYNC_EXCLUDES) ./ "$(RUNTIME_DIR)/"
+	@$(MAKE) --no-print-directory runtime-deps
 	@printf 'deployed from: %s\nbranch: %s\ncommit: %s\ndeployed at: %s\n\nThis is a deployed artifact. Do not edit files here.\nEdit the source checkout and run `make deploy`.\n' \
 		"$(CURDIR)" "$$(git rev-parse --abbrev-ref HEAD)" "$$(git rev-parse HEAD)" "$$(date '+%Y-%m-%d %H:%M:%S %z')" \
 		> "$(RUNTIME_DIR)/.deployed-commit"
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
+
+runtime-deps:  ## Install locked production dependencies into the deployed copy
+	@test -f "$(RUNTIME_DIR)/package.json" || { echo "ERROR: deployed package.json missing" >&2; exit 1; }
+	@test -f "$(RUNTIME_DIR)/pnpm-lock.yaml" || { echo "ERROR: deployed pnpm-lock.yaml missing" >&2; exit 1; }
+	pnpm --dir "$(RUNTIME_DIR)" install --prod --frozen-lockfile --ignore-scripts
 
 smoke-test:  ## Load only the deployed extension in a fresh pi process
 	python3 "$(SMOKE_SCRIPT)" --extension "$(RUNTIME_DIR)" --tool jobs \

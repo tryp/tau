@@ -30,8 +30,8 @@ async function getChromium(): Promise<typeof import("patchright").chromium> {
         return chromium;
     } catch {
         throw new Error(
-            "patchright is not installed. Install it with:\n" +
-                "  cd ~/.pi/agent/extensions/tau && pnpm add patchright"
+            "patchright is not installed in the deployed pi-tau runtime.\n" +
+                "Run `make deploy` from the pi-tau source checkout to provision its locked runtime dependencies."
         );
     }
 }
