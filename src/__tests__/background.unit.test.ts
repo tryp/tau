@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+    buildKilledError,
     evaluatePendingDecisionGate,
     registerBackgroundJobs,
     notifyCompletion,
@@ -799,7 +800,11 @@ void describe("startTimeoutTimer", () => {
                 "tc-env-default"
             );
 
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            // Poll-until instead of a fixed sleep: robust under CI load.
+            const deadline = Date.now() + 5_000;
+            while (!triggered && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
 
             assert.equal(
                 triggered,
@@ -959,6 +964,52 @@ void describe("startTimeoutTimer", () => {
 });
 
 // ─── Command policies ─────────────────────────────────────────────────
+
+void describe("buildKilledError", () => {
+    void it("explains non-backgroundable kills", () => {
+        const err = buildKilledError(
+            "timeout-disallowed",
+            "sleep 60",
+            "/tmp/x.log",
+            "tail"
+        );
+        assert.match(err.message, /Command killed on timeout/);
+        assert.match(err.message, /bash_bg for long waits/);
+        assert.match(err.message, /sleep 60/);
+    });
+
+    void it("points at job-control tools when they are missing", () => {
+        const err = buildKilledError(
+            "timeout-no-controls",
+            "npm test",
+            "/tmp/x.log",
+            "tail"
+        );
+        assert.match(err.message, /no job-control tool/);
+        assert.match(err.message, /jobs or job_decide/);
+        assert.doesNotMatch(err.message, /bash_bg for long waits/);
+    });
+
+    void it("reports cancellation for aborts", () => {
+        const err = buildKilledError(
+            "aborted",
+            "npm test",
+            "/tmp/x.log",
+            "tail"
+        );
+        assert.match(err.message, /Command aborted/);
+    });
+
+    void it("falls back for unknown reasons", () => {
+        const err = buildKilledError(
+            undefined,
+            "npm test",
+            "/tmp/x.log",
+            "tail"
+        );
+        assert.match(err.message, /unknown/);
+    });
+});
 
 import { isAutoBackgroundAllowed, detectBlockedSleep } from "../utils.ts";
 

@@ -228,5 +228,44 @@ void describe(
                 "completed tmux jobs must not leave the tool gate blocked"
             );
         });
+
+        void it("settles the race after timeout-killing a disallowed command (24.7h stall regression)", async () => {
+            const state = new TauState();
+            state.tmuxAvailable = true;
+            // Force the interactive timer path: under node --test stdin is
+            // piped, so construction-time detection may mark nonInteractive.
+            state.nonInteractive = false;
+            const { tool } = captureBashTool(state);
+            const previousBgMs = process.env.PI_TAU_BACKGROUND_AFTER_MS;
+            process.env.PI_TAU_BACKGROUND_AFTER_MS = "300";
+            try {
+                // `sleep ${X:-8}`: basename sleep takes the disallowed kill
+                // path, but the shell-expanded duration evades the upfront
+                // block — the exact shape that hung the session ~24.7h
+                // waiting for a sentinel that a killed tmux window never
+                // writes. The killed race arm must settle this in ~300ms,
+                // not at the 4-minute stall watchdog.
+                const started = Date.now();
+                await assert.rejects(
+                    tool.execute(
+                        "tc-kill-settle",
+                        { command: "sleep ${X:-8}" },
+                        null,
+                        null,
+                        { cwd: TEST_RUN_DIR, ui: stubUi }
+                    ),
+                    /Command killed on timeout \(timeout-disallowed\)/
+                );
+                const elapsed = Date.now() - started;
+                assert.ok(
+                    elapsed < 30_000,
+                    `killed race settled in ${elapsed}ms; expected well under the 4-min watchdog`
+                );
+            } finally {
+                if (previousBgMs === undefined)
+                    delete process.env.PI_TAU_BACKGROUND_AFTER_MS;
+                else process.env.PI_TAU_BACKGROUND_AFTER_MS = previousBgMs;
+            }
+        });
     }
 );

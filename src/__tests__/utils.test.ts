@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
@@ -14,6 +15,8 @@ import {
     isAutoBackgroundAllowed,
     parseSleepSeconds,
     resolveBackgroundAfterMs,
+    resolveExplicitBackgroundAfterMs,
+    scheduleSigkillFallback,
     DEFAULT_TIMEOUT_MS,
     cleanupStaleLogs,
     formatJobLine,
@@ -220,6 +223,10 @@ void describe("detectBlockedSleep", () => {
         // Unparseable durations fall through to the timeout kill path,
         // which now settles the foreground race instead of hanging.
         assert.equal(detectBlockedSleep("sleep $DUR"), null);
+        // Shell-expanded defaults evade the parser but still take the
+        // disallowed kill path (covered end-to-end by the tmux
+        // kill-settlement test).
+        assert.equal(detectBlockedSleep("sleep ${X:-8}"), null);
     });
 });
 
@@ -300,6 +307,85 @@ void describe("resolveBackgroundAfterMs", () => {
                 DEFAULT_TIMEOUT_MS
             );
         }
+    });
+});
+
+void describe("resolveExplicitBackgroundAfterMs", () => {
+    void it("converts seconds to milliseconds", () => {
+        assert.equal(resolveExplicitBackgroundAfterMs(1), 1_000);
+        assert.equal(resolveExplicitBackgroundAfterMs(0), 0);
+    });
+
+    void it("falls back to the default for missing or degenerate input", () => {
+        assert.equal(resolveExplicitBackgroundAfterMs(undefined), undefined);
+        assert.equal(resolveExplicitBackgroundAfterMs(Number.NaN), undefined);
+        assert.equal(resolveExplicitBackgroundAfterMs(-5), undefined);
+    });
+});
+
+void describe("scheduleSigkillFallback", () => {
+    void it("SIGKILLs a SIGTERM-ignoring process", async () => {
+        const child = spawn(
+            process.execPath,
+            [
+                "-e",
+                "process.on('SIGTERM', () => {}); setInterval(() => {}, 100);",
+            ],
+            { stdio: "ignore", detached: true }
+        );
+        const pid = child.pid!;
+        child.unref();
+        scheduleSigkillFallback(child, 50);
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+            try {
+                process.kill(pid, 0);
+            } catch {
+                return; // dead — fallback worked
+            }
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        try {
+            process.kill(pid, "SIGKILL");
+        } catch {
+            /* already dead */
+        }
+        assert.fail("SIGTERM-ignoring process survived the SIGKILL fallback");
+    });
+
+    void it("stands down when the process object already reports an exit", async () => {
+        const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+        const pid = sleeper.pid!;
+        try {
+            // Lie about the exit while the pid is actually alive: a correct
+            // fallback trusts the process object and never touches the live
+            // pid (pid-reuse guard — an unconditional kill could hit an
+            // unrelated recycled pid or process group).
+            scheduleSigkillFallback({ pid, exitCode: 0, signalCode: null }, 50);
+            await new Promise((r) => setTimeout(r, 300));
+            assert.doesNotThrow(
+                () => process.kill(pid, 0),
+                "live pid must survive a fallback for an exited process object"
+            );
+        } finally {
+            try {
+                sleeper.kill("SIGKILL");
+            } catch {
+                /* already dead */
+            }
+        }
+    });
+
+    void it("ignores missing or sentinel pids", () => {
+        assert.doesNotThrow(() => scheduleSigkillFallback(undefined, 10));
+        // pid -1 is the tmux sentinel, not a process: process.kill(1) must
+        // never happen.
+        assert.doesNotThrow(() =>
+            scheduleSigkillFallback(
+                { pid: -1, exitCode: null, signalCode: null },
+                10
+            )
+        );
     });
 });
 

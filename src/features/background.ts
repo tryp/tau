@@ -92,6 +92,7 @@ import {
     detectBlockedSleep,
     formatDuration,
     generateJobId,
+    INTERACTIVE_STALL_WAKE_MARGIN_MS,
     isAutoBackgroundAllowed,
     killProcessGroup,
     logPathForJob,
@@ -100,10 +101,13 @@ import {
     readOutputTail,
     readOutputTailSync,
     resolveBackgroundAfterMs,
+    resolveExplicitBackgroundAfterMs,
     resolveNonInteractiveStallWakeMs,
+    scheduleSigkillFallback,
     formatJobLine,
 } from "../utils.ts";
 import {
+    TmuxSpawnError,
     attachTmuxContext,
     getTmuxContext,
     killTmuxJob,
@@ -1614,6 +1618,7 @@ export function startTimeoutTimer(
         if (!isAutoBackgroundAllowed(command)) {
             const rp = state.runningProcesses.get(toolCallId);
             if (rp?.proc.pid) killProcessGroup(rp.proc.pid, "SIGTERM");
+            scheduleSigkillFallback(rp?.proc);
             return;
         }
 
@@ -1623,6 +1628,7 @@ export function startTimeoutTimer(
         if (!canBackground()) {
             const rp = state.runningProcesses.get(toolCallId);
             if (rp?.proc.pid) killProcessGroup(rp.proc.pid, "SIGTERM");
+            scheduleSigkillFallback(rp?.proc);
             onBackgroundUnavailable();
             return;
         }
@@ -1752,12 +1758,16 @@ export function registerBackgroundJobs(
                         pi
                     );
                 } catch (error) {
-                    // Only spawn/setup failures should fall through. A
+                    // Only spawn/setup failures should fall through to the
+                    // direct-spawn path. All other outcomes are terminal: a
                     // PossiblyStuckError is the intentional tool result from
-                    // a running tmux command and must wake the agent directly.
-                    if (error instanceof PossiblyStuckError) throw error;
-                    // tmux spawn failed (not in git repo, server error, etc.)
-                    // Fall through to direct-spawn path.
+                    // a running tmux command, and a killed/aborted/non-zero-
+                    // exit error means the command already ran in tmux —
+                    // re-running it on the direct path would execute side
+                    // effects twice and mask the real result.
+                    if (!(error instanceof TmuxSpawnError)) throw error;
+                    // TmuxSpawnError (no git root, tmux server error):
+                    // fall through to direct spawn.
                 }
             }
 
@@ -1838,23 +1848,28 @@ export function registerBackgroundJobs(
                 });
             }
 
+            // Explicit per-call delay (sanitized: NaN/negative fall back to
+            // the configured default); hoisted so the stall watchdog below
+            // can stay behind it.
+            const explicitTimeoutMs = resolveExplicitBackgroundAfterMs(
+                params.backgroundAfter
+            );
+            const foregroundTimeoutMs =
+                explicitTimeoutMs ?? resolveBackgroundAfterMs();
+
             // Start timeout timer (background-after timer, not a kill timeout)
             const timer = startTimeoutTimer(
                 triggerBackground,
                 command,
                 state,
                 toolCallId,
-                typeof params.backgroundAfter === "number"
-                    ? params.backgroundAfter * 1_000
-                    : undefined,
+                explicitTimeoutMs,
                 () => getActiveBackgroundControlTools(pi).length > 0,
                 () =>
                     notifyBackgroundUnavailable(
                         pi,
                         command,
-                        typeof params.backgroundAfter === "number"
-                            ? params.backgroundAfter * 1_000
-                            : resolveBackgroundAfterMs()
+                        foregroundTimeoutMs
                     )
             );
 
@@ -1943,11 +1958,20 @@ export function registerBackgroundJobs(
                 // every PI_TAU_STALL_WAKE_MS (default 4 min) so outstanding
                 // jobs and subagent completions get checked. Non-interactive
                 // always arms it (auto-background no-ops there); interactive
-                // arms it as a safety net behind the 15s background/kill timer
+                // arms it as a safety net behind the background/kill timer
                 // (covers SIGTERM-ignoring processes and kill failures).
+                // The safety net must stay *behind* an explicit long delay:
+                // with backgroundAfter=3600 on a silent command, a fixed 4
+                // min watchdog would kill what the user asked to keep.
+                const stallWakeMs = state.nonInteractive
+                    ? resolveNonInteractiveStallWakeMs()
+                    : Math.max(
+                          resolveNonInteractiveStallWakeMs(),
+                          foregroundTimeoutMs + INTERACTIVE_STALL_WAKE_MARGIN_MS
+                      );
                 cancelNoOutputWatchdog = startNoOutputWatchdog(
                     logPath,
-                    resolveNonInteractiveStallWakeMs(),
+                    stallWakeMs,
                     () => noOutputResolve?.()
                 );
 
@@ -1969,6 +1993,7 @@ export function registerBackgroundJobs(
                     clearInterval(pollTimer);
                     clearTimeout(timer);
                     clearTimeout(hintTimer);
+                    cancelNoOutputWatchdog?.();
                     state.runningProcesses.delete(toolCallId);
                     if (state.currentlyRunningToolCallId === toolCallId) {
                         state.currentlyRunningToolCallId = null;
@@ -1978,19 +2003,10 @@ export function registerBackgroundJobs(
                     killProcessGroup(proc.pid, "SIGTERM");
                     // SIGKILL fallback: a SIGTERM-ignoring process must not
                     // outlive the wake and re-stall the session.
-                    if (proc.pid) {
-                        const stalledPid = proc.pid;
-                        setTimeout(() => {
-                            try {
-                                killProcessGroup(stalledPid, "SIGKILL");
-                            } catch {
-                                /* already dead */
-                            }
-                        }, 5_000).unref();
-                    }
+                    scheduleSigkillFallback(proc);
                     const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
                     throw new PossiblyStuckError(
-                        `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
+                        `Possibly stuck: no output for ${formatDuration(stallWakeMs)}. ` +
                             `Killed the command so the session can continue.\n` +
                             `Command: ${command}\n` +
                             `Output (${logPath}):\n${tail}\n` +
@@ -3008,13 +3024,13 @@ async function executeTmuxForeground(
         const result = spawnForegroundTmux(command, execCwd);
         logPath = result.logPath;
         tmuxCtx = result.tmuxCtx;
-    } catch {
-        // Not in a git repo — fall back to direct spawn.
+    } catch (error) {
+        // Spawn/setup failure (no git root, tmux server error): the outer
+        // catch in execute() sees the TmuxSpawnError and falls through to
+        // the direct-spawn path. Do not mask the real reason here — a
+        // converted generic message would defeat the outer routing.
         state.jobCounter--;
-        throw new Error(
-            "tmux backend requires a git repository. " +
-                "Falling back to direct process management."
-        );
+        throw error;
     }
 
     // Register as foreground job
@@ -3054,10 +3070,13 @@ async function executeTmuxForeground(
     });
     state.currentlyRunningToolCallId = toolCallId;
 
-    // Abort handler — kill tmux window
+    // Abort handler — kill tmux window and settle the race at once. Without
+    // the killed signal an aborted call would pend until the stall watchdog
+    // (up to 4 min) instead of failing fast.
     if (signal) {
         signal.addEventListener("abort", () => {
             killTmuxJob(job);
+            triggerKilled("aborted");
         });
     }
 
@@ -3076,10 +3095,10 @@ async function executeTmuxForeground(
     function triggerKilled(reason: string): void {
         killedResolve?.(reason);
     }
-    const timeoutMs =
-        typeof params.backgroundAfter === "number"
-            ? params.backgroundAfter * 1_000
-            : resolveBackgroundAfterMs();
+    const explicitTimeoutMs = resolveExplicitBackgroundAfterMs(
+        params.backgroundAfter
+    );
+    const timeoutMs = explicitTimeoutMs ?? resolveBackgroundAfterMs();
     const timer = setTimeout(() => {
         // Non-interactive (print/`-p`/non-TTY): no agent loop to answer the
         // auto-background job_decide prompt, so let the command run to
@@ -3205,10 +3224,18 @@ async function executeTmuxForeground(
         // most every PI_TAU_STALL_WAKE_MS (default 4 min) so outstanding
         // jobs and subagent completions get checked. Non-interactive always
         // arms it (auto-background no-ops there); interactive arms it as a
-        // safety net behind the 15s background/kill timer.
+        // safety net behind the background/kill timer — scaled past an
+        // explicit long delay so the net never kills what the user asked
+        // to keep.
+        const stallWakeMs = state.nonInteractive
+            ? resolveNonInteractiveStallWakeMs()
+            : Math.max(
+                  resolveNonInteractiveStallWakeMs(),
+                  timeoutMs + INTERACTIVE_STALL_WAKE_MARGIN_MS
+              );
         cancelNoOutputWatchdog = startNoOutputWatchdog(
             logPath,
-            resolveNonInteractiveStallWakeMs(),
+            stallWakeMs,
             () => noOutputResolve?.()
         );
 
@@ -3250,12 +3277,11 @@ async function executeTmuxForeground(
             state.backgroundJobs.delete(jobId);
             updateWidget(state, ctx);
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
-            throw new Error(
-                `Command killed on timeout (${raceResult.killReason}); ` +
-                    `sleep and other non-backgroundable commands are killed instead of backgrounded. ` +
-                    `Use bash_bg for long waits.\n` +
-                    `Command: ${command}\n` +
-                    `Output (${logPath}):\n${tail}`
+            throw buildKilledError(
+                raceResult.killReason,
+                command,
+                logPath,
+                tail
             );
         }
 
@@ -3270,10 +3296,12 @@ async function executeTmuxForeground(
             }
             silenceJobAfterKill(job);
             killTmuxJob(job);
+            // No SIGKILL fallback here: tmux jobs carry a pid -1 sentinel,
+            // not a real process — the window kill above is the escalation.
             updateWidget(state, ctx);
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
             throw new PossiblyStuckError(
-                `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
+                `Possibly stuck: no output for ${formatDuration(stallWakeMs)}. ` +
                     `Killed tmux job ${jobId} so the session can continue.\n` +
                     `Command: ${command}\n` +
                     `Output (${logPath}):\n${tail}\n` +
@@ -3346,6 +3374,7 @@ async function executeTmuxForeground(
 
         // Command completed normally
         clearInterval(pollTimer);
+        clearInterval(checkTimer);
         clearTimeout(timer);
         clearTimeout(hintTimer);
         state.runningProcesses.delete(toolCallId);
@@ -3395,5 +3424,39 @@ async function executeTmuxForeground(
 }
 
 // ─── Helpers used by executeTmuxForeground ──────────────────────────
+
+/**
+ * Build the error for the tmux foreground `killed` race arm. Pure (exported
+ * for unit tests). Reasons: `timeout-disallowed` (sleep and other
+ * non-backgroundable commands), `timeout-no-controls` (backgroundable
+ * command killed because no job-control tool is active), `aborted`
+ * (cancellation requested).
+ */
+export function buildKilledError(
+    reason: string | undefined,
+    command: string,
+    logPath: string,
+    tail: string
+): Error {
+    const context = `Command: ${command}\n` + `Output (${logPath}):\n${tail}`;
+    if (reason === "aborted") {
+        return new Error(
+            `Command aborted (cancellation requested).\n${context}`
+        );
+    }
+    if (reason === "timeout-no-controls") {
+        return new Error(
+            `Command killed on timeout (${reason}); no job-control tool ` +
+                `(jobs/job_decide) is active, so the command was terminated ` +
+                `instead of backgrounded. Enable the jobs or job_decide tool, ` +
+                `then rerun the command.\n${context}`
+        );
+    }
+    return new Error(
+        `Command killed on timeout (${reason ?? "unknown"}); ` +
+            `sleep and other non-backgroundable commands are killed instead of backgrounded. ` +
+            `Use bash_bg for long waits.\n${context}`
+    );
+}
 
 import { checkExitCode, killWindow } from "../tmux.ts";

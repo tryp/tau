@@ -170,6 +170,15 @@ export function pollTmuxCompletion(job: BackgroundJob): {
 }
 
 /**
+ * Spawn/setup-phase failure for the tmux backend (no git root, tmux server
+ * error). The foreground bash tool treats these as the only signal to fall
+ * through to the direct-spawn path. Errors raised after the command has
+ * started executing in tmux (timeout-killed, aborted, stalled, non-zero
+ * exit) are terminal and must never be re-run on the direct path.
+ */
+export class TmuxSpawnError extends Error {}
+
+/**
  * Kill a tmux-backed job by killing its tmux window.
  */
 export function killTmuxJob(job: BackgroundJob): void {
@@ -213,14 +222,23 @@ export function spawnForegroundTmux(
     // If not in a git repo, fall through to direct spawn.
     // The caller should check for this.
     if (!gitRoot) {
-        throw new Error(
+        throw new TmuxSpawnError(
             "Not in a git repository — tmux backend requires a git root for session naming."
         );
     }
 
     const session = sessionNameForGitRoot(gitRoot);
     const runDir = runDirPath();
-    const result = spawnInTmux(command, cwd, runDir, session);
+    let result;
+    try {
+        result = spawnInTmux(command, cwd, runDir, session);
+    } catch (error) {
+        throw new TmuxSpawnError(
+            `tmux backend failed to spawn the command window: ${
+                error instanceof Error ? error.message : String(error)
+            }`
+        );
+    }
 
     // The log path points to the tee'd output file.
     const logPath = result.outputFile;

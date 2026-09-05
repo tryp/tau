@@ -48,6 +48,12 @@ export const MAX_OUTPUT_PREVIEW_CHARS = 12_000;
 /** Maximum log file size before the stall watchdog kills the job. */
 export const MAX_LOG_BYTES = 100 * 1024 * 1024; // 100 MiB
 /**
+ * Margin keeping the interactive stall watchdog behind the background/kill
+ * timer: with an explicit long backgroundAfter, the watchdog fires a minute
+ * after the timer instead of killing a command the user asked to keep.
+ */
+export const INTERACTIVE_STALL_WAKE_MARGIN_MS = 60_000;
+/**
  * Non-interactive sessions (subagent workers, `pi -p`) never auto-background a
  * foreground command — the auto-background timer deliberately no-ops there —
  * so a command that goes silent would block the agent loop forever (observed:
@@ -87,6 +93,20 @@ export const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
 
 // ─── Process management ─────────────────────────────────────────────
 
+/**
+ * Normalize a per-call `backgroundAfter` (seconds) to milliseconds.
+ * Returns undefined for missing, NaN, or negative values so callers fall
+ * back to the configured default. Zero is honored (background at once);
+ * Infinity keeps its historical meaning via setTimeout clamping.
+ */
+export function resolveExplicitBackgroundAfterMs(
+    value: unknown
+): number | undefined {
+    if (typeof value !== "number" || Number.isNaN(value) || value < 0)
+        return undefined;
+    return value * 1_000;
+}
+
 /** Kill an entire process group. Requires the child to have been spawned
  *  with `detached: true` so it became a process group leader. */
 export function killProcessGroup(
@@ -103,6 +123,44 @@ export function killProcessGroup(
             /* already dead */
         }
     }
+}
+
+/** Minimal liveness view for the SIGKILL fallback (structural so tests can
+ *  use fakes; real ChildProcess satisfies it). */
+export interface SigkillFallbackProc {
+    pid?: number;
+    exitCode?: number | null;
+    signalCode?: NodeJS.Signals | null;
+}
+
+/**
+ * Escalate a SIGTERM-ignoring process to SIGKILL after `delayMs`.
+ * Liveness-guarded against pid reuse: stands down when the process object
+ * already reports an exit (exitCode or signalCode set), when the pid is
+ * missing/non-positive, or when a signal-0 probe finds the pid gone.
+ * An unconditional delayed group-kill could otherwise SIGKILL an unrelated
+ * recycled pid or process group.
+ */
+export function scheduleSigkillFallback(
+    proc: SigkillFallbackProc | undefined,
+    delayMs = 5_000
+): void {
+    const pid = proc?.pid;
+    if (!pid || pid <= 0) return;
+    setTimeout(() => {
+        if (proc?.exitCode !== null && proc?.exitCode !== undefined) return;
+        if (proc?.signalCode !== null && proc?.signalCode !== undefined) return;
+        try {
+            process.kill(pid, 0);
+        } catch {
+            return; // ESRCH — already dead.
+        }
+        try {
+            killProcessGroup(pid, "SIGKILL");
+        } catch {
+            /* already dead */
+        }
+    }, delayMs).unref();
 }
 
 // ─── Job helpers ────────────────────────────────────────────────────
