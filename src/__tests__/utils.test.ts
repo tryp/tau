@@ -12,6 +12,9 @@ import {
     lastAssistantText,
     detectBlockedSleep,
     isAutoBackgroundAllowed,
+    parseSleepSeconds,
+    resolveBackgroundAfterMs,
+    DEFAULT_TIMEOUT_MS,
     cleanupStaleLogs,
     formatJobLine,
     readOutputTailSync,
@@ -202,6 +205,22 @@ void describe("detectBlockedSleep", () => {
         assert.equal(detectBlockedSleep("sleep 10\necho done"), "sleep 10");
         assert.equal(detectBlockedSleep("sleep 5\r\necho done"), "sleep 5");
     });
+
+    void it("blocks GNU sleep forms (suffixes, operands, paths)", () => {
+        assert.equal(detectBlockedSleep("sleep 5s"), "sleep 5s");
+        assert.equal(detectBlockedSleep("sleep 1m"), "sleep 1m");
+        assert.equal(detectBlockedSleep("sleep 1 2"), "sleep 1 2");
+        assert.equal(detectBlockedSleep("/bin/sleep 5"), "/bin/sleep 5");
+        assert.equal(detectBlockedSleep("sleep -- 5"), "sleep -- 5");
+    });
+
+    void it("allows sub-threshold and unparseable sleep", () => {
+        assert.equal(detectBlockedSleep("sleep 1s"), null);
+        assert.equal(detectBlockedSleep("sleep"), null);
+        // Unparseable durations fall through to the timeout kill path,
+        // which now settles the foreground race instead of hanging.
+        assert.equal(detectBlockedSleep("sleep $DUR"), null);
+    });
 });
 
 void describe("isAutoBackgroundAllowed", () => {
@@ -221,8 +240,66 @@ void describe("isAutoBackgroundAllowed", () => {
         assert.equal(isAutoBackgroundAllowed("sleep && echo hi"), false);
     });
 
+    void it("disallows path-prefixed sleep (kill-path parity)", () => {
+        assert.equal(isAutoBackgroundAllowed("/bin/sleep 60"), false);
+        assert.equal(isAutoBackgroundAllowed("/usr/bin/sleep 5s"), false);
+    });
+
     void it("handles empty string", () => {
         assert.equal(isAutoBackgroundAllowed(""), true);
+    });
+});
+
+void describe("parseSleepSeconds", () => {
+    void it("parses plain seconds", () => {
+        assert.equal(parseSleepSeconds(["5"]), 5);
+        assert.equal(parseSleepSeconds(["0.5"]), 0.5);
+    });
+
+    void it("parses GNU suffixes", () => {
+        assert.equal(parseSleepSeconds(["5s"]), 5);
+        assert.equal(parseSleepSeconds(["1m"]), 60);
+        assert.equal(parseSleepSeconds(["2h"]), 7200);
+        assert.equal(parseSleepSeconds(["1d"]), 86400);
+        assert.equal(parseSleepSeconds(["0.001h"]), 3.6);
+    });
+
+    void it("sums multiple operands and skips --", () => {
+        assert.equal(parseSleepSeconds(["1", "2"]), 3);
+        assert.equal(parseSleepSeconds(["--", "5"]), 5);
+    });
+
+    void it("returns undefined for missing or unparseable operands", () => {
+        assert.equal(parseSleepSeconds([]), undefined);
+        assert.equal(parseSleepSeconds(["abc"]), undefined);
+        assert.equal(parseSleepSeconds(["$DUR"]), undefined);
+    });
+});
+
+void describe("resolveBackgroundAfterMs", () => {
+    void it("defaults to DEFAULT_TIMEOUT_MS", () => {
+        assert.equal(resolveBackgroundAfterMs({}), DEFAULT_TIMEOUT_MS);
+        assert.equal(DEFAULT_TIMEOUT_MS, 15_000);
+    });
+
+    void it("honors PI_TAU_BACKGROUND_AFTER_MS", () => {
+        assert.equal(
+            resolveBackgroundAfterMs({
+                PI_TAU_BACKGROUND_AFTER_MS: "5000",
+            }),
+            5_000
+        );
+    });
+
+    void it("ignores invalid overrides", () => {
+        for (const raw of ["", "abc", "-5", "0", "3.5"]) {
+            assert.equal(
+                resolveBackgroundAfterMs({
+                    PI_TAU_BACKGROUND_AFTER_MS: raw,
+                }),
+                DEFAULT_TIMEOUT_MS
+            );
+        }
     });
 });
 

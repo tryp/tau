@@ -775,6 +775,45 @@ void describe("startTimeoutTimer", () => {
         clearTimeout(timer);
     });
 
+    void it("honors PI_TAU_BACKGROUND_AFTER_MS as the default delay", async () => {
+        const saved = process.env.PI_TAU_BACKGROUND_AFTER_MS;
+        process.env.PI_TAU_BACKGROUND_AFTER_MS = "50";
+        try {
+            const state = new TauState();
+            state.currentlyRunningToolCallId = "tc-env-default";
+            let triggered = false;
+            state.runningProcesses.set("tc-env-default", {
+                toolCallId: "tc-env-default",
+                proc: { pid: -1 } as never,
+                command: "npm test",
+                logPath: "/tmp/test-env-default.log",
+                triggerBackground: () => {},
+            });
+
+            const timer = startTimeoutTimer(
+                () => {
+                    triggered = true;
+                },
+                "npm test",
+                state,
+                "tc-env-default"
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 150));
+
+            assert.equal(
+                triggered,
+                true,
+                "env default should fire without an explicit timeout"
+            );
+            clearTimeout(timer);
+        } finally {
+            if (saved === undefined)
+                delete process.env.PI_TAU_BACKGROUND_AFTER_MS;
+            else process.env.PI_TAU_BACKGROUND_AFTER_MS = saved;
+        }
+    });
+
     void it("does NOT background when no job-control tool is available", async () => {
         const state = new TauState();
         state.currentlyRunningToolCallId = "tc-no-control";

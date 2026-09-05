@@ -19,8 +19,28 @@ import type { BackgroundJob, JobStatus } from "./types.ts";
 
 // ─── Configuration constants ────────────────────────────────────────
 
-/** Default timeout for foreground bash commands (15s, matching Claude Code). */
+/**
+ * Default delay before a foreground bash command auto-backgrounds
+ * (15s, matching Claude Code). Every foreground job auto-backgrounds (or,
+ * for non-backgroundable commands like sleep, is killed) after this delay
+ * unless the call passes backgroundAfter. Override session-wide with
+ * PI_TAU_BACKGROUND_AFTER_MS (milliseconds).
+ */
 export const DEFAULT_TIMEOUT_MS = 15_000;
+
+export function resolveBackgroundAfterMs(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = env.PI_TAU_BACKGROUND_AFTER_MS;
+    if (raw !== undefined) {
+        const normalized = raw.trim();
+        if (/^\d+$/.test(normalized)) {
+            const parsed = Number(normalized);
+            if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+        }
+    }
+    return DEFAULT_TIMEOUT_MS;
+}
 export const STALL_CHECK_INTERVAL_MS = 5_000;
 export const STALL_THRESHOLD_MS = 45_000;
 export const STALL_TAIL_BYTES = 1024;
@@ -297,8 +317,38 @@ const DISALLOWED_AUTO_BACKGROUND_COMMANDS = ["sleep"];
 
 /** Check whether a command is allowed to be auto-backgrounded. */
 export function isAutoBackgroundAllowed(command: string): boolean {
-    const base = command.trim().split(/\s+/)[0] ?? "";
+    const first = command.trim().split(/\s+/)[0] ?? "";
+    // Match the sleep binary regardless of path prefix (/bin/sleep 60 must
+    // take the kill path just like bare `sleep 60`).
+    const base = first.split("/").pop() ?? "";
     return !DISALLOWED_AUTO_BACKGROUND_COMMANDS.includes(base);
+}
+
+const SLEEP_SUFFIX_SECONDS: Record<string, number> = {
+    s: 1,
+    m: 60,
+    h: 3600,
+    d: 86400,
+};
+
+/**
+ * Total sleep seconds for GNU sleep operands (suffixes s/m/h/d, multiple
+ * operands summed, `--` separator skipped). Returns undefined when no
+ * duration operand is present or an operand is unparseable (e.g. a variable
+ * like $DUR) — such commands are left to the timeout kill path instead of
+ * the upfront block.
+ */
+export function parseSleepSeconds(args: string[]): number | undefined {
+    let total = 0;
+    let seen = false;
+    for (const arg of args) {
+        if (arg === "--") continue;
+        const m = /^(\d+(?:\.\d+)?)([smhd])?$/.exec(arg);
+        if (!m) return undefined;
+        total += parseFloat(m[1]) * (m[2] ? SLEEP_SUFFIX_SECONDS[m[2]] : 1);
+        seen = true;
+    }
+    return seen ? total : undefined;
 }
 
 /**
@@ -317,10 +367,15 @@ export function detectBlockedSleep(command: string): string | null {
             .trim()
             .split(/&&|;|\||\r?\n/)[0]
             ?.trim() ?? "";
-    const m = /^sleep\s+(\d+(?:\.\d+)?)\s*$/.exec(first);
-    if (!m) return null;
-    const secs = parseFloat(m[1]);
-    if (secs < 2) return null;
+    const argv = first.split(/\s+/).filter(Boolean);
+    if (argv.length === 0) return null;
+    // Match the sleep binary regardless of path prefix (/bin/sleep 5s).
+    if ((argv[0].split("/").pop() ?? "") !== "sleep") return null;
+    // GNU sleep forms: suffixes (5s/1m/2h), multiple operands (sleep 1 2),
+    // `--` separator. Unparseable operands (e.g. $DUR) fall through to the
+    // timeout kill path instead of the upfront block.
+    const secs = parseSleepSeconds(argv.slice(1));
+    if (secs === undefined || secs < 2) return null;
     return first;
 }
 

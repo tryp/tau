@@ -82,7 +82,6 @@ import type {
     UiContext,
 } from "../types.ts";
 import {
-    DEFAULT_TIMEOUT_MS,
     MAX_LOG_BYTES,
     MAX_OUTPUT_PREVIEW_CHARS,
     STALL_CHECK_INTERVAL_MS,
@@ -100,6 +99,7 @@ import {
     markJobTerminal,
     readOutputTail,
     readOutputTailSync,
+    resolveBackgroundAfterMs,
     resolveNonInteractiveStallWakeMs,
     formatJobLine,
 } from "../utils.ts";
@@ -1597,7 +1597,7 @@ export function startTimeoutTimer(
     canBackground: () => boolean = () => true,
     onBackgroundUnavailable: () => void = () => {}
 ): NodeJS.Timeout {
-    const timeoutMs = explicitTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timeoutMs = explicitTimeoutMs ?? resolveBackgroundAfterMs();
 
     const timer = setTimeout(() => {
         // Non-interactive (print/`-p`/non-TTY): there is no agent loop to answer
@@ -1682,7 +1682,8 @@ export function registerBackgroundJobs(
         ...originalBashTool,
         name: "bash",
         description:
-            "Execute bash commands with streaming output. Commands that run longer than 15 seconds " +
+            "Execute bash commands with streaming output. Commands that run longer than the auto-background delay " +
+            "(15 seconds by default, PI_TAU_BACKGROUND_AFTER_MS to override, backgroundAfter per call) " +
             "are automatically backgrounded and the agent is asked whether to kill or let them continue. " +
             "Use Ctrl+Shift+B to manually background a running process. " +
             "Background job output is written to per-session log files. " +
@@ -1704,7 +1705,7 @@ export function registerBackgroundJobs(
             backgroundAfter: Type.Optional(
                 Type.Number({
                     description:
-                        "Background the command after this many seconds (default: auto, ~15 seconds). " +
+                        "Background the command after this many seconds (default: auto, ~15 seconds or PI_TAU_BACKGROUND_AFTER_MS). " +
                         "The command continues running in the background; use jobs/attach to monitor it.",
                 })
             ),
@@ -1853,7 +1854,7 @@ export function registerBackgroundJobs(
                         command,
                         typeof params.backgroundAfter === "number"
                             ? params.backgroundAfter * 1_000
-                            : DEFAULT_TIMEOUT_MS
+                            : resolveBackgroundAfterMs()
                     )
             );
 
@@ -3078,7 +3079,7 @@ async function executeTmuxForeground(
     const timeoutMs =
         typeof params.backgroundAfter === "number"
             ? params.backgroundAfter * 1_000
-            : DEFAULT_TIMEOUT_MS;
+            : resolveBackgroundAfterMs();
     const timer = setTimeout(() => {
         // Non-interactive (print/`-p`/non-TTY): no agent loop to answer the
         // auto-background job_decide prompt, so let the command run to
