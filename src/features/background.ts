@@ -1937,17 +1937,18 @@ export function registerBackgroundJobs(
                 // Command still running — start polling for progress
                 startPolling();
 
-                // Non-interactive: the auto-background timer no-ops here, so a
-                // silent or deadlocked command would block the agent loop
-                // forever. Arm a no-output watchdog and race it — a stuck
-                // command wakes the agent with a possibly-stuck notice instead.
-                if (state.nonInteractive) {
-                    cancelNoOutputWatchdog = startNoOutputWatchdog(
-                        logPath,
-                        resolveNonInteractiveStallWakeMs(),
-                        () => noOutputResolve?.()
-                    );
-                }
+                // Stall wake (both modes): a foreground command that outlives
+                // its timeout handling must wake the supervising agent at most
+                // every PI_TAU_STALL_WAKE_MS (default 4 min) so outstanding
+                // jobs and subagent completions get checked. Non-interactive
+                // always arms it (auto-background no-ops there); interactive
+                // arms it as a safety net behind the 15s background/kill timer
+                // (covers SIGTERM-ignoring processes and kill failures).
+                cancelNoOutputWatchdog = startNoOutputWatchdog(
+                    logPath,
+                    resolveNonInteractiveStallWakeMs(),
+                    () => noOutputResolve?.()
+                );
 
                 // Race: completion vs background signal
                 const raceResult = await Promise.race([
@@ -1974,6 +1975,18 @@ export function registerBackgroundJobs(
                     // Remove foreground job registration
                     state.backgroundJobs.delete(jobId);
                     killProcessGroup(proc.pid, "SIGTERM");
+                    // SIGKILL fallback: a SIGTERM-ignoring process must not
+                    // outlive the wake and re-stall the session.
+                    if (proc.pid) {
+                        const stalledPid = proc.pid;
+                        setTimeout(() => {
+                            try {
+                                killProcessGroup(stalledPid, "SIGKILL");
+                            } catch {
+                                /* already dead */
+                            }
+                        }, 5_000).unref();
+                    }
                     const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
                     throw new PossiblyStuckError(
                         `Possibly stuck: no output for ${formatDuration(resolveNonInteractiveStallWakeMs())}. ` +
@@ -3050,6 +3063,18 @@ async function executeTmuxForeground(
     // Timeout timer — matches the direct-spawn path: backgroundAfter
     // overrides the default timeout, so `backgroundAfter=300` actually
     // backgrounds after 300s instead of the 15s default.
+    // Killed signal: killing a tmux window never writes the exit-code
+    // sentinel, so the completion poller would wait forever. Resolve a
+    // dedicated signal so the race below settles (observed: `sleep 15\n...`
+    // bypassed the sleep block via newline, hit the disallowed kill path,
+    // and hung the session ~24h waiting for a sentinel that never arrives).
+    let killedResolve: ((reason: string) => void) | null = null;
+    const killedSignal = new Promise<string>((resolve) => {
+        killedResolve = resolve;
+    });
+    function triggerKilled(reason: string): void {
+        killedResolve?.(reason);
+    }
     const timeoutMs =
         typeof params.backgroundAfter === "number"
             ? params.backgroundAfter * 1_000
@@ -3062,11 +3087,13 @@ async function executeTmuxForeground(
         if (!state.runningProcesses.has(toolCallId)) return;
         if (!isAutoBackgroundAllowed(command)) {
             killTmuxJob(job);
+            triggerKilled("timeout-disallowed");
             return;
         }
         if (getActiveBackgroundControlTools(pi).length === 0) {
             killTmuxJob(job);
             notifyBackgroundUnavailable(pi, command, timeoutMs);
+            triggerKilled("timeout-no-controls");
             return;
         }
         triggerBackground();
@@ -3171,32 +3198,65 @@ async function executeTmuxForeground(
         // Command still running — start polling for progress
         startPolling();
 
-        // Non-interactive: the auto-background timer no-ops here, so a silent
-        // or deadlocked command would block the agent loop forever. Arm a
-        // no-output watchdog and race it — a stuck command wakes the agent
-        // with a possibly-stuck notice instead.
-        if (state.nonInteractive) {
-            cancelNoOutputWatchdog = startNoOutputWatchdog(
-                logPath,
-                resolveNonInteractiveStallWakeMs(),
-                () => noOutputResolve?.()
-            );
-        }
+        // Stall wake (both modes): a foreground command that outlives its
+        // timeout handling — killed tmux window with no sentinel, ignored
+        // SIGTERM, deadlocked binary — must wake the supervising agent at
+        // most every PI_TAU_STALL_WAKE_MS (default 4 min) so outstanding
+        // jobs and subagent completions get checked. Non-interactive always
+        // arms it (auto-background no-ops there); interactive arms it as a
+        // safety net behind the 15s background/kill timer.
+        cancelNoOutputWatchdog = startNoOutputWatchdog(
+            logPath,
+            resolveNonInteractiveStallWakeMs(),
+            () => noOutputResolve?.()
+        );
 
-        // Race: completion vs background signal
+        // Race: completion vs background vs killed vs stall signal
         const raceResult = await Promise.race([
             completionPromise.then((code) => ({
                 type: "completed" as const,
                 code,
+                killReason: undefined as string | undefined,
             })),
             backgroundSignal.then(() => ({
                 type: "backgrounded" as const,
                 code: undefined as number | undefined,
+                killReason: undefined as string | undefined,
             })),
             noOutputSignal.then(() => ({
                 type: "stalled" as const,
+                code: undefined as number | undefined,
+                killReason: undefined as string | undefined,
+            })),
+            killedSignal.then((killReason) => ({
+                type: "killed" as const,
+                code: undefined as number | undefined,
+                killReason,
             })),
         ]);
+
+        if (raceResult.type === "killed") {
+            clearInterval(pollTimer);
+            clearInterval(checkTimer);
+            clearTimeout(timer);
+            clearTimeout(hintTimer);
+            cancelNoOutputWatchdog?.();
+            state.runningProcesses.delete(toolCallId);
+            if (state.currentlyRunningToolCallId === toolCallId) {
+                state.currentlyRunningToolCallId = null;
+            }
+            silenceJobAfterKill(job);
+            state.backgroundJobs.delete(jobId);
+            updateWidget(state, ctx);
+            const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
+            throw new Error(
+                `Command killed on timeout (${raceResult.killReason}); ` +
+                    `sleep and other non-backgroundable commands are killed instead of backgrounded. ` +
+                    `Use bash_bg for long waits.\n` +
+                    `Command: ${command}\n` +
+                    `Output (${logPath}):\n${tail}`
+            );
+        }
 
         if (raceResult.type === "stalled") {
             clearInterval(pollTimer);

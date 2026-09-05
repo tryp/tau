@@ -187,6 +187,21 @@ void describe("detectBlockedSleep", () => {
     void it("handles empty string", () => {
         assert.equal(detectBlockedSleep(""), null);
     });
+
+    void it("blocks multiline sleep-first commands (stall regression)", () => {
+        // Observed stall: `sleep 15\necho ...\ncat ...` bypassed the block
+        // because the split ignored newlines, then hit the disallowed kill
+        // path on timeout and hung the session waiting for a tmux sentinel
+        // that never arrives. Newlines must split like ; && |.
+        assert.equal(
+            detectBlockedSleep(
+                'sleep 15\necho "=== GPU state ==="\ncat /sys/class/drm/card0/device/gpu_busy_percent'
+            ),
+            "sleep 15"
+        );
+        assert.equal(detectBlockedSleep("sleep 10\necho done"), "sleep 10");
+        assert.equal(detectBlockedSleep("sleep 5\r\necho done"), "sleep 5");
+    });
 });
 
 void describe("isAutoBackgroundAllowed", () => {

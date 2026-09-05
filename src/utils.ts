@@ -307,10 +307,15 @@ export function isAutoBackgroundAllowed(command: string): boolean {
  * Blocks sleep >= 2 seconds; allows sub-2s pacing.
  */
 export function detectBlockedSleep(command: string): string | null {
+    // Split on shell chaining operators AND newlines: a leading `sleep 15\n...`
+    // multiline command must be blocked the same as `sleep 15; ...`. Without
+    // the newline split, a `sleep 15` first line bypasses the block and then
+    // hits the no-auto-background kill path on timeout (observed: 24h stall
+    // when the tmux kill left the foreground race pending).
     const first =
         command
             .trim()
-            .split(/&&|;|\|/)[0]
+            .split(/&&|;|\||\r?\n/)[0]
             ?.trim() ?? "";
     const m = /^sleep\s+(\d+(?:\.\d+)?)\s*$/.exec(first);
     if (!m) return null;
