@@ -77,9 +77,13 @@ export function startTitlebarSpinner(
             }) === "stale"
         ) {
             // Session replaced or reloaded while the spinner was running;
-            // the captured pi/ctx are gone. Stop the interval instead of
-            // letting the next tick crash pi with an uncaughtException.
-            stopTitlebarSpinner(pi, state, ctx);
+            // the captured pi/ctx are gone. Clear the interval directly —
+            // the full stop path would itself touch the stale ctx and throw
+            // the same assertion again.
+            if (state.titlebarTimer) {
+                clearInterval(state.titlebarTimer);
+                state.titlebarTimer = null;
+            }
         }
     }, readTitlebarIntervalMs());
 }
