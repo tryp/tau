@@ -4,6 +4,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { formatDuration } from "../utils.ts";
 import path from "node:path";
 
@@ -69,8 +70,17 @@ export function startTitlebarSpinner(
     state.titlebarTimer = setInterval(() => {
         const frame =
             BRAILLE_FRAMES[state.titlebarFrameIndex % BRAILLE_FRAMES.length];
-        ctx.ui.setTitle(`${frame} ${getTitleBase(pi)}`);
-        state.titlebarFrameIndex++;
+        if (
+            staleSafe(() => {
+                ctx.ui.setTitle(`${frame} ${getTitleBase(pi)}`);
+                state.titlebarFrameIndex++;
+            }) === "stale"
+        ) {
+            // Session replaced or reloaded while the spinner was running;
+            // the captured pi/ctx are gone. Stop the interval instead of
+            // letting the next tick crash pi with an uncaughtException.
+            stopTitlebarSpinner(pi, state, ctx);
+        }
     }, readTitlebarIntervalMs());
 }
 
@@ -108,11 +118,19 @@ export function startAgentTimer(
             return;
         }
         const elapsed = formatDuration(Date.now() - state.agentStartTime);
-        const spinner = ctx.ui.theme.fg("accent", "●");
-        ctx.ui.setStatus(
-            "tau-turn",
-            spinner + ctx.ui.theme.fg("dim", ` ${elapsed}`)
-        );
+        if (
+            staleSafe(() => {
+                const spinner = ctx.ui.theme.fg("accent", "●");
+                ctx.ui.setStatus(
+                    "tau-turn",
+                    spinner + ctx.ui.theme.fg("dim", ` ${elapsed}`)
+                );
+            }) === "stale"
+        ) {
+            // Pre-reload zombie interval from a replaced extension instance.
+            // Self-terminate so the stale ctx cannot crash pi.
+            stopAgentTimer(state);
+        }
     }, 1_000);
     registerAgentTimer(state.agentTimer);
 }

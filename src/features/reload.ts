@@ -14,6 +14,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
 
 /**
@@ -97,7 +98,14 @@ export function registerReloadTool(pi: ExtensionAPI, state: TauState): void {
                 // Wait up to 30s for the agent to go idle
                 for (let i = 0; i < 150; i++) {
                     await new Promise((r) => setTimeout(r, 200));
-                    if (_ctx.isIdle()) {
+                    const idle = staleSafe(() => _ctx.isIdle());
+                    if (idle === "stale") {
+                        // The session/extension context was already replaced
+                        // while we waited (reload happened or the user
+                        // switched sessions). Nothing left to reload.
+                        return;
+                    }
+                    if (idle) {
                         await doReload();
                         return;
                     }

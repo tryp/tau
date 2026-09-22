@@ -55,6 +55,8 @@ export {
     trackJobOutputIndex,
 };
 
+import { staleSafe } from "./ctx-guard.ts";
+
 import type {
     AgentToolResult,
     AgentToolUpdateCallback,
@@ -250,7 +252,11 @@ export function cancelQueuedBackgroundNotification(
             cancelQueuedMessage?: (queueKey: string) => void;
         }
     ).cancelQueuedMessage;
-    cancel?.(backgroundNotificationKey(jobId, kind));
+    // The queue may have been invalidated by a session replacement or reload
+    // while the job was running; the assertion must not escape a timer
+    // callback as an uncaughtException (it terminates pi). Stale => nothing
+    // to cancel anyway.
+    staleSafe(() => cancel?.(backgroundNotificationKey(jobId, kind)));
 }
 
 export function cancelQueuedBackgroundNotifications(
@@ -275,14 +281,19 @@ function sendQueuedMessage(
     message: Parameters<ExtensionAPI["sendMessage"]>[0],
     options: QueuedMessageOptions
 ): void {
-    (
-        pi as ExtensionAPI & {
-            sendMessage: (
-                message: Parameters<ExtensionAPI["sendMessage"]>[0],
-                options: QueuedMessageOptions
-            ) => void;
-        }
-    ).sendMessage(message, options);
+    // Same stale-ctx guard as cancelQueuedBackgroundNotification: delivery
+    // happens from debounce timers and completion promise chains that can
+    // outlive the extension context that captured pi.
+    staleSafe(() =>
+        (
+            pi as ExtensionAPI & {
+                sendMessage: (
+                    message: Parameters<ExtensionAPI["sendMessage"]>[0],
+                    options: QueuedMessageOptions
+                ) => void;
+            }
+        ).sendMessage(message, options)
+    );
 }
 
 // ─── Stall watchdog ─────────────────────────────────────────────────
@@ -417,6 +428,14 @@ export function hasForegroundTasks(state: TauState): boolean {
 // ─── Widget / status bar ────────────────────────────────────────────
 
 export function updateWidget(state: TauState, ctx: UiContext): void {
+    // Runs from completion/terminal paths (timers, process close events) that
+    // can fire after the session was replaced; ctx.ui access then throws the
+    // stale-ctx assertion. Skip the widget update in that case — there is no
+    // UI to update for a replaced session.
+    if (staleSafe(() => renderWidget(state, ctx)) === "stale") return;
+}
+
+function renderWidget(state: TauState, ctx: UiContext): void {
     const allJobs = Array.from(state.backgroundJobs.values());
     const runningJobs = allJobs.filter((job) => job.status === "running");
 
@@ -1411,10 +1430,14 @@ export function notifyCompletion(
     const duration = formatDuration(Date.now() - job.startTime);
     const emoji = job.status === "completed" ? "✅" : "❌";
 
-    // Toast notification fires immediately for each job
-    ctx.ui.notify(
-        `${emoji} ${job.id} ${job.status} (${duration})`,
-        job.status === "completed" ? "success" : "error"
+    // Toast notification fires immediately for each job. The toast is the
+    // only ctx access here; a stale ctx (session replaced while the job ran)
+    // must not turn this completion path into an uncaughtException.
+    staleSafe(() =>
+        ctx.ui.notify(
+            `${emoji} ${job.id} ${job.status} (${duration})`,
+            job.status === "completed" ? "success" : "error"
+        )
     );
 
     // Indexing is asynchronous. Queue the completion only after it settles so
@@ -1436,9 +1459,11 @@ export function notifyCompletion(
             return;
         }
         if (job.sidecarIndexStatus === "failed") {
-            ctx.ui.notify(
-                `Sidecar indexing failed for ${job.id} (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at ${job.logPath}`,
-                "warning"
+            staleSafe(() =>
+                ctx.ui.notify(
+                    `Sidecar indexing failed for ${job.id} (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at ${job.logPath}`,
+                    "warning"
+                )
             );
         }
         completionBatch.jobs.push({ job, duration, emoji });
@@ -1554,15 +1579,19 @@ export function registerBackgroundJob(
 
 /** Return the job-control tools currently available to the agent. */
 export function getActiveBackgroundControlTools(pi: ExtensionAPI): string[] {
-    try {
-        return pi
-            .getActiveTools()
-            .filter((name) => name === "jobs" || name === "job_decide");
-    } catch {
-        // Older hosts/mocks may not expose active-tool introspection. Keep the
-        // historical behavior there; current pi always provides this method.
+    const getActive = (pi as ExtensionAPI & { getActiveTools?: () => string[] })
+        .getActiveTools;
+    if (typeof getActive !== "function") {
+        // Older hosts/mocks may not expose active-tool introspection. Keep
+        // the historical behavior there; current pi always provides it.
         return ["jobs", "job_decide"];
     }
+    const tools = staleSafe(() => getActive());
+    if (tools === "stale") {
+        // Session replaced — there is no agent that could use the controls.
+        return [];
+    }
+    return tools.filter((name) => name === "jobs" || name === "job_decide");
 }
 
 function notifyBackgroundUnavailable(
@@ -1570,19 +1599,21 @@ function notifyBackgroundUnavailable(
     command: string,
     timeoutMs: number
 ): void {
-    pi.sendMessage(
-        {
-            customType: "bg-unavailable",
-            content:
-                `⏰ Command exceeded ${formatDuration(timeoutMs)} and was terminated ` +
-                `instead of backgrounded because no job-control tool is active.\n` +
-                `Command: ${command}\n\n` +
-                `Do not use shell kill/pkill cleanup. Enable the jobs or job_decide ` +
-                `tool, then rerun the command.`,
-            display: true,
-            details: { command, timeoutMs },
-        },
-        { deliverAs: "followUp", triggerTurn: true }
+    staleSafe(() =>
+        pi.sendMessage(
+            {
+                customType: "bg-unavailable",
+                content:
+                    `⏰ Command exceeded ${formatDuration(timeoutMs)} and was terminated ` +
+                    `instead of backgrounded because no job-control tool is active.\n` +
+                    `Command: ${command}\n\n` +
+                    `Do not use shell kill/pkill cleanup. Enable the jobs or job_decide ` +
+                    `tool, then rerun the command.`,
+                display: true,
+                details: { command, timeoutMs },
+            },
+            { deliverAs: "followUp", triggerTurn: true }
+        )
     );
 }
 

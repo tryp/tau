@@ -25,6 +25,7 @@ import type {
 import { Type } from "@earendil-works/pi-ai";
 import { tmpdir } from "node:os";
 import type { TauState } from "../state.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
 import type {
     BackgroundJob,
@@ -357,7 +358,12 @@ export function registerAgentBackground(
         // Older pi versions only expose agent_end, so the fallback waits
         // until the event loop reports idle. Newer versions use the explicit
         // agent_settled event below and skip this heuristic.
-        const settled = ctx.isIdle();
+        const settled = staleSafe(() => ctx.isIdle());
+        if (settled === "stale") {
+            // Session replaced while this settle loop was parked in a timer.
+            // The captured ctx is gone; abandon the batch.
+            return;
+        }
         if (!settled && attempt < 100) {
             settlementScheduled = true;
             const timer = setTimeout(
@@ -396,7 +402,14 @@ export function registerAgentBackground(
 
             // Re-read after settlement. This guarantees --fork sees a complete
             // JSONL session, including the agent_bg tool result.
-            const sessionFile = ctx.sessionManager.getSessionFile();
+            const sessionFile = staleSafe(() =>
+                ctx.sessionManager.getSessionFile()
+            );
+            if (sessionFile === "stale") {
+                // Session replaced during the settle — drop the batch; the new
+                // session has its own pending-agent ledger.
+                return;
+            }
             startAgentProcess(
                 job,
                 {
@@ -445,7 +458,14 @@ export function registerAgentBackground(
                         }
                         continue;
                     }
-                    const sessionFile = ctx.sessionManager.getSessionFile();
+                    const sessionFile = staleSafe(() =>
+                        ctx.sessionManager.getSessionFile()
+                    );
+                    if (sessionFile === "stale") {
+                        // Session replaced while the deferred timer was
+                        // parked; abandon the batch.
+                        return;
+                    }
                     startAgentProcess(
                         job,
                         {

@@ -31,6 +31,7 @@ import type {
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import type { JobTrigger } from "../types.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
 import { ensureTriggerMonitor, triggerLabel } from "./trigger-monitor.ts";
 
@@ -446,6 +447,7 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
 
 function flushReadyCallbacks(): void {
     if (_agentBusy || !_pi) return;
+    const pi = _pi;
 
     const ready = Array.from(callbacks.values())
         .filter((cb) => cb.fired)
@@ -455,22 +457,34 @@ function flushReadyCallbacks(): void {
 
     const message = buildCallbackMessage(cb);
 
-    // Try to start a new agent turn with the callback message.
-    _pi.sendUserMessage(message, {
-        deliverAs: "followUp",
-    });
+    // Delivery runs from a timeout; if the session was replaced or the
+    // extension reloaded while the callback was queued, the captured _pi is
+    // stale and every call throws an assertion that would kill pi from this
+    // timer. A replaced session has no agent to deliver to — drop the
+    // callback instead of crashing.
+    if (
+        staleSafe(() => {
+            // Try to start a new agent turn with the callback message.
+            pi.sendUserMessage(message, {
+                deliverAs: "followUp",
+            });
 
-    // Also persist the callback as a custom entry in the session
-    // transcript. This ensures the callback data survives compaction
-    // and session restores. appendEntry is used here instead of
-    // sendMessage+deliverAs:followUp to avoid delivering the same
-    // callback content to the LLM twice (sendUserMessage above
-    // already handles agent notification).
-    _pi.appendEntry("callback", {
-        cbId: cb.id,
-        linkedJobId: cb.linkedJobId,
-        message,
-    });
+            // Also persist the callback as a custom entry in the session
+            // transcript. This ensures the callback data survives compaction
+            // and session restores. appendEntry is used here instead of
+            // sendMessage+deliverAs:followUp to avoid delivering the same
+            // callback content to the LLM twice (sendUserMessage above
+            // already handles agent notification).
+            pi.appendEntry("callback", {
+                cbId: cb.id,
+                linkedJobId: cb.linkedJobId,
+                message,
+            });
+        }) === "stale"
+    ) {
+        callbacks.delete(cb.id);
+        return;
+    }
 
     callbacks.delete(cb.id);
     persistState();

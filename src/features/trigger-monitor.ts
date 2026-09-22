@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
 import type { BackgroundJob, JobTrigger } from "../types.ts";
 import { evaluateTrigger, makeTriggerAccum } from "./trigger-check.ts";
+import { staleSafe } from "./ctx-guard.ts";
 
 const TRIGGER_POLL_MS = 2_000;
 
@@ -90,28 +91,38 @@ export function startTriggerMonitor(
                     const matchPart = result.matchText
                         ? `\nMatched: ${result.matchText}`
                         : "";
-                    pi.sendMessage(
-                        {
-                            customType: "bg-trigger",
-                            content:
-                                `\u26a1 ${job.id} trigger: ${triggerLabel(t)} ` +
-                                `(current: ${result.current})${errorPart}${suffix}\n` +
-                                `Command: ${job.command}\nLog: ${job.logPath}${matchPart}`,
-                            display: true,
-                            details: {
-                                jobId: job.id,
-                                triggerType: t.type,
-                                threshold:
-                                    t.type === "outputMatch"
-                                        ? t.pattern
-                                        : t.value,
-                                current: result.current,
-                                matchText: result.matchText,
-                                error: result.error,
-                            },
-                        },
-                        { deliverAs: "followUp", triggerTurn: true }
-                    );
+                    if (
+                        staleSafe(() =>
+                            pi.sendMessage(
+                                {
+                                    customType: "bg-trigger",
+                                    content:
+                                        `\u26a1 ${job.id} trigger: ${triggerLabel(t)} ` +
+                                        `(current: ${result.current})${errorPart}${suffix}\n` +
+                                        `Command: ${job.command}\nLog: ${job.logPath}${matchPart}`,
+                                    display: true,
+                                    details: {
+                                        jobId: job.id,
+                                        triggerType: t.type,
+                                        threshold:
+                                            t.type === "outputMatch"
+                                                ? t.pattern
+                                                : t.value,
+                                        current: result.current,
+                                        matchText: result.matchText,
+                                        error: result.error,
+                                    },
+                                },
+                                { deliverAs: "followUp", triggerTurn: true }
+                            )
+                        ) === "stale"
+                    ) {
+                        // Session replaced while polling; the captured pi is
+                        // gone. Stop the monitor instead of crashing pi from
+                        // this interval callback.
+                        stop();
+                        return;
+                    }
                     continue; // one-shot: drop the fired trigger
                 }
             } catch {

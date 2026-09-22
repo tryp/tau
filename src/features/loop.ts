@@ -31,6 +31,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
 
 // --- Constants ---
@@ -465,13 +466,16 @@ export function registerLoop(pi: ExtensionAPI, state: TauState): void {
     });
 
     function sendTick(msg: string): void {
+        // Tick delivery happens from timers/agent_end events that can fire
+        // after a session replacement or reload. A stale pi must not turn
+        // into an uncaughtException; the loop simply stops emitting.
         if (isAgentIdle) {
             // Agent is idle: trigger a new turn directly.
-            pi.sendUserMessage(msg);
+            staleSafe(() => pi.sendUserMessage(msg));
         } else {
             // Agent is busy: queue as a follow-up so it runs after the
             // current turn completes.
-            pi.sendUserMessage(msg, { deliverAs: "followUp" });
+            staleSafe(() => pi.sendUserMessage(msg, { deliverAs: "followUp" }));
         }
     }
 

@@ -29,6 +29,7 @@ import {
     sessionNameForGitRoot,
     spawnInTmux,
 } from "../tmux.ts";
+import { staleSafe } from "./ctx-guard.ts";
 import { trackJobOutputIndex } from "./sidecar.ts";
 
 /** Per-run directory for exit-code sentinels and output files. */
@@ -256,6 +257,31 @@ export function spawnForegroundTmux(
 }
 
 /**
+ * Finalize a tmux-backed job once its exit-code sentinel is present.
+ *
+ * This is the body of the completion poll timer (see spawnBackgroundTmux),
+ * extracted so the stale-ctx fallback can be unit-tested without a live
+ * tmux server. `onCompletion` carries the caller's completion machinery
+ * (notification, cleanup), which is the path that can touch a stale ctx.
+ */
+export function finalizeTmuxCompletion(
+    job: BackgroundJob,
+    exitCode: number,
+    ctx: UiContext,
+    onCompletion: (job: BackgroundJob) => void,
+    onTerminal?: () => void
+): void {
+    markJobTerminal(
+        job,
+        exitCode === 0 || exitCode === null ? "completed" : "failed",
+        exitCode
+    );
+    void trackJobOutputIndex(job, ctx, "bash_bg");
+    onCompletion(job);
+    onTerminal?.();
+}
+
+/**
  * Spawn a bash command in a tmux window (background mode).
  *
  * Sets up completion detection and returns the job.
@@ -308,25 +334,25 @@ export function spawnBackgroundTmux(
 
         clearInterval(pollTimer);
         cancelStall();
-        markJobTerminal(
-            job,
-            result.exitCode === 0 || result.exitCode === null
-                ? "completed"
-                : "failed",
-            result.exitCode ?? 0
-        );
-        void trackJobOutputIndex(job, ctx, "bash_bg");
-        // Finalize through the shared completion machinery (toast, batch
-        // suppression, busy-deferral, prune of consumed jobs) plus tmux
-        // window cleanup — mirrors the direct-spawn path's notifyCompletion
-        // so tmux-backed jobs cannot re-awaken the agent redundantly.
-        onCompletion(job);
-        // Refresh the footer widget only after the job has been finalized
-        // (notification + cleanup + counter updates), so it neither shows the
-        // completed job as running nor reports stale completed/failed counts.
-        // Mirrors the auto-background poller in background.ts. Without this,
-        // the background-jobs widget stays frozen at the spawn-time snapshot.
-        onTerminal?.();
+        if (
+            staleSafe(() =>
+                finalizeTmuxCompletion(
+                    job,
+                    result.exitCode ?? 0,
+                    ctx,
+                    onCompletion,
+                    onTerminal
+                )
+            ) === "stale"
+        ) {
+            // The captured pi/ctx were invalidated by a session replacement
+            // or reload while this job was running. Every access would throw
+            // the stale-ctx assertion; inside a timer callback that is an
+            // uncaughtException that kills pi, so fall back to cleanup that
+            // needs no pi: keep the output log, kill the tmux window so it
+            // does not outlive the session.
+            killTmuxJob(job);
+        }
     }, 500);
     pollTimer.unref();
 
