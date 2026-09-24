@@ -26,7 +26,7 @@
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -34,7 +34,11 @@ import {
     startStallWatchdog,
 } from "../features/background.ts";
 import { TauState } from "../state.ts";
-import { STALL_CHECK_INTERVAL_MS, STALL_THRESHOLD_MS } from "../utils.ts";
+import {
+    MAX_LOG_BYTES,
+    STALL_CHECK_INTERVAL_MS,
+    STALL_THRESHOLD_MS,
+} from "../utils.ts";
 
 interface CapturedMessage {
     customType?: string;
@@ -221,6 +225,175 @@ void describe("stall watchdog — no-progress jobs", () => {
             messages.filter((m) => m.customType === "bg-stall").length,
             0,
             "a job with steady output must not be flagged as stalled"
+        );
+    });
+});
+
+void describe("stall watchdog — silence notice for a job detached as silent", () => {
+    let dir: string;
+    let logPath: string;
+    let messages: CapturedMessage[];
+
+    beforeEach(() => {
+        dir = mkdtempSync(join(tmpdir(), "pi-tau-stall-detached-"));
+        logPath = join(dir, "job.out");
+        writeFileSync(logPath, "");
+        messages = [];
+        mock.timers.enable({ apis: ["setInterval", "Date"] });
+    });
+
+    afterEach(() => {
+        mock.timers.reset();
+        rmSync(dir, { recursive: true, force: true });
+    });
+
+    void it("does not repeat the silence the detach notice already reported", () => {
+        const state = new TauState();
+        const cancel = startStallWatchdog(
+            "job-detached",
+            "long silent computation",
+            logPath,
+            makePi(messages),
+            state,
+            undefined,
+            { silenceNoticeOnlyAfterGrowth: true }
+        );
+
+        for (let i = 0; i < STALL_TICKS * 3; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        cancel();
+
+        assert.equal(
+            messages.filter((m) => m.customType === "bg-stall").length,
+            0,
+            "a job detached because it was already silent must not emit a " +
+                "second, contradictory keep-it-or-kill-it prompt"
+        );
+    });
+
+    void it("announces silence again after the job produces output and goes quiet", () => {
+        const state = new TauState();
+        const cancel = startStallWatchdog(
+            "job-detached-then-quiet",
+            "long silent computation",
+            logPath,
+            makePi(messages),
+            state,
+            undefined,
+            { silenceNoticeOnlyAfterGrowth: true }
+        );
+
+        // First silence window passes with no notice: the agent was just
+        // told this job is silent by the detach notice.
+        for (let i = 0; i < STALL_TICKS; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        assert.equal(
+            messages.length,
+            0,
+            "no notice during the initial silence window"
+        );
+
+        // The job makes progress, then goes quiet again. That is new
+        // information and must be surfaced.
+        writeFileSync(logPath, "point 1 done\n");
+        mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        for (let i = 0; i < STALL_TICKS; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        cancel();
+
+        assert.ok(
+            messages.some((m) => m.customType === "bg-stall"),
+            "silence after real progress must still be surfaced"
+        );
+    });
+
+    void it("still terminates an oversize log while the silence notice is suppressed", () => {
+        const state = new TauState();
+        let oversize = 0;
+        const cancel = startStallWatchdog(
+            "job-oversize",
+            "chatty computation",
+            logPath,
+            makePi(messages),
+            state,
+            () => {
+                oversize++;
+            },
+            { silenceNoticeOnlyAfterGrowth: true }
+        );
+
+        // Sparse file: only the reported size matters, not bytes on disk.
+        truncateSync(logPath, MAX_LOG_BYTES + 1);
+        mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        cancel();
+
+        assert.equal(
+            oversize,
+            1,
+            "oversize termination must stay armed for a detached job"
+        );
+        assert.ok(
+            messages.some((m) => /exceeded/.test(m.content)),
+            "the oversize notice must still be delivered"
+        );
+    });
+
+    void it("still surfaces an interactive prompt while the silence notice is suppressed", () => {
+        const state = new TauState();
+        const cancel = startStallWatchdog(
+            "job-detached-prompt",
+            "rm -i some-file",
+            logPath,
+            makePi(messages),
+            state,
+            undefined,
+            { silenceNoticeOnlyAfterGrowth: true }
+        );
+
+        writeFileSync(logPath, "Overwrite existing file? (y/n): ");
+        for (let i = 0; i < STALL_TICKS; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        cancel();
+
+        assert.ok(
+            messages.some((m) => m.customType === "bg-stall"),
+            "prompt detection is distinct information and must still fire"
+        );
+    });
+
+    void it("still surfaces a prompt that was already present when armed", () => {
+        // A pre-existing prompt is not new growth, but it is actionable and
+        // distinct from a plain silence stall, so it must still be reported
+        // as an interactive-input block rather than swallowed.
+        writeFileSync(logPath, "Overwrite existing file? (y/n): ");
+        const state = new TauState();
+        const cancel = startStallWatchdog(
+            "job-prompt-at-arm",
+            "rm -i some-file",
+            logPath,
+            makePi(messages),
+            state,
+            undefined,
+            { silenceNoticeOnlyAfterGrowth: true }
+        );
+
+        for (let i = 0; i < STALL_TICKS; i++) {
+            mock.timers.tick(STALL_CHECK_INTERVAL_MS);
+        }
+        cancel();
+
+        assert.ok(
+            messages.some((m) => /interactive input/.test(m.content)),
+            "a pre-existing prompt is still actionable and must be surfaced"
+        );
+        assert.equal(
+            messages.filter((m) => /produced no output/.test(m.content)).length,
+            0,
+            "it must not be reported as a plain silence stall"
         );
     });
 });

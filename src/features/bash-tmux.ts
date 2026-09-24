@@ -26,6 +26,7 @@ import {
     checkExitCode,
     getGitRoot,
     killWindow,
+    queryWindows,
     sessionNameForGitRoot,
     spawnInTmux,
 } from "../tmux.ts";
@@ -154,20 +155,109 @@ export function getTmuxContext(job: BackgroundJob): TmuxJobContext | undefined {
 }
 
 /**
+ * Polls between tmux window-liveness checks. The exit-code sentinel is a
+ * single `stat()`; an `exec` per 500ms poll per job would be wasteful, so
+ * liveness is sampled on a slower cadence (~10s). Overridable so tests do not
+ * have to wait a full cadence.
+ */
+export const TMUX_LIVENESS_POLL_EVERY = 20;
+
+/**
+ * Ceiling for the override (~8 min at the 500ms poll cadence). An arbitrarily
+ * large value would push the liveness check past any realistic job lifetime and
+ * silently disable the vanished-window recovery this exists to provide.
+ */
+export const MAX_TMUX_LIVENESS_POLL_EVERY = 1_000;
+
+function livenessPollEvery(): number {
+    return resolveLivenessPollEvery(process.env);
+}
+
+/**
+ * Resolve the liveness cadence (in polls) from the environment.
+ *
+ * Digit-only, like the other numeric env overrides: rejects "1e9", "-5",
+ * "20.5", and padded junk rather than coercing them. Values above
+ * MAX_TMUX_LIVENESS_POLL_EVERY are clamped, because an arbitrarily large
+ * cadence would outlive any realistic job and silently disable the
+ * vanished-window recovery this exists to provide.
+ */
+export function resolveLivenessPollEvery(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = env.PI_TAU_TMUX_LIVENESS_POLL_EVERY;
+    if (raw === undefined) return TMUX_LIVENESS_POLL_EVERY;
+    const normalized = raw.trim();
+    if (!/^\d+$/.test(normalized)) return TMUX_LIVENESS_POLL_EVERY;
+    const parsed = Number(normalized);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+        return TMUX_LIVENESS_POLL_EVERY;
+    }
+    return Math.min(parsed, MAX_TMUX_LIVENESS_POLL_EVERY);
+}
+
+/** Consecutive sentinel-absent polls observed per job. */
+const livenessPollCounts = new WeakMap<BackgroundJob, number>();
+
+/**
+ * Timeout for the liveness probe. It runs inside a 500ms completion poller and
+ * `queryWindows` is synchronous, so a hung tmux must not be able to block the
+ * event loop for the default 10s. A timeout reports "unknown", which the caller
+ * treats as "still running, retry next cadence".
+ */
+export const TMUX_LIVENESS_QUERY_TIMEOUT_MS = 2_000;
+
+/**
+ * Whether the tmux window still exists in its session. `undefined` means the
+ * query itself failed (tmux could not be run) — not evidence of death.
+ */
+function tmuxWindowAlive(
+    session: string,
+    windowId: string
+): boolean | undefined {
+    const windows = queryWindows(session, TMUX_LIVENESS_QUERY_TIMEOUT_MS);
+    if (windows === undefined) return undefined;
+    return windows.some((window) => window.id === windowId);
+}
+
+/**
  * Poll for exit-code completion of a tmux-backed background job.
  * Called by the stall watchdog tick to detect completed commands.
+ *
+ * A tmux window can also die *without* writing the sentinel: `tmux
+ * kill-window`/`kill-session`/`kill-server`, an OOM SIGKILL of the pane, or a
+ * host reboot. Waiting only on the sentinel left such a job `running` forever,
+ * and `jobs attach` would await a donePromise that never resolves. When the
+ * sentinel is absent but the window is gone, report the job as vanished so the
+ * caller can finalize it. The wrapper script writes the sentinel before it
+ * exits, so a normally-finished window always has its sentinel present —
+ * sentinel-absent plus window-gone means the window died abnormally.
  */
 export function pollTmuxCompletion(job: BackgroundJob): {
     completed: boolean;
     exitCode?: number;
+    /** The window disappeared without reporting an exit code. */
+    vanished?: boolean;
 } {
     const ctx = getTmuxContext(job);
     if (!ctx) return { completed: false };
 
     const code = checkExitCode(ctx.exitCodeFile);
-    if (code === undefined) return { completed: false };
+    if (code !== undefined) return { completed: true, exitCode: code };
 
-    return { completed: true, exitCode: code };
+    const every = livenessPollEvery();
+    const count = (livenessPollCounts.get(job) ?? 0) + 1;
+    if (count < every) {
+        livenessPollCounts.set(job, count);
+        return { completed: false };
+    }
+    livenessPollCounts.set(job, 0);
+    const alive = tmuxWindowAlive(ctx.session, ctx.windowId);
+    // A failed query is not evidence of death: keep the job running and retry
+    // on the next cadence rather than finalizing a live job.
+    if (alive !== false) return { completed: false };
+
+    return { completed: true, vanished: true };
 }
 
 /**
@@ -266,7 +356,7 @@ export function spawnForegroundTmux(
  */
 export function finalizeTmuxCompletion(
     job: BackgroundJob,
-    exitCode: number,
+    exitCode: number | undefined,
     ctx: UiContext,
     onCompletion: (job: BackgroundJob) => void,
     onTerminal?: () => void
@@ -334,11 +424,14 @@ export function spawnBackgroundTmux(
 
         clearInterval(pollTimer);
         cancelStall();
+        // A vanished window reports no exit code; passing undefined marks the
+        // job failed (not completed) with no fabricated status code.
+        const exitCode = result.vanished ? undefined : (result.exitCode ?? 0);
         if (
             staleSafe(() =>
                 finalizeTmuxCompletion(
                     job,
-                    result.exitCode ?? 0,
+                    exitCode,
                     ctx,
                     onCompletion,
                     onTerminal

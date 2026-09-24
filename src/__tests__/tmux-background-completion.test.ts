@@ -20,8 +20,9 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { registerBackgroundJobs } from "../features/background.ts";
+import { getTmuxContext } from "../features/bash-tmux.ts";
 import { TauState } from "../state.ts";
-import { sessionNameForGitRoot } from "../tmux.ts";
+import { listWindows, queryWindows, sessionNameForGitRoot } from "../tmux.ts";
 
 const TEST_RUN_DIR = `/tmp/pi-tmux-bgtest-${process.pid}`;
 
@@ -96,6 +97,26 @@ const stubUi = {
     theme: { fg: (_accent: string, text: string) => text },
 };
 
+/** Run `fn` with temporary env overrides, restoring them afterwards. */
+async function withEnv<T>(
+    overrides: Record<string, string>,
+    fn: () => Promise<T>
+): Promise<T> {
+    const previous = new Map<string, string | undefined>();
+    for (const [key, value] of Object.entries(overrides)) {
+        previous.set(key, process.env[key]);
+        process.env[key] = value;
+    }
+    try {
+        return await fn();
+    } finally {
+        for (const [key, value] of previous) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+}
+
 /** Wait until a predicate is true or the deadline passes. */
 async function waitFor(
     predicate: () => boolean,
@@ -109,9 +130,28 @@ async function waitFor(
     assert.ok(predicate(), label);
 }
 
+/**
+ * These tests drive real tmux sessions and need a git work tree to take the
+ * tmux path. Skip (rather than fail) where either is missing.
+ */
+const TMUX_AND_GIT_AVAILABLE = ((): boolean => {
+    try {
+        execSync("tmux -V", { stdio: "ignore" });
+        execSync("git --version", { stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+})();
+
+const TMUX_SUITE_OPTIONS = {
+    concurrency: 1,
+    skip: !TMUX_AND_GIT_AVAILABLE,
+};
+
 void describe(
     "tmux bash backgrounding — completion + backgroundAfter",
-    { concurrency: 1 },
+    TMUX_SUITE_OPTIONS,
     () => {
         beforeEach(() => {
             killTestSession();
@@ -161,6 +201,26 @@ void describe(
                     stalledJob?.status,
                     "running",
                     "detached tmux command must keep running, not be killed"
+                );
+                assert.equal(
+                    state.backgroundJobs.size,
+                    1,
+                    "the detached tmux command must be the only tracked job"
+                );
+                assert.equal(
+                    stalledJob?.isBackgrounded,
+                    true,
+                    "the detached tmux job must be marked as backgrounded"
+                );
+                // The window must actually still exist: the detach keeps the
+                // in-flight work alive instead of killing the window.
+                const tmuxCtx = getTmuxContext(stalledJob);
+                assert.ok(tmuxCtx, "detached tmux job must carry its context");
+                assert.ok(
+                    listWindows(tmuxCtx.session).some(
+                        (window) => window.id === tmuxCtx.windowId
+                    ),
+                    "the detached tmux window must still be alive"
                 );
                 assert.equal(
                     state.pendingDecisionJobId,
@@ -238,6 +298,185 @@ void describe(
                 undefined,
                 "completed tmux jobs must not leave the tool gate blocked"
             );
+        });
+
+        void it("does not let a later abort kill an already-detached tmux window", async () => {
+            const state = new TauState();
+            state.tmuxAvailable = true;
+            state.nonInteractive = true;
+            const { tool } = captureBashTool(state);
+            const controller = new AbortController();
+            let windowId: string | undefined;
+
+            await withEnv({ PI_TAU_STALL_WAKE_MS: "100" }, async () => {
+                const result = await tool.execute(
+                    "tc-tmux-detach-then-abort",
+                    { command: "tail -f /dev/null" },
+                    controller.signal,
+                    null,
+                    { cwd: TEST_RUN_DIR, ui: stubUi }
+                );
+                assert.match(
+                    (result.content[0] as { text: string }).text,
+                    /detached the still-running command to the background instead of killing it/
+                );
+                const job = [...state.backgroundJobs.values()].find(
+                    (candidate) => candidate.isBackgrounded
+                );
+                assert.ok(job, "detached tmux job must be tracked");
+                windowId = getTmuxContext(job)?.windowId;
+                assert.ok(
+                    windowId,
+                    "detached tmux job must carry its window id"
+                );
+
+                // The tool call is over; an abort now belongs to a later turn
+                // and must not reach back and kill the detached window.
+                controller.abort();
+            });
+
+            assert.ok(windowId);
+            // Give the tmux server a moment to reap the window if the abort did
+            // kill it, then require a definitive answer: an inconclusive query
+            // (undefined) must not be read as "the window is gone".
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            await waitFor(
+                () => {
+                    const windows = queryWindows(
+                        sessionNameForGitRoot(TEST_RUN_DIR)
+                    );
+                    return (
+                        windows === undefined ||
+                        windows.some((window) => window.id === windowId)
+                    );
+                },
+                3_000,
+                "aborting the finished tool call must not kill the detached tmux window"
+            );
+            assert.equal(
+                state.backgroundJobs.size,
+                1,
+                "the detached job must still be tracked after the abort"
+            );
+        });
+
+        void it("finalizes a tmux job whose window dies without a sentinel", async () => {
+            const state = new TauState();
+            state.tmuxAvailable = true;
+            const { tool } = captureBashTool(state);
+
+            await withEnv(
+                { PI_TAU_TMUX_LIVENESS_POLL_EVERY: "1" },
+                async () => {
+                    const result = await tool.execute(
+                        "tc-vanished",
+                        {
+                            command: "tail -f /dev/null",
+                            backgroundAfter: 1,
+                        },
+                        null,
+                        null,
+                        { cwd: TEST_RUN_DIR, ui: stubUi }
+                    );
+                    assert.match(
+                        String(
+                            (result.content[0] as { text?: string })?.text ?? ""
+                        ),
+                        /Process backgrounded as /
+                    );
+
+                    const job = [...state.backgroundJobs.values()].find(
+                        (candidate) => candidate.isBackgrounded
+                    );
+                    assert.ok(job, "backgrounded job must be tracked");
+                    const tmuxCtx = getTmuxContext(job);
+                    assert.ok(
+                        tmuxCtx,
+                        "backgrounded tmux job must carry context"
+                    );
+
+                    // Kill the window out from under the job without letting
+                    // the wrapper script write its exit-code sentinel — the
+                    // SIGKILL / kill-window / host-reboot case.
+                    execSync(`tmux kill-window -t ${tmuxCtx.windowId}`);
+
+                    // Polling only the sentinel left this job "running"
+                    // forever, and `jobs attach` would await a donePromise that
+                    // never resolves. It must reach terminal status instead.
+                    await waitFor(
+                        () => job.status !== "running",
+                        10_000,
+                        `vanished tmux job ${job.id} must reach terminal status ` +
+                            `(got status=${job.status})`
+                    );
+                    assert.equal(job.status, "failed");
+                    assert.equal(
+                        job.exitCode,
+                        undefined,
+                        "a vanished window has no exit code to report"
+                    );
+                }
+            );
+        });
+
+        void it("still kills a silent command in an interactive session (tmux)", async () => {
+            const state = new TauState();
+            state.tmuxAvailable = true;
+            state.nonInteractive = false;
+            const { tool } = captureBashTool(state);
+            const toolCallId = "tc-tmux-interactive-kill";
+            let windowId: string | undefined;
+
+            await withEnv(
+                {
+                    PI_TAU_STALL_WAKE_MS: "100",
+                    PI_TAU_INTERACTIVE_STALL_MARGIN_MS: "0",
+                },
+                async () => {
+                    const execution = tool.execute(
+                        toolCallId,
+                        {
+                            command: "tail -f /dev/null",
+                            backgroundAfter: 1,
+                        },
+                        null,
+                        null,
+                        { cwd: TEST_RUN_DIR, ui: stubUi }
+                    );
+                    // Orphan the foreground entry so the background/kill timer
+                    // has nothing to act on and the stall watchdog — the
+                    // interactive kill arm under test — is what ends it.
+                    setTimeout(() => {
+                        const job = [...state.backgroundJobs.values()].find(
+                            (candidate) => candidate.toolCallId === toolCallId
+                        );
+                        windowId = job
+                            ? getTmuxContext(job)?.windowId
+                            : undefined;
+                        state.runningProcesses.delete(toolCallId);
+                    }, 300);
+
+                    await assert.rejects(
+                        execution,
+                        /Possibly stuck: no output for 1s\. Killed tmux job/
+                    );
+                }
+            );
+
+            assert.ok(windowId, "the foreground tmux window must have existed");
+            assert.equal(
+                listWindows(sessionNameForGitRoot(TEST_RUN_DIR)).some(
+                    (window) => window.id === windowId
+                ),
+                false,
+                "the interactively stalled tmux window must be killed"
+            );
+            assert.equal(
+                state.backgroundJobs.size,
+                0,
+                "a killed tmux command must not linger as a tracked job"
+            );
+            assert.equal(state.runningProcesses.size, 0);
         });
 
         void it("settles the race after timeout-killing a disallowed command (24.7h stall regression)", async () => {

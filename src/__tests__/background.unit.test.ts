@@ -1889,6 +1889,17 @@ void describe("bash cwd validation", () => {
                 job,
                 "detached command must be registered as a background job"
             );
+            assert.equal(
+                state.backgroundJobs.size,
+                1,
+                "the detached command must be the only tracked job — the stale " +
+                    "foreground entry must not linger"
+            );
+            assert.equal(
+                job.isBackgrounded,
+                true,
+                "the detached job must be marked as backgrounded"
+            );
             assert.equal(job.status, "running");
             detachedPid = job.pid;
             assert.ok(detachedPid && detachedPid > 0);
@@ -2017,6 +2028,167 @@ void describe("bash cwd validation", () => {
             false,
             "notify:false must not expose an autonomous wake"
         );
+    });
+});
+
+void describe("bash tool — interactive stall kill safety net", () => {
+    /** Minimal UiContext stub: the 2s "Ctrl+B" hint timer needs ui.notify. */
+    const stallContext = {
+        cwd: process.cwd(),
+        ui: {
+            notify: () => {},
+            setWidget: () => {},
+            setStatus: () => {},
+        },
+    };
+
+    /** Run `fn` with temporary env overrides, restoring them afterwards. */
+    async function withEnv<T>(
+        overrides: Record<string, string>,
+        fn: () => Promise<T>
+    ): Promise<T> {
+        const previous = new Map<string, string | undefined>();
+        for (const [key, value] of Object.entries(overrides)) {
+            previous.set(key, process.env[key]);
+            process.env[key] = value;
+        }
+        try {
+            return await fn();
+        } finally {
+            for (const [key, value] of previous) {
+                if (value === undefined) delete process.env[key];
+                else process.env[key] = value;
+            }
+        }
+    }
+
+    /** Wait for a pid to disappear, so a SIGTERM/SIGKILL race is not flaky. */
+    async function waitUntilGone(
+        pid: number,
+        timeoutMs = 8_000
+    ): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            try {
+                process.kill(pid, 0);
+            } catch {
+                return true;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return false;
+    }
+
+    void it("still kills a silent command in an interactive session (direct spawn)", async () => {
+        const state = new TauState();
+        state.tmuxAvailable = false;
+        state.nonInteractive = false;
+        const bashTool = captureBashTool(state);
+        const toolCallId = "tc-interactive-stall-kill";
+        let killedPid: number | undefined;
+
+        await withEnv(
+            {
+                PI_TAU_STALL_WAKE_MS: "100",
+                PI_TAU_INTERACTIVE_STALL_MARGIN_MS: "0",
+            },
+            async () => {
+                const execution = bashTool.execute(
+                    toolCallId,
+                    { command: "tail -f /dev/null", backgroundAfter: 1 },
+                    undefined,
+                    undefined,
+                    stallContext
+                );
+
+                // Simulate the case the safety net exists for: a foreground
+                // command orphaned from its tracking entry, so the
+                // background/kill timer finds nothing to act on and only the
+                // stall watchdog can end it. (Also pins the interactive kill
+                // arm, which is otherwise shadowed by the background timer.)
+                setTimeout(() => {
+                    killedPid =
+                        state.runningProcesses.get(toolCallId)?.proc.pid;
+                    state.runningProcesses.delete(toolCallId);
+                }, 300);
+
+                await assert.rejects(
+                    execution,
+                    /Possibly stuck: no output for 1s\. Killed the command/
+                );
+            }
+        );
+
+        assert.ok(killedPid, "the foreground command must have been tracked");
+        assert.equal(
+            await waitUntilGone(killedPid),
+            true,
+            "the interactively stalled command must actually be killed"
+        );
+        assert.equal(
+            state.backgroundJobs.size,
+            0,
+            "an interactively killed command must not become a background job"
+        );
+        assert.equal(state.runningProcesses.size, 0);
+        assert.equal(state.currentlyRunningToolCallId, null);
+        assert.equal(
+            state.pendingDecisionJobId,
+            undefined,
+            "a killed command must not arm the job_decide gate"
+        );
+    });
+
+    void it("does not let a later abort kill an already-detached command", async () => {
+        const state = new TauState();
+        state.tmuxAvailable = false;
+        state.nonInteractive = true;
+        const bashTool = captureBashTool(state);
+        const controller = new AbortController();
+        let detachedPid: number | undefined;
+
+        await withEnv({ PI_TAU_STALL_WAKE_MS: "100" }, async () => {
+            const result = await bashTool.execute(
+                "tc-detach-then-abort",
+                { command: "tail -f /dev/null" },
+                controller.signal,
+                undefined,
+                stallContext
+            );
+            assert.match(
+                result.content[0].text,
+                /detached the still-running command to the background/
+            );
+            detachedPid = [...state.backgroundJobs.values()].find(
+                (job) => job.command === "tail -f /dev/null"
+            )?.pid;
+
+            // The tool call is over; an abort now belongs to a later turn
+            // and must not reach back and SIGTERM the background job.
+            controller.abort();
+        });
+
+        try {
+            assert.ok(detachedPid && detachedPid > 0);
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            assert.doesNotThrow(
+                () => process.kill(detachedPid!, 0),
+                "aborting the finished tool call must not kill the detached job"
+            );
+        } finally {
+            if (detachedPid) {
+                try {
+                    process.kill(-detachedPid, "SIGKILL");
+                } catch {
+                    /* already gone */
+                }
+                try {
+                    process.kill(detachedPid, "SIGKILL");
+                } catch {
+                    /* already gone */
+                }
+            }
+        }
     });
 });
 

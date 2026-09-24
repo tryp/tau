@@ -94,16 +94,17 @@ import {
     detectBlockedSleep,
     formatDuration,
     generateJobId,
-    INTERACTIVE_STALL_WAKE_MARGIN_MS,
     isAutoBackgroundAllowed,
     killProcessGroup,
     logPathForJob,
+    MIN_STALL_CHECK_INTERVAL_MS,
     looksLikePrompt,
     markJobTerminal,
     readOutputTail,
     readOutputTailSync,
     resolveBackgroundAfterMs,
     resolveExplicitBackgroundAfterMs,
+    resolveInteractiveStallWakeMarginMs,
     resolveNonInteractiveStallWakeMs,
     scheduleSigkillFallback,
     formatJobLine,
@@ -203,7 +204,23 @@ export function startNoOutputWatchdog(
     onStall: () => void,
     checkIntervalMs = STALL_CHECK_INTERVAL_MS
 ): () => void {
+    // Poll at least as often as the budget being measured: a budget shorter
+    // than the interval could not be honored (PI_TAU_STALL_WAKE_MS=1000 with
+    // the 5s default was only detected after two polls, ~10s). The floor keeps
+    // a pathologically small budget from becoming a busy loop.
+    const intervalMs = Math.max(
+        MIN_STALL_CHECK_INTERVAL_MS,
+        Math.min(checkIntervalMs, stallMs)
+    );
+    // Baseline with the size already in the log: bytes that were there when
+    // the watchdog was armed are not growth. Starting at -1 made the first
+    // poll look like growth and delayed every detection by one full interval.
     let lastSize = -1;
+    try {
+        lastSize = statSync(logPath).size;
+    } catch {
+        // Log not created yet — counts as no output.
+    }
     let lastGrowth = Date.now();
     const timer = setInterval(() => {
         let size: number | undefined;
@@ -221,7 +238,7 @@ export function startNoOutputWatchdog(
             clearInterval(timer);
             onStall();
         }
-    }, checkIntervalMs);
+    }, intervalMs);
     timer.unref();
     return () => clearInterval(timer);
 }
@@ -298,16 +315,42 @@ function sendQueuedMessage(
 
 // ─── Stall watchdog ─────────────────────────────────────────────────
 
+export interface StallWatchdogOptions {
+    /**
+     * Suppress the "no output" notice until the job has produced output at
+     * least once *after* the watchdog was armed.
+     *
+     * A job detached because it had already gone silent was surfaced to the
+     * agent by the detach notice itself. Re-announcing the same silence one
+     * threshold later only produces a second, contradictory "keep it or kill
+     * it" prompt — and in non-interactive sessions it points at the
+     * job_decide gate this code deliberately leaves disarmed. Oversize
+     * termination and interactive-prompt detection are unaffected.
+     */
+    silenceNoticeOnlyAfterGrowth?: boolean;
+}
+
 export function startStallWatchdog(
     jobId: string,
     command: string,
     logPath: string,
     pi: ExtensionAPI,
     state: TauState,
-    onOversize?: () => void
+    onOversize?: () => void,
+    options?: StallWatchdogOptions
 ): () => void {
+    // Seed the baseline with the current size so "growth" means output
+    // produced after the watchdog was armed. Starting from 0 would make a log
+    // that already had content look like it grew on the first tick, defeating
+    // `silenceNoticeOnlyAfterGrowth`.
     let lastSize = 0;
+    try {
+        lastSize = statSync(logPath).size;
+    } catch {
+        /* log not created yet */
+    }
     let lastGrowth = Date.now();
+    let sawGrowth = false;
     let cancelled = false;
 
     const timer = setInterval(() => {
@@ -347,17 +390,31 @@ export function startStallWatchdog(
             if (size > lastSize) {
                 lastSize = size;
                 lastGrowth = Date.now();
+                sawGrowth = true;
                 return;
             }
             if (Date.now() - lastGrowth < STALL_THRESHOLD_MS) return;
 
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
+            const promptLike = looksLikePrompt(tail);
+            // A job detached *because* it had gone silent was already surfaced
+            // by the detach notice; repeating that same fact one threshold later
+            // only adds a contradictory keep/kill prompt. An interactive prompt
+            // is different information and always fires. Stay armed (no cancel)
+            // so output-then-silence is still announced.
+            if (
+                !promptLike &&
+                options?.silenceNoticeOnlyAfterGrowth &&
+                !sawGrowth
+            ) {
+                return;
+            }
 
             cancelled = true;
             clearInterval(timer);
 
             const suffix = outstandingJobsSuffix(state, jobId);
-            if (looksLikePrompt(tail)) {
+            if (promptLike) {
                 const summary =
                     `Background job ${jobId} appears to be waiting for interactive input.\n` +
                     `Command: ${command}\n\n` +
@@ -1508,7 +1565,8 @@ export function registerBackgroundJob(
     toolCallId: string,
     state: TauState,
     pi: ExtensionAPI,
-    ctx: UiContext
+    ctx: UiContext,
+    options?: StallWatchdogOptions
 ): BackgroundJob {
     const jobId = generateJobId(++state.jobCounter);
 
@@ -1550,7 +1608,8 @@ export function registerBackgroundJob(
             silenceJobAfterKill(job);
             cancelQueuedBackgroundNotifications(pi, job.id);
             state.wakeupEvaluate?.();
-        }
+        },
+        options
     );
 
     proc.on("close", (code) => {
@@ -1877,12 +1936,14 @@ export function registerBackgroundJobs(
                 });
             });
 
-            // Abort handler
-            if (signal) {
-                signal.addEventListener("abort", () => {
-                    killProcessGroup(proc.pid!, "SIGTERM");
-                });
-            }
+            // Abort handler. Detached below once the command becomes a
+            // background job: an abort belongs to the tool call waiting on the
+            // foreground command, not to the job it turned into. Leaving it
+            // attached let a later turn's abort SIGTERM a healthy detached job.
+            const onAbort = (): void => {
+                killProcessGroup(proc.pid!, "SIGTERM");
+            };
+            if (signal) signal.addEventListener("abort", onAbort);
 
             // Explicit per-call delay (sanitized: NaN/negative fall back to
             // the configured default); hoisted so the stall watchdog below
@@ -2003,7 +2064,8 @@ export function registerBackgroundJobs(
                     ? resolveNonInteractiveStallWakeMs()
                     : Math.max(
                           resolveNonInteractiveStallWakeMs(),
-                          foregroundTimeoutMs + INTERACTIVE_STALL_WAKE_MARGIN_MS
+                          foregroundTimeoutMs +
+                              resolveInteractiveStallWakeMarginMs()
                       );
                 cancelNoOutputWatchdog = startNoOutputWatchdog(
                     logPath,
@@ -2074,7 +2136,14 @@ export function registerBackgroundJobs(
                         toolCallId,
                         state,
                         pi,
-                        ctx
+                        ctx,
+                        {
+                            // A stall detach already told the agent the job is
+                            // silent; only re-announce silence after it has
+                            // produced output and gone quiet again.
+                            silenceNoticeOnlyAfterGrowth:
+                                raceResult.type === "stalled",
+                        }
                     );
 
                     // Remove stale foreground entry created earlier — same process,
@@ -2154,6 +2223,7 @@ export function registerBackgroundJobs(
                 clearTimeout(timer);
                 clearTimeout(hintTimer);
                 cancelNoOutputWatchdog?.();
+                signal?.removeEventListener("abort", onAbort);
             }
         },
     });
@@ -3129,13 +3199,13 @@ async function executeTmuxForeground(
 
     // Abort handler — kill tmux window and settle the race at once. Without
     // the killed signal an aborted call would pend until the stall watchdog
-    // (up to 4 min) instead of failing fast.
-    if (signal) {
-        signal.addEventListener("abort", () => {
-            killTmuxJob(job);
-            triggerKilled("aborted");
-        });
-    }
+    // (up to 4 min) instead of failing fast. Detached below when the command
+    // becomes a background job so a later abort cannot kill it.
+    const onAbort = (): void => {
+        killTmuxJob(job);
+        triggerKilled("aborted");
+    };
+    if (signal) signal.addEventListener("abort", onAbort);
 
     // Timeout timer — matches the direct-spawn path: backgroundAfter
     // overrides the default timeout, so `backgroundAfter=300` actually
@@ -3288,7 +3358,7 @@ async function executeTmuxForeground(
             ? resolveNonInteractiveStallWakeMs()
             : Math.max(
                   resolveNonInteractiveStallWakeMs(),
-                  timeoutMs + INTERACTIVE_STALL_WAKE_MARGIN_MS
+                  timeoutMs + resolveInteractiveStallWakeMarginMs()
               );
         cancelNoOutputWatchdog = startNoOutputWatchdog(
             logPath,
@@ -3352,12 +3422,17 @@ async function executeTmuxForeground(
             clearInterval(checkTimer);
             clearTimeout(timer);
             clearTimeout(hintTimer);
+            cancelNoOutputWatchdog?.();
             state.runningProcesses.delete(toolCallId);
             if (state.currentlyRunningToolCallId === toolCallId) {
                 state.currentlyRunningToolCallId = null;
             }
             silenceJobAfterKill(job);
             killTmuxJob(job);
+            // Drop the foreground entry like the direct-spawn stall kill and
+            // the `killed` arm do: leaving a terminal job in the map made the
+            // killed command linger in job listings.
+            state.backgroundJobs.delete(jobId);
             // No SIGKILL fallback here: tmux jobs carry a pid -1 sentinel,
             // not a real process — the window kill above is the escalation.
             updateWidget(state, ctx);
@@ -3399,6 +3474,12 @@ async function executeTmuxForeground(
                 state,
                 () => {
                     killTmuxJob(job);
+                },
+                {
+                    // A stall detach already told the agent the job is silent;
+                    // only re-announce silence after it has produced output and
+                    // gone quiet again.
+                    silenceNoticeOnlyAfterGrowth: raceResult.type === "stalled",
                 }
             );
 
@@ -3408,12 +3489,16 @@ async function executeTmuxForeground(
                 if (!result.completed) return;
                 clearInterval(bgPoller);
                 cancelStall();
+                // A vanished window reports no exit code; leave exitCode
+                // undefined rather than fabricating one.
                 markJobTerminal(
                     job,
-                    result.exitCode === 0 || result.exitCode === null
-                        ? "completed"
-                        : "failed",
-                    result.exitCode ?? 0
+                    result.vanished
+                        ? "failed"
+                        : result.exitCode === 0 || result.exitCode === null
+                          ? "completed"
+                          : "failed",
+                    result.vanished ? undefined : (result.exitCode ?? 0)
                 );
                 clearPendingDecision(state, job);
                 void trackJobOutputIndex(job, ctx, "bash_bg");
@@ -3499,6 +3584,7 @@ async function executeTmuxForeground(
         clearTimeout(timer);
         clearTimeout(hintTimer);
         cancelNoOutputWatchdog?.();
+        signal?.removeEventListener("abort", onAbort);
     }
 }
 

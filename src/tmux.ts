@@ -9,7 +9,7 @@
  * no polling subsystem, no window option tagging.
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
     chmodSync,
@@ -84,9 +84,43 @@ export interface TmuxWindow {
  * Returns empty array if the session does not exist.
  */
 export function listWindows(session: string): TmuxWindow[] {
-    const raw = execSafe(
-        `tmux list-windows -t ${shellQuote(session)} -F '#{window_id}|||#{window_index}|||#{window_name}'`
+    return queryWindows(session) ?? [];
+}
+
+/** Default timeout for a tmux window query (fast local command). */
+export const TMUX_QUERY_TIMEOUT_MS = 10_000;
+
+/**
+ * List windows, distinguishing "no such session" from "the query could not
+ * run". `listWindows` collapses both into an empty array, which is fine for
+ * display but not for deciding that a window has *vanished*: a transient tmux
+ * failure (spawn error, timeout, resource exhaustion) would look identical to
+ * a killed window and finalize a live job. Returns undefined when the query
+ * itself failed, so callers can retry instead of concluding anything.
+ *
+ * `spawnSync` blocks the event loop, so callers running inside a poller should
+ * pass a short timeout.
+ */
+export function queryWindows(
+    session: string,
+    timeoutMs = TMUX_QUERY_TIMEOUT_MS
+): TmuxWindow[] | undefined {
+    const result = spawnSync(
+        "tmux",
+        [
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_id}|||#{window_index}|||#{window_name}",
+        ],
+        { encoding: "utf-8", timeout: timeoutMs }
     );
+    // `error` means tmux itself could not be run (ENOENT/EAGAIN/timeout). A
+    // non-zero status is a real answer: tmux ran and reported no such session
+    // or no server.
+    if (result.error) return undefined;
+    const raw = (result.stdout ?? "").trim();
     if (!raw) return [];
     return raw.split("\n").map((line) => {
         const [id, index, title] = line.split("|||");

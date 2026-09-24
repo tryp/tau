@@ -42,6 +42,12 @@ export function resolveBackgroundAfterMs(
     return DEFAULT_TIMEOUT_MS;
 }
 export const STALL_CHECK_INTERVAL_MS = 5_000;
+/**
+ * Floor for the no-output watchdog's poll interval. A stall budget shorter
+ * than the poll interval could not be honored, so the watchdog polls at least
+ * as often as its budget — but never in a busy loop.
+ */
+export const MIN_STALL_CHECK_INTERVAL_MS = 50;
 export const STALL_THRESHOLD_MS = 45_000;
 export const STALL_TAIL_BYTES = 1024;
 export const MAX_OUTPUT_PREVIEW_CHARS = 12_000;
@@ -51,8 +57,25 @@ export const MAX_LOG_BYTES = 100 * 1024 * 1024; // 100 MiB
  * Margin keeping the interactive stall watchdog behind the background/kill
  * timer: with an explicit long backgroundAfter, the watchdog fires a minute
  * after the timer instead of killing a command the user asked to keep.
+ * Override with PI_TAU_INTERACTIVE_STALL_MARGIN_MS (milliseconds); 0 makes the
+ * safety net fire as soon as the background/kill timer does, which is how the
+ * interactive kill arms are exercised in tests.
  */
 export const INTERACTIVE_STALL_WAKE_MARGIN_MS = 60_000;
+
+export function resolveInteractiveStallWakeMarginMs(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = env.PI_TAU_INTERACTIVE_STALL_MARGIN_MS;
+    if (raw !== undefined) {
+        const normalized = raw.trim();
+        if (/^\d+$/.test(normalized)) {
+            const parsed = Number(normalized);
+            if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+        }
+    }
+    return INTERACTIVE_STALL_WAKE_MARGIN_MS;
+}
 /**
  * Non-interactive sessions (subagent workers, `pi -p`) never auto-background a
  * foreground command — the auto-background timer deliberately no-ops there —

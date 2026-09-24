@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import {
     killWindow,
+    listWindows,
+    queryWindows,
     sessionExists,
     spawnInTmux,
     captureOutput,
@@ -60,7 +62,26 @@ async function waitForExitCode(
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
-void describe("tmux window lifecycle", { concurrency: 1 }, () => {
+/**
+ * These tests create real tmux sessions and need git for the session name;
+ * skip (rather than fail) where either is missing.
+ */
+const TMUX_AND_GIT_AVAILABLE = ((): boolean => {
+    try {
+        execSync("tmux -V", { stdio: "ignore" });
+        execSync("git --version", { stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+})();
+
+const TMUX_SUITE_OPTIONS = {
+    concurrency: 1,
+    skip: !TMUX_AND_GIT_AVAILABLE,
+};
+
+void describe("tmux window lifecycle", TMUX_SUITE_OPTIONS, () => {
     beforeEach(() => {
         cleanup();
         mkdirSync(TEST_RUN_DIR, { recursive: true });
@@ -69,6 +90,53 @@ void describe("tmux window lifecycle", { concurrency: 1 }, () => {
         cleanup();
     });
 
+    void it("queryWindows separates a missing session from a failed query", async () => {
+        // A missing session is a real answer: tmux ran and found nothing, so a
+        // window that used to be there has vanished.
+        assert.deepEqual(
+            queryWindows("pi-test-definitely-missing"),
+            [],
+            "a missing session must report an empty window list, not undefined"
+        );
+
+        // A query that could not run at all is not an answer: collapsing it
+        // into [] is what let a transient tmux failure finalize a live job.
+        // This direction must stay distinguishable from the one above.
+        const originalPath = process.env.PATH;
+        try {
+            process.env.PATH = "/nonexistent-tmux-path";
+            assert.equal(
+                queryWindows(TEST_SESSION),
+                undefined,
+                "a failed query must report undefined, not an empty window list"
+            );
+            assert.deepEqual(
+                listWindows(TEST_SESSION),
+                [],
+                "listWindows stays the display-friendly wrapper"
+            );
+        } finally {
+            process.env.PATH = originalPath;
+        }
+
+        // A live session reports its windows, which is what keeps a healthy
+        // background job from being finalized as vanished.
+        const result = spawnInTmux(
+            "tail -f /dev/null",
+            "/tmp",
+            TEST_RUN_DIR,
+            TEST_SESSION
+        );
+        const windows = queryWindows(TEST_SESSION);
+        assert.ok(windows, "a live session's window list must be readable");
+        assert.equal(windows.length, 1);
+        assert.equal(windows[0]?.id, result.windowId);
+        assert.deepEqual(
+            listWindows(TEST_SESSION),
+            windows,
+            "listWindows must stay the display-friendly wrapper"
+        );
+    });
     void it("session auto-destroys when command script exits", async () => {
         const result = spawnInTmux(
             "echo hello",
