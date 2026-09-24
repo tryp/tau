@@ -1206,6 +1206,46 @@ void describe(
             );
         });
 
+        void it("preserves a newer tool-call owner instead of clearing it", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
+
+            const state = new TauState();
+            state.currentlyRunningToolCallId = "newer-tool-call";
+            const proc = mockProc(-77779);
+
+            const pi = {
+                registerTool() {},
+                sendMessage() {},
+            } as never;
+
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+
+            _rbg(
+                proc,
+                "/tmp/test-bg-owner.log",
+                "echo hello",
+                "tc-bg-older",
+                state,
+                pi,
+                ctx
+            );
+
+            assert.equal(
+                state.currentlyRunningToolCallId,
+                "newer-tool-call",
+                "a concurrent call's ownership must survive backgrounding"
+            );
+            proc.emitClose(0);
+        });
+
         void it("marks job as failed on non-zero exit", async () => {
             const { registerBackgroundJob: _rbg } =
                 await import("../features/background.ts");
@@ -1800,28 +1840,75 @@ void describe("bash cwd validation", () => {
         assert.equal(state.backgroundJobs.size, 0);
     });
 
-    void it("wakes a silent non-interactive direct-spawn command", async () => {
+    void it("detaches, not kills, a silent non-interactive direct-spawn command", async () => {
         const state = new TauState();
         state.tmuxAvailable = false;
         state.nonInteractive = true;
         const bashTool = captureBashTool(state);
         const previousWakeMs = process.env.PI_TAU_STALL_WAKE_MS;
         process.env.PI_TAU_STALL_WAKE_MS = "100";
-        const context = { cwd: process.cwd(), ui: { notify: () => {} } };
+        const context = {
+            cwd: process.cwd(),
+            ui: {
+                notify: () => {},
+                setWidget: () => {},
+                setStatus: () => {},
+            },
+        };
 
+        let detachedPid: number | undefined;
         try {
-            await assert.rejects(
-                bashTool.execute(
-                    "tc-stall-wake-direct",
-                    { command: "tail -f /dev/null" },
-                    undefined,
-                    undefined,
-                    context
-                ),
-                /Possibly stuck: no output.*bash_bg/s
+            const result = await bashTool.execute(
+                "tc-stall-detach-direct",
+                { command: "tail -f /dev/null" },
+                undefined,
+                undefined,
+                context
             );
-            assert.equal(state.runningProcesses.size, 0);
+            const text = result.content[0].text;
+            assert.match(
+                text,
+                /detached the still-running command to the background instead of killing it/
+            );
+            assert.match(text, /Process backgrounded as /);
+            assert.equal(
+                state.runningProcesses.size,
+                0,
+                "detached command must leave no foreground running process"
+            );
+            assert.equal(
+                state.pendingDecisionJobId,
+                undefined,
+                "non-interactive sessions must not arm the job_decide gate"
+            );
+
+            const job = [...state.backgroundJobs.values()].find(
+                (candidate) => candidate.command === "tail -f /dev/null"
+            );
+            assert.ok(
+                job,
+                "detached command must be registered as a background job"
+            );
+            assert.equal(job.status, "running");
+            detachedPid = job.pid;
+            assert.ok(detachedPid && detachedPid > 0);
+            assert.doesNotThrow(
+                () => process.kill(detachedPid!, 0),
+                "detached process must still be alive (not killed)"
+            );
         } finally {
+            if (detachedPid) {
+                try {
+                    process.kill(-detachedPid, "SIGKILL");
+                } catch {
+                    /* already gone */
+                }
+                try {
+                    process.kill(detachedPid, "SIGKILL");
+                } catch {
+                    /* already gone */
+                }
+            }
             if (previousWakeMs === undefined)
                 delete process.env.PI_TAU_STALL_WAKE_MS;
             else process.env.PI_TAU_STALL_WAKE_MS = previousWakeMs;

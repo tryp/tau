@@ -58,8 +58,10 @@ export const INTERACTIVE_STALL_WAKE_MARGIN_MS = 60_000;
  * foreground command — the auto-background timer deliberately no-ops there —
  * so a command that goes silent would block the agent loop forever (observed:
  * a 14h session hang caused by a deadlocked test binary). After this much
- * output silence, the command is killed and a possibly-stuck notice is
- * returned as the tool result so the agent can decide what to do next.
+ * output silence, the still-running command is detached to the background (it
+ * keeps running) and a notice is returned as the tool result, so the agent is
+ * woken to check on it without destroying in-flight work. Interactive
+ * sessions keep kill semantics for this safety net.
  * Override with PI_TAU_STALL_WAKE_MS (milliseconds).
  */
 export const NONINTERACTIVE_STALL_WAKE_MS = 240_000;

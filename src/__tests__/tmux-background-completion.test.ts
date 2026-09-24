@@ -123,7 +123,7 @@ void describe(
             rmSync(TEST_RUN_DIR, { recursive: true, force: true });
         });
 
-        void it("wakes non-interactive silent tmux commands and preserves a newer tool owner", async () => {
+        void it("detaches non-interactive silent tmux commands and preserves a newer tool owner", async () => {
             const state = new TauState();
             state.tmuxAvailable = true;
             state.nonInteractive = true;
@@ -133,7 +133,7 @@ void describe(
 
             try {
                 const execution = tool.execute(
-                    "tc-stall-wake-tmux",
+                    "tc-stall-detach-tmux",
                     { command: "tail -f /dev/null" },
                     null,
                     null,
@@ -143,9 +143,11 @@ void describe(
                     state.currentlyRunningToolCallId = "newer-tool-call";
                 }, 100);
 
-                await assert.rejects(
-                    execution,
-                    /Possibly stuck: no output.*bash_bg/s
+                const result = await execution;
+                const first = result.content[0] as { text: string };
+                assert.match(
+                    first.text,
+                    /detached the still-running command to the background instead of killing it/
                 );
                 assert.equal(
                     state.currentlyRunningToolCallId,
@@ -155,7 +157,16 @@ void describe(
                 const stalledJob = [...state.backgroundJobs.values()].find(
                     (job) => job.command === "tail -f /dev/null"
                 );
-                assert.equal(stalledJob?.status, "killed");
+                assert.equal(
+                    stalledJob?.status,
+                    "running",
+                    "detached tmux command must keep running, not be killed"
+                );
+                assert.equal(
+                    state.pendingDecisionJobId,
+                    undefined,
+                    "non-interactive sessions must not arm the job_decide gate"
+                );
             } finally {
                 if (previousWakeMs === undefined)
                     delete process.env.PI_TAU_STALL_WAKE_MS;

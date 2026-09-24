@@ -1532,7 +1532,12 @@ export function registerBackgroundJob(
     } else {
         state.backgroundJobs.set(jobId, job);
     }
-    state.currentlyRunningToolCallId = null;
+    // Only release ownership this call actually holds: a concurrent tool call
+    // may have overwritten the global owner, and clearing it would break
+    // Ctrl+B targeting for the newer call.
+    if (state.currentlyRunningToolCallId === toolCallId) {
+        state.currentlyRunningToolCallId = null;
+    }
 
     const cancelStall = startStallWatchdog(
         jobId,
@@ -2020,7 +2025,13 @@ export function registerBackgroundJobs(
                     })),
                 ]);
 
-                if (raceResult.type === "stalled") {
+                // Interactive sessions keep kill semantics: the auto-background
+                // timer normally wins long before this safety net, so a stall
+                // here means a SIGTERM-ignoring or unmanageable process. In
+                // non-interactive sessions the command is instead detached to
+                // the background (it keeps running) so the agent is woken to
+                // check on it without destroying in-flight work.
+                if (raceResult.type === "stalled" && !state.nonInteractive) {
                     clearInterval(pollTimer);
                     clearTimeout(timer);
                     clearTimeout(hintTimer);
@@ -2045,7 +2056,10 @@ export function registerBackgroundJobs(
                     );
                 }
 
-                if (raceResult.type === "backgrounded") {
+                if (
+                    raceResult.type === "backgrounded" ||
+                    raceResult.type === "stalled"
+                ) {
                     // Clean up foreground state
                     clearInterval(pollTimer);
                     clearTimeout(timer);
@@ -2067,7 +2081,17 @@ export function registerBackgroundJobs(
                     // separate job ID that would otherwise stay in state forever.
                     state.backgroundJobs.delete(jobId);
 
-                    state.pendingDecisionJobId = job.id;
+                    // Non-interactive sessions have no UI to answer the
+                    // job_decide gate, so never arm it there: it would block
+                    // every subsequent tool call.
+                    if (!state.nonInteractive) {
+                        state.pendingDecisionJobId = job.id;
+                    }
+
+                    const silenceNotice =
+                        raceResult.type === "stalled"
+                            ? `No output for ${formatDuration(stallWakeMs)}; detached the still-running command to the background instead of killing it.\n`
+                            : "";
 
                     // The tool result below is the authoritative backgrounding
                     // notice. Do not enqueue a second model turn with the same
@@ -2076,7 +2100,9 @@ export function registerBackgroundJobs(
                         content: [
                             {
                                 type: "text" as const,
-                                text: `Process backgrounded as ${job.id}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}`,
+                                text:
+                                    silenceNotice +
+                                    `Process backgrounded as ${job.id}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}`,
                             },
                         ],
                         details: undefined,
@@ -3316,7 +3342,12 @@ async function executeTmuxForeground(
             );
         }
 
-        if (raceResult.type === "stalled") {
+        // Interactive sessions keep kill semantics: the auto-background timer
+        // normally wins long before this safety net, so a stall here means a
+        // SIGTERM-ignoring or unmanageable window. Non-interactive sessions
+        // instead detach the still-running window to the background so the
+        // agent is woken to check on it without destroying in-flight work.
+        if (raceResult.type === "stalled" && !state.nonInteractive) {
             clearInterval(pollTimer);
             clearInterval(checkTimer);
             clearTimeout(timer);
@@ -3340,7 +3371,10 @@ async function executeTmuxForeground(
             );
         }
 
-        if (raceResult.type === "backgrounded") {
+        if (
+            raceResult.type === "backgrounded" ||
+            raceResult.type === "stalled"
+        ) {
             clearInterval(pollTimer);
             clearInterval(checkTimer);
             clearTimeout(timer);
@@ -3350,7 +3384,9 @@ async function executeTmuxForeground(
             // Mark as backgrounded — the completion poller in bash-tmux will handle notification.
             // Start the background completion poller.
             job.isBackgrounded = true;
-            state.currentlyRunningToolCallId = null;
+            if (state.currentlyRunningToolCallId === toolCallId) {
+                state.currentlyRunningToolCallId = null;
+            }
 
             // Start stall watchdog and cancel it when the completion poller
             // observes terminal state. Otherwise completed jobs emit stale
@@ -3386,17 +3422,29 @@ async function executeTmuxForeground(
             }, 500);
             bgPoller.unref();
 
-            state.pendingDecisionJobId = jobId;
+            // Non-interactive sessions have no UI to answer the job_decide
+            // gate, so never arm it there: it would block every subsequent
+            // tool call.
+            if (!state.nonInteractive) {
+                state.pendingDecisionJobId = jobId;
+            }
 
             // The tool result below is the authoritative backgrounding
             // notice. Do not enqueue a duplicate model turn.
             updateWidget(state, ctx);
 
+            const silenceNotice =
+                raceResult.type === "stalled"
+                    ? `No output for ${formatDuration(stallWakeMs)}; detached the still-running command to the background instead of killing it.\n`
+                    : "";
+
             return {
                 content: [
                     {
                         type: "text" as const,
-                        text: `Process backgrounded as ${jobId}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}`,
+                        text:
+                            silenceNotice +
+                            `Process backgrounded as ${jobId}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}`,
                     },
                 ],
                 details: undefined,
