@@ -101,6 +101,16 @@ void describe("stale run dir cleanup", () => {
         );
     });
 
+    void it("retains a dir with a recently written job log", () => {
+        const dir = makeRunDir("pi-tmux-334", 48 * HOUR_MS, "old output");
+        const log = join(dir, "pi-bg-job.out");
+        const recentStamp = (NOW_MS - HOUR_MS) / 1000;
+        utimesSync(log, recentStamp, recentStamp);
+        cleanup();
+        assert.equal(existsSync(dir), true);
+        assert.equal(readFileSync(log, "utf-8"), "old output");
+    });
+
     void it("removes a dead process's run dir older than the retention window", () => {
         const dir = makeRunDir("pi-tmux-333", RUN_DIR_RETENTION_MS + HOUR_MS);
         cleanup();
@@ -135,6 +145,15 @@ void describe("stale run dir cleanup", () => {
         cleanup({ retentionMs: 0 });
         assert.equal(existsSync(unrelated), true);
         assert.equal(existsSync(unattributable), true);
+    });
+
+    void it("leaves entries with oversized numeric pid suffixes untouched", () => {
+        const dir = makeRunDir(
+            "pi-tmux-999999999999999999999999",
+            48 * HOUR_MS
+        );
+        cleanup({ retentionMs: 0 });
+        assert.equal(existsSync(dir), true);
     });
 
     void it("keeps a dir that disappears mid-scan and continues the scan", () => {
@@ -212,6 +231,29 @@ void describe("orphaned tmux session reaping", () => {
     void it("keeps pi-bg sessions that still have a live pane", () => {
         const { calls, runTmux } = tmuxWithPanes("4242\n4243\n");
         cleanup({ runTmux, isAlive: (pid) => pid === 4243 });
+        assert.equal(
+            calls.some((command) => command.startsWith("tmux kill-session")),
+            false
+        );
+    });
+
+    void it("does not kill sessions when pane output is blank or malformed", () => {
+        for (const panes of ["", "not-a-pid\n"]) {
+            const { calls, runTmux } = tmuxWithPanes(panes);
+            cleanup({ runTmux });
+            assert.equal(
+                calls.some((command) =>
+                    command.startsWith("tmux kill-session")
+                ),
+                false,
+                `must preserve session for pane output ${JSON.stringify(panes)}`
+            );
+        }
+    });
+
+    void it("does not kill sessions with mixed live and malformed pane pids", () => {
+        const { calls, runTmux } = tmuxWithPanes("4242\nmalformed\n");
+        cleanup({ runTmux, isAlive: (pid) => pid === 4242 });
         assert.equal(
             calls.some((command) => command.startsWith("tmux kill-session")),
             false

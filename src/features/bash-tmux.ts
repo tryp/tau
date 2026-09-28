@@ -10,7 +10,7 @@
  * child-process spawning when tmux is absent.
  */
 
-import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -129,15 +129,39 @@ function execTmux(command: string): string {
  * deleting what cannot be inspected is what destroyed the forensic record this
  * retention window exists to preserve.
  */
-function isReapable(dir: string, nowMs: number, retentionMs: number): boolean {
-    let mtimeMs: number;
+function newestMtimeMs(path: string): number | undefined {
+    let info;
     try {
-        mtimeMs = statSync(dir).mtimeMs;
+        // lstat avoids following symlinks out of the run directory or looping
+        // through a symlink cycle. Run dirs are small, so this startup walk is
+        // bounded by the number of job artifacts they contain.
+        info = lstatSync(path);
     } catch {
-        // Raced with another pi process reaping it — nothing to remove.
-        return false;
+        // An unreadable or concurrently removed entry makes age unknown.
+        return undefined;
     }
-    return nowMs - mtimeMs >= retentionMs;
+
+    let newest = info.mtimeMs;
+    if (!info.isDirectory()) return newest;
+
+    let entries: string[];
+    try {
+        entries = readdirSync(path);
+    } catch {
+        return undefined;
+    }
+    for (const entry of entries) {
+        const childMtimeMs = newestMtimeMs(join(path, entry));
+        if (childMtimeMs === undefined) return undefined;
+        newest = Math.max(newest, childMtimeMs);
+    }
+    return newest;
+}
+
+function isReapable(dir: string, nowMs: number, retentionMs: number): boolean {
+    const newest = newestMtimeMs(dir);
+    if (newest === undefined) return false;
+    return nowMs - newest >= retentionMs;
 }
 
 /**
@@ -158,13 +182,22 @@ function reapOrphanedTmuxSessions(
             .split("\n")
             .filter((s) => s.startsWith("pi-bg-"));
         for (const session of sessions) {
-            const panePids = runTmux(
+            const paneOutput = runTmux(
                 `tmux list-panes -t ${session} -F '#{pane_pid}'`
-            )
-                .trim()
-                .split("\n")
-                .map((p) => parseInt(p, 10));
-            const allDead = panePids.every((pid) => !isAlive(pid));
+            ).trim();
+            if (!paneOutput) continue;
+            const panePids = paneOutput.split("\n").map((rawPid) => {
+                const value = rawPid.trim();
+                if (!/^\d+$/.test(value)) return undefined;
+                const pid = Number(value);
+                return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+            });
+            // Missing or malformed pane data is unknown, not proof that the
+            // session is orphaned. Never kill a session on an uncertain parse.
+            if (panePids.some((pid) => pid === undefined)) continue;
+            const allDead =
+                panePids.length > 0 &&
+                panePids.every((pid) => pid !== undefined && !isAlive(pid));
             if (allDead) {
                 runTmux(`tmux kill-session -t ${session}`);
             }
@@ -212,6 +245,7 @@ export function cleanupStaleTmuxRunDirs(
         // directory: an entry we cannot attribute is not ours to delete.
         if (!/^\d+$/.test(suffix)) continue;
         const pid = Number(suffix);
+        if (!Number.isSafeInteger(pid) || pid <= 0) continue;
         if (pid === process.pid) continue;
         if (isAlive(pid)) continue; // still running — never touch
         const dir = join(rootDir, entry);
