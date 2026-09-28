@@ -148,6 +148,11 @@ void describe("job_decide — pendingDecisionJobId cleanup", () => {
             `Expected keep message, got: ${result.content[0].text}`
         );
         assert.equal(state.pendingDecisionJobId, undefined);
+        assert.equal(
+            job.wantsCompletionNotification,
+            true,
+            "keep must request the completion notice"
+        );
     });
 
     void it("clears pendingDecisionJobId on kill of non-existent job", async () => {
@@ -1513,6 +1518,77 @@ void describe(
             };
             assert.equal(msg.customType, "job-completion");
             assert.ok(msg.content.includes(job2.id));
+        });
+
+        void it("wakes the agent for a kept auto-backgrounded job's successful completion", async () => {
+            const { registerBackgroundJob: _rbg } =
+                await import("../features/background.ts");
+
+            const state = new TauState();
+            // captureJobDecide wires state._flushCompletionBatch and returns the
+            // job_decide handler used by the agent to keep the job.
+            const decide = captureJobDecide(state);
+            const sentMessages: Array<{
+                message: unknown;
+                options: unknown;
+            }> = [];
+            const pi = {
+                registerTool() {},
+                sendMessage(message: unknown, options: unknown) {
+                    sentMessages.push({ message, options });
+                },
+            } as never;
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            const proc = mockProc(-77790);
+            const job = _rbg(
+                proc,
+                "/tmp/test-bg-keep-wake.log",
+                "sleep 300",
+                "tc-bg-keep-wake",
+                state,
+                pi,
+                ctx
+            );
+
+            // Precondition: auto-backgrounded jobs are not notify-by-default,
+            // so a plain success would be suppressed.
+            assert.notEqual(job.wantsCompletionNotification, true);
+
+            await decide.execute(
+                "tc-keep",
+                { jobId: job.id, decision: "keep" },
+                null,
+                null,
+                null
+            );
+
+            proc.emitClose(0);
+            await job.outputIndexPromise;
+            state._flushCompletionBatch?.();
+
+            assert.equal(
+                sentMessages.length,
+                1,
+                "a kept job's successful completion must wake the agent"
+            );
+            const sent = sentMessages[0] as {
+                message: { customType: string; content: string };
+                options: { triggerTurn?: boolean };
+            };
+            assert.equal(sent.message.customType, "job-completion");
+            assert.ok(sent.message.content.includes(job.id));
+            assert.equal(
+                sent.options.triggerTurn,
+                true,
+                "completion must trigger a turn"
+            );
         });
 
         void it("waits for output indexing and includes terminal log evidence", async () => {

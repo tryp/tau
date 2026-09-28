@@ -3248,12 +3248,22 @@ export function registerBackgroundJobs(
                 }
                 case "keep": {
                     state.pendingDecisionJobId = undefined;
+                    // An explicit keep is a request to be told the terminal
+                    // result. Without this marker a successful completion is
+                    // silently suppressed for jobs that were not launched with
+                    // bash_bg's notify (auto-backgrounded/detached foreground
+                    // commands), so the kept job's result is stranded until the
+                    // agent happens to poll `jobs` — the observed "job finished
+                    // but the agent never woke" gap.
+                    if (job.status === "running") {
+                        job.wantsCompletionNotification = true;
+                    }
                     state.wakeupEvaluate?.();
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Keeping ${job.id} running in the background. Use the jobs tool to check on it later.`,
+                                text: `Keeping ${job.id} running in the background. You will be notified when it completes.`,
                             },
                         ],
                         details: jobDetails(job),
