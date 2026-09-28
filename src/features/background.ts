@@ -1026,7 +1026,7 @@ function jobDecisionEvidence(job: BackgroundJob): string {
         const growth = evidence.fileSize > 0 ? "yes" : "no";
         const scanNote = evidence.truncated ? "; log scan capped" : "";
         return oneLine(
-            `Progress: ${formatDuration(Date.now() - job.startTime)} elapsed; ${evidence.counts.total} lines; output growth since launch ${growth}; +${evidence.delta.total} lines since prior check (${evidence.delta.err} err, ${evidence.delta.warn} warn)${sample}${scanNote}`,
+            `Progress: ${formatDuration(Date.now() - job.startTime)} elapsed; ${evidence.counts.total} lines (totals ${evidence.counts.err} err, ${evidence.counts.warn} warn); output growth since launch ${growth}; +${evidence.delta.total} lines since prior check (+${evidence.delta.err} err, +${evidence.delta.warn} warn)${sample}${scanNote}`,
             260
         );
     } catch {

@@ -89,6 +89,8 @@ interface Snapshot {
     counts: LogCounts;
     pending: string;
     lastSeenSize: number;
+    /** First strong-error line seen across all scans, so evidence survives deltas. */
+    firstError?: string;
 }
 
 function emptyCounts(): LogCounts {
@@ -189,6 +191,8 @@ export class JobLogEvidenceTracker {
             const delta = countLines(scannedText);
             const firstError = firstErrorLine(scannedText);
             addCounts(snapshot.counts, delta);
+            if (firstError && !snapshot.firstError)
+                snapshot.firstError = firstError;
             snapshot.lastSeenSize = fileSize;
             const grew = fileSize > priorSize;
             this.snapshots.delete(jobId);
@@ -201,7 +205,9 @@ export class JobLogEvidenceTracker {
             return {
                 counts: { ...snapshot.counts },
                 delta,
-                ...(firstError ? { firstError } : {}),
+                ...(snapshot.firstError
+                    ? { firstError: snapshot.firstError }
+                    : {}),
                 fileSize,
                 lastWriteAt: fileStat.mtimeMs,
                 grew,

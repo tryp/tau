@@ -2643,7 +2643,8 @@ void describe("evaluatePendingDecisionGate", () => {
             assert.match(content, /Progress: 5s elapsed/);
             assert.match(content, /2 lines/);
             assert.match(content, /output growth since launch yes/);
-            assert.match(content, /1 err, 0 warn/);
+            assert.match(content, /\+1 err, \+0 warn/);
+            assert.match(content, /totals 1 err, 0 warn/);
             assert.match(content, /first err: ERROR: connection failed/);
             assert.ok(content.length < 500);
         } finally {

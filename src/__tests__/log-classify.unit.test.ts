@@ -85,6 +85,8 @@ void describe("JobLogEvidenceTracker", () => {
         assert.deepEqual(second?.counts, { err: 1, warn: 1, total: 4 });
         assert.deepEqual(second?.delta, { err: 0, warn: 1, total: 2 });
         assert.equal(second?.grew, true);
+        // First-seen error must survive later delta-only scans.
+        assert.equal(second?.firstError, "ERROR: failed");
     });
 
     void it("resets counts and offset when the log shrinks", () => {
