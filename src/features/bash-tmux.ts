@@ -28,6 +28,8 @@ import {
     killWindow,
     queryWindows,
     sessionNameForGitRoot,
+    sanitizeTmuxToken,
+    shellQuote,
     spawnInTmux,
 } from "../tmux.ts";
 import { staleSafe } from "./ctx-guard.ts";
@@ -183,7 +185,9 @@ function reapOrphanedTmuxSessions(
             .filter((s) => s.startsWith("pi-bg-"));
         for (const session of sessions) {
             const paneOutput = runTmux(
-                `tmux list-panes -t ${session} -F '#{pane_pid}'`
+                `tmux list-panes -t ${shellQuote(
+                    sanitizeTmuxToken(session, 64, "bg")
+                )} -F '#{pane_pid}'`
             ).trim();
             if (!paneOutput) continue;
             const panePids = paneOutput.split("\n").map((rawPid) => {
@@ -199,7 +203,11 @@ function reapOrphanedTmuxSessions(
                 panePids.length > 0 &&
                 panePids.every((pid) => pid !== undefined && !isAlive(pid));
             if (allDead) {
-                runTmux(`tmux kill-session -t ${session}`);
+                runTmux(
+                    `tmux kill-session -t ${shellQuote(
+                        sanitizeTmuxToken(session, 64, "bg")
+                    )}`
+                );
             }
         }
     } catch {

@@ -31,6 +31,7 @@ import {
     serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
+import { sanitizeTmuxToken, tmuxCommandArg } from "../tmux.ts";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { TauState } from "../state.ts";
@@ -224,9 +225,13 @@ async function launchTab(command: string): Promise<void> {
 }
 
 async function launchTmux(command: string): Promise<void> {
-    const sessionName = `handoff-${Date.now()}`;
+    const sessionName = sanitizeTmuxToken(
+        `handoff-${Date.now()}`,
+        64,
+        "handoff"
+    );
     execSync(
-        `tmux new-session -d -s ${sessionName} "${command.replace(/"/g, '\\"')}"`,
+        `tmux new-session -d -s ${sessionName} ${tmuxCommandArg(command)}`,
         { encoding: "utf-8" }
     );
     execSync(`tmux switch-client -t ${sessionName}`, {

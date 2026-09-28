@@ -51,12 +51,32 @@ export function shellQuote(value: string): string {
     return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/** Reduce a tmux identifier to one bounded, parser-safe token. */
+export function sanitizeTmuxToken(
+    value: string,
+    maxLength = 30,
+    fallback = "shell"
+): string {
+    if (!value.trim()) return fallback;
+    const safe = value.replace(/[^A-Za-z0-9._@:-]/g, "_").slice(0, maxLength);
+    return safe || fallback;
+}
+
+/** Quote a value for tmux's command parser and the surrounding shell. */
+export function tmuxCommandArg(value: string): string {
+    const tmuxQuoted = `"${value.replace(/[\\"$#]/g, "\\$&")}"`;
+    return shellQuote(tmuxQuoted);
+}
+
 // ─── Session management ─────────────────────────────────────────────
 
 /** Determine the background tmux session name for a given git root. */
 export function sessionNameForGitRoot(gitRoot: string): string {
-    const slug =
-        gitRoot.split("/").pop()?.slice(0, 16).toLowerCase() ?? "project";
+    const slug = sanitizeTmuxToken(
+        gitRoot.split("/").pop()?.slice(0, 16).toLowerCase() ?? "project",
+        16,
+        "project"
+    );
     // Include a short hash to avoid collisions between same-named directories.
     const hash = createHash("md5").update(gitRoot).digest("hex").slice(0, 8);
     return `pi-bg-${slug}-${hash}`;
@@ -66,7 +86,9 @@ export function sessionNameForGitRoot(gitRoot: string): string {
 export function sessionExists(name: string): boolean {
     return (
         execSafe(
-            `tmux has-session -t ${shellQuote(name)} 2>/dev/null && echo yes`
+            `tmux has-session -t ${shellQuote(
+                sanitizeTmuxToken(name, 64, "bg")
+            )} 2>/dev/null && echo yes`
         ) === "yes"
     );
 }
@@ -110,7 +132,7 @@ export function queryWindows(
         [
             "list-windows",
             "-t",
-            session,
+            sanitizeTmuxToken(session, 64, "bg"),
             "-F",
             "#{window_id}|||#{window_index}|||#{window_name}",
         ],
@@ -225,16 +247,31 @@ export function spawnInTmux(
         exitCodeFile,
     });
 
-    const createCmd = exists
-        ? `new-window -d -t ${shellQuote(session)}`
-        : `new-session -d -s ${shellQuote(session)}`;
-
-    const windowName = command.split(/\s/)[0]?.slice(0, 30) ?? "shell";
     const windowId = exec(
-        `tmux ${createCmd} -n ${shellQuote(windowName)} -c ${shellQuote(cwd)} -P -F '#{window_id}' ${shellQuote(script.scriptPath)}`
+        buildSpawnCommand(command, cwd, script.scriptPath, session, exists)
     );
 
     return { windowId, id, outputFile, exitCodeFile };
+}
+
+/** Build the command used to ask tmux to create a session/window. */
+export function buildSpawnCommand(
+    command: string,
+    cwd: string,
+    scriptPath: string,
+    session: string,
+    sessionAlreadyExists: boolean
+): string {
+    const safeSession = sanitizeTmuxToken(session, 64, "bg");
+    const createCmd = sessionAlreadyExists
+        ? `new-window -d -t ${shellQuote(safeSession)}`
+        : `new-session -d -s ${shellQuote(safeSession)}`;
+    const windowName = sanitizeTmuxToken(
+        command.split(/\s/)[0] ?? "",
+        30,
+        "shell"
+    );
+    return `tmux ${createCmd} -n ${shellQuote(windowName)} -c ${shellQuote(cwd)} -P -F '#{window_id}' ${tmuxCommandArg(scriptPath)}`;
 }
 
 // ─── Output capture ─────────────────────────────────────────────────
@@ -257,7 +294,9 @@ export function captureOutput(
     }
     // Fallback: capture from tmux pane.
     const raw = execSafe(
-        `tmux capture-pane -t ${shellQuote(windowId)} -p -S -${lines}`
+        `tmux capture-pane -t ${shellQuote(
+            sanitizeTmuxToken(windowId, 64, "bg")
+        )} -p -S -${lines}`
     );
     return raw ?? "(no output)";
 }
@@ -286,7 +325,11 @@ export function checkExitCode(exitCodeFile: string): number | undefined {
 
 /** Kill a tmux window by its ID. */
 export function killWindow(windowId: string): void {
-    execSafe(`tmux kill-window -t ${shellQuote(windowId)}`);
+    execSafe(
+        `tmux kill-window -t ${shellQuote(
+            sanitizeTmuxToken(windowId, 64, "bg")
+        )}`
+    );
 }
 
 /** Get the git root for a directory, or null if not in a git repo. */

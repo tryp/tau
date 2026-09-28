@@ -137,6 +137,32 @@ void describe("tmux window lifecycle", TMUX_SUITE_OPTIONS, () => {
             "listWindows must stay the display-friendly wrapper"
         );
     });
+    void it("spawns a command whose first token contains a shell assignment separator", async () => {
+        const result = spawnInTmux(
+            "i=0; while [ $i -lt 2 ]; do echo assignment-$i; i=$((i+1)); done",
+            "/tmp",
+            TEST_RUN_DIR,
+            TEST_SESSION
+        );
+        assert.match(result.windowId, /^@[0-9]+$/);
+        assert.equal(await waitForExitCode(result.exitCodeFile), 0);
+        const output = readFileSync(result.outputFile, "utf-8");
+        assert.match(output, /assignment-0/);
+        assert.match(output, /assignment-1/);
+    });
+
+    void it("preserves cwd and script paths containing tmux metacharacters", async () => {
+        const specialDir = `${TEST_RUN_DIR};quoted dir`;
+        mkdirSync(specialDir, { recursive: true });
+        try {
+            const result = spawnInTmux("pwd", specialDir, specialDir, TEST_SESSION);
+            assert.equal(await waitForExitCode(result.exitCodeFile), 0);
+            assert.match(readFileSync(result.outputFile, "utf-8"), new RegExp(specialDir));
+        } finally {
+            rmSync(specialDir, { recursive: true, force: true });
+        }
+    });
+
     void it("session auto-destroys when command script exits", async () => {
         const result = spawnInTmux(
             "echo hello",
