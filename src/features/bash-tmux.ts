@@ -10,7 +10,7 @@
  * child-process spawning when tmux is absent.
  */
 
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -54,70 +54,176 @@ export function cleanupTmuxRunDir(): void {
     }
 }
 
-/** Clean up run directories from dead pi processes. Called on session startup. */
-export function cleanupStaleTmuxRunDirs(): void {
-    const entries = readdirSync("/tmp").filter((e) => e.startsWith("pi-tmux-"));
-    for (const entry of entries) {
-        const pid = parseInt(entry.replace("pi-tmux-", ""), 10);
-        // Skip our own process
-        if (pid === process.pid) continue;
-        // Check if the process is still alive
-        try {
-            process.kill(pid, 0);
-            continue; // alive — don't touch
-        } catch {
-            // dead — clean up
-        }
-        const dir = join("/tmp", entry);
-        try {
-            rmSync(dir, { recursive: true, force: true });
-        } catch {
-            /* permission error or concurrent cleanup */
-        }
-        // Also kill any tmux session that belonged to this dead process.
-        // Sessions are named pi-bg-<slug>-<hash>, but we can't derive the name
-        // from the PID alone. Instead, kill sessions whose panes are all dead.
-    }
-    // Kill orphaned pi-bg sessions (all panes dead)
+/**
+ * How long the run directory of a dead pi process is kept before it is reaped.
+ *
+ * The run directory holds every background job's output for that session — the
+ * only record of what those jobs did. Removing it the moment the owning process
+ * disappears destroys that record exactly when it is most needed (a crashed,
+ * killed, or stalled session), so dead run directories are retained for a day.
+ */
+export const RUN_DIR_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Ceiling for the override (30 days). Nothing reads job logs from a month-dead
+ * session, so beyond this the directory is pure garbage.
+ */
+export const MAX_RUN_DIR_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Resolve the dead-run-directory retention window from the environment.
+ *
+ * Digit-only, like the other numeric env overrides. Unlike the liveness
+ * cadence, `0` is meaningful here and accepted: it restores the previous
+ * delete-immediately behavior for hosts with a small /tmp. Values above
+ * MAX_RUN_DIR_RETENTION_MS are clamped.
+ */
+export function resolveRunDirRetentionMs(
+    env: NodeJS.ProcessEnv = process.env
+): number {
+    const raw = env.PI_TAU_TMUX_RUN_DIR_RETENTION_MS;
+    if (raw === undefined) return RUN_DIR_RETENTION_MS;
+    const normalized = raw.trim();
+    if (!/^\d+$/.test(normalized)) return RUN_DIR_RETENTION_MS;
+    const parsed = Number(normalized);
+    if (!Number.isSafeInteger(parsed)) return RUN_DIR_RETENTION_MS;
+    return Math.min(parsed, MAX_RUN_DIR_RETENTION_MS);
+}
+
+/** Injectable seams for {@link cleanupStaleTmuxRunDirs}. */
+export interface StaleRunDirCleanupOptions {
+    /** Directory holding the `pi-tmux-<pid>` run directories. */
+    rootDir?: string;
+    /** Clock used for the retention comparison. */
+    now?: () => number;
+    /** Process-liveness probe, also used for tmux pane pids. */
+    isAlive?: (pid: number) => boolean;
+    /** Retention window in ms; defaults to the env-resolved value. */
+    retentionMs?: number;
+    /** tmux command runner; returns stdout, throws on failure. */
+    runTmux?: (command: string) => string;
+}
+
+/** Process-liveness probe: `process.kill(pid, 0)` without the throw. */
+function processAlive(pid: number): boolean {
     try {
-        const sessions = execSync("tmux list-sessions -F '#{session_name}'", {
-            encoding: "utf-8",
-            timeout: 3000,
-            stdio: ["ignore", "pipe", "pipe"],
-        })
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** Run a tmux command in the same shape the cleanup path always used. */
+function execTmux(command: string): string {
+    return execSync(command, {
+        encoding: "utf-8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+}
+
+/**
+ * Whether a run directory may be deleted now: it must be datable and older
+ * than the retention window. A directory whose mtime cannot be read is kept —
+ * deleting what cannot be inspected is what destroyed the forensic record this
+ * retention window exists to preserve.
+ */
+function isReapable(dir: string, nowMs: number, retentionMs: number): boolean {
+    let mtimeMs: number;
+    try {
+        mtimeMs = statSync(dir).mtimeMs;
+    } catch {
+        // Raced with another pi process reaping it — nothing to remove.
+        return false;
+    }
+    return nowMs - mtimeMs >= retentionMs;
+}
+
+/**
+ * Kill `pi-bg-<slug>-<hash>` tmux sessions whose panes are all dead.
+ *
+ * Session names cannot be derived from a pid, so ownership is inferred from
+ * the panes: a session left with no live pane is an orphan that would
+ * otherwise accumulate forever. Job output lives in the run directory, which
+ * this path never touches, so reaping a session does not discard job logs.
+ */
+function reapOrphanedTmuxSessions(
+    runTmux: (command: string) => string,
+    isAlive: (pid: number) => boolean
+): void {
+    try {
+        const sessions = runTmux("tmux list-sessions -F '#{session_name}'")
             .trim()
             .split("\n")
             .filter((s) => s.startsWith("pi-bg-"));
         for (const session of sessions) {
-            const panePids = execSync(
-                `tmux list-panes -t ${session} -F '#{pane_pid}'`,
-                {
-                    encoding: "utf-8",
-                    timeout: 3000,
-                    stdio: ["ignore", "pipe", "pipe"],
-                }
+            const panePids = runTmux(
+                `tmux list-panes -t ${session} -F '#{pane_pid}'`
             )
                 .trim()
                 .split("\n")
                 .map((p) => parseInt(p, 10));
-            const allDead = panePids.every((pid) => {
-                try {
-                    process.kill(pid, 0);
-                    return false;
-                } catch {
-                    return true;
-                }
-            });
+            const allDead = panePids.every((pid) => !isAlive(pid));
             if (allDead) {
-                execSync(`tmux kill-session -t ${session}`, {
-                    timeout: 3000,
-                    stdio: "ignore",
-                });
+                runTmux(`tmux kill-session -t ${session}`);
             }
         }
     } catch {
         /* tmux not available or no sessions */
     }
+}
+
+/**
+ * Clean up run directories left behind by dead pi processes. Called on session
+ * startup.
+ *
+ * A directory is removed only when its owning process is gone AND it has not
+ * been written for the retention window (24h by default). The eager version of
+ * this deleted a dead session's logs on the next pi startup — before anyone
+ * could read them. Live processes are never touched, our own directory is
+ * skipped, and entries that are not pid-stamped run directories are ignored.
+ *
+ * Pass `retentionMs: 0` (or set `PI_TAU_TMUX_RUN_DIR_RETENTION_MS=0`) for the
+ * previous delete-immediately behavior.
+ */
+export function cleanupStaleTmuxRunDirs(
+    options: StaleRunDirCleanupOptions = {}
+): void {
+    const rootDir = options.rootDir ?? "/tmp";
+    const now = options.now ?? Date.now;
+    const isAlive = options.isAlive ?? processAlive;
+    const retentionMs = options.retentionMs ?? resolveRunDirRetentionMs();
+    const runTmux = options.runTmux ?? execTmux;
+
+    let entries: string[];
+    try {
+        entries = readdirSync(rootDir);
+    } catch {
+        // Unreadable root (missing, or not a directory): nothing to reap.
+        return;
+    }
+    const nowMs = now();
+
+    for (const entry of entries) {
+        if (!entry.startsWith("pi-tmux-")) continue;
+        const suffix = entry.slice("pi-tmux-".length);
+        // Skip our own process, and anything that is not a pid-stamped run
+        // directory: an entry we cannot attribute is not ours to delete.
+        if (!/^\d+$/.test(suffix)) continue;
+        const pid = Number(suffix);
+        if (pid === process.pid) continue;
+        if (isAlive(pid)) continue; // still running — never touch
+        const dir = join(rootDir, entry);
+        if (!isReapable(dir, nowMs, retentionMs)) continue;
+        try {
+            rmSync(dir, { recursive: true, force: true });
+        } catch {
+            /* permission error or concurrent cleanup */
+        }
+    }
+
+    reapOrphanedTmuxSessions(runTmux, isAlive);
 }
 
 /**
