@@ -223,8 +223,8 @@ void describe("orphaned tmux session reaping", () => {
         cleanup({ runTmux });
         assert.deepEqual(calls, [
             "tmux list-sessions -F '#{session_name}'",
-            "tmux list-panes -t pi-bg-alpha-1 -F '#{pane_pid}'",
-            "tmux kill-session -t pi-bg-alpha-1",
+            "tmux list-panes -t 'pi-bg-alpha-1' -F '#{pane_pid}'",
+            "tmux kill-session -t 'pi-bg-alpha-1'",
         ]);
     });
 
