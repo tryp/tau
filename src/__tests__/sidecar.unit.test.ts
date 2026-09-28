@@ -20,6 +20,7 @@ import {
 } from "../features/background.ts";
 import {
     chunkText,
+    formatSidecarReceipt,
     INLINE_FALLBACK_MAX_CHARS,
     prepareInlineOutput,
 } from "../features/sidecar.ts";
@@ -49,6 +50,13 @@ CREATE TABLE IF NOT EXISTS context_chunks (
   title TEXT,
   content TEXT NOT NULL,
   byte_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_source_severity (
+  source_id TEXT PRIMARY KEY REFERENCES context_sources(id) ON DELETE CASCADE,
+  err_line_count INTEGER NOT NULL,
+  warn_line_count INTEGER NOT NULL,
+  classified_line_count INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_context_sources_created ON context_sources(created_at);
@@ -644,9 +652,37 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(matches[0].sourceId, sourceId);
     });
 
+    void it("formats severity when available and preserves the legacy receipt otherwise", () => {
+        const source = { sourceId: "src-1", chunkIds: ["chunk-1"] };
+        const unchanged = formatSidecarReceipt("bash", source, 100, 2);
+        assert.equal(
+            unchanged,
+            [
+                "[context-sidecar] Large bash output indexed locally",
+                "Source: src-1",
+                "Chunks: 1; original size: 100 bytes, 2 lines",
+                '- Search snippets first: context_search query:"..." source_id:"src-1"',
+                '- Retrieve focused output: context_get source_id:"src-1" chunk_id:"chunk-1"',
+                '- Export full output for offline processing: context_export source_id:"src-1"',
+            ].join("\n")
+        );
+        assert.match(
+            formatSidecarReceipt(
+                "bash",
+                {
+                    ...source,
+                    severityCounts: { err: 3, warn: 12, total: 361 },
+                },
+                100,
+                2
+            ),
+            /Severity: 3 err, 12 warn of 361 lines/
+        );
+    });
+
     void it("returns a compact receipt for large foreground output", async () => {
         createDb(tmpDir);
-        const output = `foreground-large-token\n${"x".repeat(40_000)}`;
+        const output = `ERROR: foreground-large-token\n${"x".repeat(40_000)}`;
         const job = testJob({
             id: "job-large-foreground",
             logPath: writeLog(output),
@@ -656,7 +692,8 @@ void describe("indexJobOutputInSidecar", () => {
             job,
             { cwd: tmpDir },
             output,
-            "bash"
+            "bash",
+            { useExternalApi: false }
         );
 
         assert.equal(prepared.truncated, true);
@@ -666,8 +703,82 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(prepared.empty, false);
         assert.ok(prepared.source);
         assert.match(prepared.text, /\[context-sidecar\]/);
+        assert.match(prepared.text, /Severity: 1 err, 0 warn of 2 lines/);
         assert.ok(prepared.text.length < 10_000);
         assert.equal(await readJobOutputFromSidecar(job.id), output);
+        const check = new DatabaseSync(join(tmpDir, "context.db"));
+        const severity = check
+            .prepare(
+                "SELECT err_line_count, warn_line_count, classified_line_count FROM context_source_severity WHERE source_id = ?"
+            )
+            .get(prepared.source?.sourceId) as
+            | {
+                  err_line_count: number;
+                  warn_line_count: number;
+                  classified_line_count: number;
+              }
+            | undefined;
+        assert.equal(severity?.err_line_count, 1);
+        assert.equal(severity?.warn_line_count, 0);
+        assert.equal(severity?.classified_line_count, 2);
+        check.close();
+    });
+
+    void it("keeps indexing when the severity table is unavailable", async () => {
+        const db = createDb(tmpDir);
+        db.exec("DROP TABLE context_source_severity");
+        db.close();
+        const output = `ERROR: old sidecar schema\n${"x".repeat(40_000)}`;
+        const job = testJob({
+            id: "job-severity-write-failure",
+            logPath: writeLog(output),
+        });
+        const prepared = await prepareInlineOutput(
+            job,
+            { cwd: tmpDir },
+            output,
+            "bash",
+            {
+                useExternalApi: false,
+            }
+        );
+        assert.ok(prepared.source);
+        assert.match(prepared.text, /Severity: 1 err, 0 warn of 2 lines/);
+        assert.equal(await readJobOutputFromSidecar(job.id), output);
+    });
+
+    void it("keeps indexing and the legacy receipt when classification throws", async () => {
+        createDb(tmpDir);
+        const output = `ERROR: classifier test\n${"x".repeat(40_000)}`;
+        const job = testJob({
+            id: "job-classify-failure",
+            logPath: writeLog(output),
+        });
+        const prepared = await prepareInlineOutput(
+            job,
+            { cwd: tmpDir },
+            output,
+            "bash",
+            {
+                useExternalApi: false,
+                classify: () => {
+                    throw new Error("classifier unavailable");
+                },
+            }
+        );
+        assert.equal(prepared.truncated, true);
+        assert.ok(prepared.source);
+        assert.match(prepared.text, /\[context-sidecar\]/);
+        assert.doesNotMatch(prepared.text, /Severity:/);
+        assert.equal(await readJobOutputFromSidecar(job.id), output);
+        const check = new DatabaseSync(join(tmpDir, "context.db"));
+        const severity = check
+            .prepare(
+                "SELECT COUNT(*) AS count FROM context_source_severity WHERE source_id = ?"
+            )
+            .get(prepared.source?.sourceId) as { count: number };
+        assert.equal(severity.count, 0);
+        check.close();
     });
 
     void it("bounds large foreground output when the sidecar is unavailable", async () => {

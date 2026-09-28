@@ -19,6 +19,7 @@ import type {
     SidecarIndexOutcome,
     SidecarIndexStats,
 } from "../types.ts";
+import { countLines, type LogCounts } from "./log-classify.ts";
 
 /** Inline output limits mirror the context sidecar's baseline capture policy. */
 export const INLINE_CONTEXT_MAX_BYTES = 24 * 1024;
@@ -402,15 +403,21 @@ export function formatSidecarReceipt(
     bytes: number,
     lines: number
 ): string {
+    const severity = source.severityCounts
+        ? `Severity: ${source.severityCounts.err} err, ${source.severityCounts.warn} warn of ${source.severityCounts.total} lines`
+        : undefined;
     return [
         `[context-sidecar] Large ${toolName} output indexed locally`,
         `Source: ${source.sourceId}`,
         `Chunks: ${source.chunkIds.length}; original size: ${bytes} bytes, ${lines} lines`,
+        severity,
         `- Search snippets first: context_search query:"..." source_id:"${source.sourceId}"`,
         `- Retrieve focused output: context_get source_id:"${source.sourceId}" chunk_id:"${source.chunkIds[0] ?? ""}"`,
         "- Export full output for offline processing: context_export source_id:" +
             `"${source.sourceId}"`,
-    ].join("\n");
+    ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
 }
 
 /**
@@ -539,6 +546,14 @@ async function tryIndexViaExternalApi(
 }
 
 /**
+ * Optional test/caller controls for indexing behavior. Classification remains advisory.
+ */
+export interface SidecarIndexOptions {
+    classify?: (text: string) => LogCounts;
+    useExternalApi?: boolean;
+}
+
+/**
  * Index large foreground output before it is returned to the model.
  * The complete output remains in the log/sidecar; only a compact receipt or
  * bounded fallback is returned inline.
@@ -553,7 +568,8 @@ export async function prepareInlineOutput(
     },
     ctx: SidecarContext,
     output: string,
-    toolName = "bash"
+    toolName = "bash",
+    options: SidecarIndexOptions = {}
 ): Promise<PreparedInlineOutput> {
     const bytes = Buffer.byteLength(output, "utf8");
     const totalLines =
@@ -572,7 +588,12 @@ export async function prepareInlineOutput(
     }
 
     const lines = totalLines;
-    const indexOutcome = await indexJobOutputWithOutcome(job, ctx, toolName);
+    const indexOutcome = await indexJobOutputWithOutcome(
+        job,
+        ctx,
+        toolName,
+        options
+    );
     const source = indexOutcome.source;
     if (source) {
         return {
@@ -668,6 +689,27 @@ function makePreview(text: string): string {
  * context.db using the same schema that context_search / context_get /
  * context_list expect. Used when the pi-context external API is unavailable.
  */
+function writeSeverityCountsBestEffort(
+    db: DatabaseSync,
+    sourceId: string,
+    counts: LogCounts | undefined
+): void {
+    if (!counts) return;
+    try {
+        db.prepare(
+            `INSERT INTO context_source_severity
+             (source_id, err_line_count, warn_line_count, classified_line_count)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(source_id) DO UPDATE SET
+               err_line_count = excluded.err_line_count,
+               warn_line_count = excluded.warn_line_count,
+               classified_line_count = excluded.classified_line_count`
+        ).run(sourceId, counts.err, counts.warn, counts.total);
+    } catch {
+        // Severity is advisory metadata; older sidecar schemas must still index output.
+    }
+}
+
 async function indexViaDirectDb(
     text: string,
     job: {
@@ -679,7 +721,8 @@ async function indexViaDirectDb(
     },
     ctx: SidecarContext,
     toolName: string,
-    dbPath: string
+    dbPath: string,
+    severityCounts?: LogCounts
 ): Promise<string | undefined> {
     const bytes = Buffer.byteLength(text, "utf8");
     const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
@@ -724,6 +767,7 @@ async function indexViaDirectDb(
             // Re-indexing is internal maintenance, not a context read. Do
             // not charge these bytes to returned_byte_count; that counter
             // tracks bytes actually returned by context retrieval.
+            writeSeverityCountsBestEffort(db, existing.id, severityCounts);
             return existing.id;
         }
 
@@ -784,6 +828,7 @@ async function indexViaDirectDb(
             );
         }
         db.exec("COMMIT");
+        writeSeverityCountsBestEffort(db, sourceId, severityCounts);
         return sourceId;
     } catch (error) {
         try {
@@ -814,7 +859,8 @@ export async function indexJobOutputWithOutcome(
         status?: string;
     },
     ctx: SidecarContext,
-    toolName: string = "bash_bg"
+    toolName: string = "bash_bg",
+    options: SidecarIndexOptions = {}
 ): Promise<SidecarIndexOutcome> {
     sidecarIndexStats.attempts += 1;
     let text: string;
@@ -843,6 +889,12 @@ export async function indexJobOutputWithOutcome(
     }
 
     sidecarIndexStats.eligible += 1;
+    let severityCounts: LogCounts | undefined;
+    try {
+        severityCounts = (options.classify ?? countLines)(text);
+    } catch {
+        // Classification is advisory; keep the existing indexing path intact.
+    }
     const dbPath = sidecarDbPath();
     if (!existsSync(dbPath)) {
         const outcome: SidecarIndexOutcome = {
@@ -858,16 +910,26 @@ export async function indexJobOutputWithOutcome(
 
     try {
         // Try pi-context's public external-indexing API first.
-        const apiSourceId = await tryIndexViaExternalApi(
-            text,
-            job,
-            ctx,
-            toolName,
-            dbPath
-        );
+        const apiSourceId =
+            options.useExternalApi === false
+                ? undefined
+                : await tryIndexViaExternalApi(
+                      text,
+                      job,
+                      ctx,
+                      toolName,
+                      dbPath
+                  );
         const sourceId =
             apiSourceId ??
-            (await indexViaDirectDb(text, job, ctx, toolName, dbPath));
+            (await indexViaDirectDb(
+                text,
+                job,
+                ctx,
+                toolName,
+                dbPath,
+                severityCounts
+            ));
         if (!sourceId) {
             const outcome: SidecarIndexOutcome = {
                 status: "skipped",
@@ -879,9 +941,13 @@ export async function indexJobOutputWithOutcome(
             sidecarIndexStats.schemaSkipped += 1;
             return outcome;
         }
-        const source = findJobSourceDetailsInSidecar(job.id) ?? {
+        const indexedSource = findJobSourceDetailsInSidecar(job.id) ?? {
             sourceId,
             chunkIds: [],
+        };
+        const source: JobOutputIndex = {
+            ...indexedSource,
+            ...(severityCounts ? { severityCounts } : {}),
         };
         const outcome: SidecarIndexOutcome = {
             status: "indexed",

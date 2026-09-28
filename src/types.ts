@@ -4,6 +4,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { LogCounts } from "./features/log-classify.ts";
 
 // ─── Background jobs ────────────────────────────────────────────────
 
@@ -22,10 +23,11 @@ export interface PendingBackgroundAgent {
     settleTimer?: ReturnType<typeof setTimeout>;
 }
 
-/** Stable identifiers for indexed background-job output. */
+/** Stable identifiers and optional classification for indexed background-job output. */
 export interface JobOutputIndex {
     sourceId: string;
     chunkIds: string[];
+    severityCounts?: LogCounts;
 }
 
 export type SidecarIndexStatus = "indexed" | "skipped" | "failed";
