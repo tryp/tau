@@ -56,6 +56,13 @@ export {
 };
 
 import { staleSafe } from "./ctx-guard.ts";
+import {
+    countLines,
+    formatLogCounts,
+    jobLogEvidenceTracker,
+    oneLine,
+    type LogCounts,
+} from "./log-classify.ts";
 
 import type {
     AgentToolResult,
@@ -414,9 +421,11 @@ export function startStallWatchdog(
             clearInterval(timer);
 
             const suffix = outstandingJobsSuffix(state, jobId);
+            const progress = trackedJob ? jobDecisionEvidence(trackedJob) : "";
             if (promptLike) {
                 const summary =
                     `Background job ${jobId} appears to be waiting for interactive input.\n` +
+                    (progress ? `${progress}\n` : "") +
                     `Command: ${command}\n\n` +
                     `Last output:\n${tail.trimEnd()}\n\n` +
                     `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
@@ -446,6 +455,7 @@ export function startStallWatchdog(
             // agent and its parent session stayed blocked on it.
             const summary =
                 `Background job ${jobId} has produced no output for ${formatDuration(STALL_THRESHOLD_MS)}.\n` +
+                (progress ? `${progress}\n` : "") +
                 `Command: ${command}\n\n` +
                 `The job may be spinning, hung, or silently computing. Use job_decide ` +
                 `to keep it running or kill it.`;
@@ -578,10 +588,13 @@ export function evaluatePendingDecisionGate(
             : (job?.status ?? "unknown");
     const controls = getActiveBackgroundControlTools(pi);
     if (controls.length === 0) {
+        const progress =
+            job?.status === "running" ? jobDecisionEvidence(job) : "";
         return {
             block: true,
             reason:
-                `A background job (${state.pendingDecisionJobId}) is awaiting a decision (${status}), ` +
+                `A background job (${state.pendingDecisionJobId}) is awaiting a decision (${status}). ` +
+                (progress ? `${progress}. ` : "") +
                 "but this session has no active job-control tool (jobs/job_decide). " +
                 "Do not run shell kill, pkill, or tmux cleanup commands. " +
                 "Ask the operator to enable jobs/job_decide or clear the job externally.",
@@ -599,11 +612,14 @@ export function evaluatePendingDecisionGate(
     // handles it without losing work already in flight.
     if (state.decisionSteerJobId !== state.pendingDecisionJobId) {
         state.decisionSteerJobId = state.pendingDecisionJobId;
+        const progress =
+            job?.status === "running" ? jobDecisionEvidence(job) : "";
         pi.sendMessage(
             {
                 customType: "tau-pending-decision",
                 content:
                     `A background job (${state.pendingDecisionJobId}) is awaiting your decision (${status}). ` +
+                    (progress ? `${progress}. ` : "") +
                     `Use ${controls.join(" or ")} before continuing with other work.`,
                 display: true,
             },
@@ -732,6 +748,9 @@ export interface OutputMetadata {
     empty: boolean;
     /** Whether reading or formatting the output failed. */
     error: boolean;
+    severityCounts?: LogCounts;
+    severityDelta?: LogCounts;
+    severityScanTruncated?: boolean;
 }
 
 export interface FormatJobOutputResult extends OutputMetadata {
@@ -770,6 +789,7 @@ export function getOutputMetadata(text: string, error = false): OutputMetadata {
             text.length === 0 ||
             !lines.some((line) => line.trim().length > 0),
         error,
+        severityCounts: countLines(emptyPlaceholder ? "" : text),
     };
 }
 
@@ -931,6 +951,108 @@ function outputDetails(
 
 function outputReadFailed(job: BackgroundJob, output: string): boolean {
     return output === "(no output yet)" && !existsSync(job.logPath);
+}
+
+function lastLogLine(logPath: string): string | undefined {
+    try {
+        const tail = readOutputTailSync(logPath, 4_096);
+        if (tail === "(no output yet)" || tail === "(no output)")
+            return undefined;
+        const lines = tail.split(/\r\n|\n|\r/).filter(Boolean);
+        const last = lines.at(-1);
+        if (!last || last.startsWith("...[truncated")) return undefined;
+        return oneLine(last, 160);
+    } catch {
+        return undefined;
+    }
+}
+
+export function formatBackgroundEvidence(
+    job: BackgroundJob,
+    finalize = false
+): string {
+    try {
+        const evidence = jobLogEvidenceTracker.scan(
+            job.id,
+            job.logPath,
+            finalize
+        );
+        if (!evidence) return "";
+        const tail = lastLogLine(job.logPath);
+        const parts = [formatLogCounts(evidence.counts)];
+        if (evidence.truncated) parts.push("scan capped");
+        if (evidence.rotated) parts.push("log rotated");
+        if (tail) parts.push(`last: ${tail}`);
+        return ` — ${oneLine(parts.join(", "), 260)}`;
+    } catch {
+        return "";
+    }
+}
+
+function logEvidenceMetadata(
+    job: BackgroundJob,
+    finalize = false,
+    trackerKey = job.id
+):
+    | Pick<
+          OutputMetadata,
+          "severityCounts" | "severityDelta" | "severityScanTruncated"
+      >
+    | undefined {
+    try {
+        const evidence = jobLogEvidenceTracker.scan(
+            trackerKey,
+            job.logPath,
+            finalize
+        );
+        if (!evidence) return undefined;
+        return {
+            severityCounts: evidence.counts,
+            severityDelta: evidence.delta,
+            severityScanTruncated: evidence.truncated,
+        };
+    } catch {
+        return undefined;
+    }
+}
+
+function jobDecisionEvidence(job: BackgroundJob): string {
+    try {
+        const evidence = jobLogEvidenceTracker.scan(job.id, job.logPath);
+        if (!evidence) return "";
+        const sample = evidence.firstError
+            ? `; first err: ${oneLine(evidence.firstError, 96)}`
+            : "";
+        const growth = evidence.fileSize > 0 ? "yes" : "no";
+        const scanNote = evidence.truncated ? "; log scan capped" : "";
+        return oneLine(
+            `Progress: ${formatDuration(Date.now() - job.startTime)} elapsed; ${evidence.counts.total} lines; output growth since launch ${growth}; +${evidence.delta.total} lines since prior check (${evidence.delta.err} err, ${evidence.delta.warn} warn)${sample}${scanNote}`,
+            260
+        );
+    } catch {
+        return "";
+    }
+}
+
+function completionLogEvidence(job: BackgroundJob): {
+    text: string;
+    counts?: LogCounts;
+} {
+    try {
+        const evidence = jobLogEvidenceTracker.scan(job.id, job.logPath, true);
+        if (!evidence) return { text: "" };
+        const parts = [formatLogCounts(evidence.counts)];
+        if (evidence.truncated) parts.push("scan capped");
+        if (evidence.rotated) parts.push("log rotated");
+        const tail = lastLogLine(job.logPath);
+        if (tail) parts.push(`last: ${tail}`);
+        return {
+            text: oneLine(parts.join("; "), 220),
+            counts: evidence.counts,
+        };
+    } catch {
+        return { text: "" };
+    }
 }
 
 /**
@@ -1219,9 +1341,20 @@ function deliverCompletionNotification(
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
+    const completionEvidenceById = new Map<
+        string,
+        ReturnType<typeof completionLogEvidence>
+    >();
+    for (const item of batch) {
+        completionEvidenceById.set(
+            item.job.id,
+            completionLogEvidence(item.job)
+        );
+    }
 
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
+        const logEvidence = completionEvidenceById.get(job.id);
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
 
@@ -1235,6 +1368,7 @@ function deliverCompletionNotification(
                 customType: "job-completion",
                 content:
                     `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
+                    `${logEvidence?.text ? `Output evidence: ${logEvidence.text}\n` : ""}` +
                     `Command: ${job.command}\nOutput: ${job.logPath}${
                         job.sidecarIndexStatus === "failed"
                             ? `\nWarning: sidecar indexing failed (${job.sidecarIndexErrorCategory ?? "unknown"}); output remains at the log path.`
@@ -1246,6 +1380,9 @@ function deliverCompletionNotification(
                     status: job.status,
                     exitCode: job.exitCode,
                     duration,
+                    ...(logEvidence?.counts
+                        ? { severityCounts: logEvidence.counts }
+                        : {}),
                     command: job.command,
                     logPath: job.logPath,
                     sourceId: job.sourceId,
@@ -1283,6 +1420,16 @@ function deliverCompletionNotification(
             }`
     );
     const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
+    const outputEvidence = oneLine(
+        batch
+            .map((item) => {
+                const evidence = completionEvidenceById.get(item.job.id);
+                return evidence?.text ? `${item.job.id}: ${evidence.text}` : "";
+            })
+            .filter(Boolean)
+            .join(" | "),
+        280
+    );
 
     const gpuLine = readGpuSnapshot();
     const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
@@ -1291,7 +1438,7 @@ function deliverCompletionNotification(
         pi,
         {
             customType: "job-completion",
-            content: `${header}\n${lines.join("\n")}\n${detailLines.join("\n")}${resourceInfo}`,
+            content: `${header}\n${lines.join("\n")}${outputEvidence ? `\nOutput evidence: ${outputEvidence}` : ""}\n${detailLines.join("\n")}${resourceInfo}`,
             display: true,
             details: {
                 batch: batch.map((b) => ({
@@ -1299,6 +1446,13 @@ function deliverCompletionNotification(
                     status: b.job.status,
                     exitCode: b.job.exitCode,
                     duration: b.duration,
+                    ...(completionEvidenceById.get(b.job.id)?.counts
+                        ? {
+                              severityCounts: completionEvidenceById.get(
+                                  b.job.id
+                              )!.counts,
+                          }
+                        : {}),
                     command: b.job.command,
                     logPath: b.job.logPath,
                     sourceId: b.job.sourceId,
@@ -1633,7 +1787,10 @@ export function registerBackgroundJob(
         updateWidget(state, ctx);
     });
 
-    ctx.ui.notify(`Process backgrounded as ${jobId}`, "info");
+    ctx.ui.notify(
+        `Process backgrounded as ${jobId}${formatBackgroundEvidence(job)}`,
+        "info"
+    );
     updateWidget(state, ctx);
 
     return job;
@@ -2171,7 +2328,7 @@ export function registerBackgroundJobs(
                                 type: "text" as const,
                                 text:
                                     silenceNotice +
-                                    `Process backgrounded as ${job.id}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}`,
+                                    `Process backgrounded as ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}`,
                             },
                         ],
                         details: undefined,
@@ -2353,7 +2510,7 @@ export function registerBackgroundJobs(
                     content: [
                         {
                             type: "text" as const,
-                            text: `Started background job ${job.id}\nCommand: ${params.command}\nOutput: ${job.logPath}`,
+                            text: `Started background job ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${params.command}\nOutput: ${job.logPath}`,
                         },
                     ],
                     details: jobDetails(job),
@@ -2484,7 +2641,7 @@ export function registerBackgroundJobs(
                     {
                         type: "text" as const,
                         text:
-                            `Started background job ${jobId}\n` +
+                            `Started background job ${jobId}${formatBackgroundEvidence(job)}\n` +
                             `Command: ${params.command}\n` +
                             `PID: ${proc.pid}\n` +
                             `Output: ${logPath}${extra}`,
@@ -2645,7 +2802,20 @@ export function registerBackgroundJobs(
                             error:
                                 formatted.error ||
                                 outputReadFailed(job, output),
+                            ...logEvidenceMetadata(
+                                job,
+                                job.status !== "running",
+                                `${job.id}:jobs-output`
+                            ),
                         };
+                        const severityNote = metadata.severityCounts
+                            ? `\nLog severity: ${formatLogCounts(metadata.severityCounts)}; ` +
+                              `since prior read +${metadata.severityDelta?.total ?? 0} lines ` +
+                              `(+${metadata.severityDelta?.err ?? 0} err, +${metadata.severityDelta?.warn ?? 0} warn)` +
+                              (metadata.severityScanTruncated
+                                  ? "; scan capped at 512KB"
+                                  : "")
+                            : "";
                         return {
                             content: [
                                 {
@@ -2662,7 +2832,7 @@ export function registerBackgroundJobs(
                                         tailCount !== undefined
                                             ? `, tail=${tailCount}`
                                             : ""
-                                    }\nLog: ${job.logPath}\n\n${formatted.text}`,
+                                    }\nLog: ${job.logPath}${severityNote}\n\n${formatted.text}`,
                                 },
                             ],
                             details: outputDetails(job, metadata, source),
@@ -2683,6 +2853,24 @@ export function registerBackgroundJobs(
                         const logLine = sidecarOutput.logPath
                             ? `\nLog: ${sidecarOutput.logPath}`
                             : "";
+                        const evidence = sidecarOutput.logPath
+                            ? jobLogEvidenceTracker.scan(
+                                  `${params.jobId}:jobs-output`,
+                                  sidecarOutput.logPath,
+                                  true
+                              )
+                            : undefined;
+                        const severityCounts =
+                            evidence?.counts ?? countLines(sidecarOutput.text);
+                        const severityDelta = evidence?.delta;
+                        const severityNote =
+                            `\nLog severity: ${formatLogCounts(severityCounts)}` +
+                            (severityDelta
+                                ? `; since prior read +${severityDelta.total} lines (+${severityDelta.err} err, +${severityDelta.warn} warn)`
+                                : "") +
+                            (evidence?.truncated
+                                ? "; scan capped at 512KB"
+                                : "");
                         return {
                             content: [
                                 {
@@ -2699,7 +2887,7 @@ export function registerBackgroundJobs(
                                         tailCount !== undefined
                                             ? `, tail=${tailCount}`
                                             : ""
-                                    }${logLine}\n\n${formatted.text}`,
+                                    }${logLine}${severityNote}\n\n${formatted.text}`,
                                 },
                             ],
                             details: {
@@ -2707,6 +2895,11 @@ export function registerBackgroundJobs(
                                 status: "completed",
                                 logPath: sidecarOutput.logPath,
                                 totalLines: formatted.totalLines,
+                                severityCounts,
+                                ...(severityDelta ? { severityDelta } : {}),
+                                ...(evidence?.truncated
+                                    ? { severityScanTruncated: true }
+                                    : {}),
                                 truncated: formatted.truncated,
                                 empty: formatted.empty,
                                 error: formatted.error,
@@ -3529,7 +3722,7 @@ async function executeTmuxForeground(
                         type: "text" as const,
                         text:
                             silenceNotice +
-                            `Process backgrounded as ${jobId}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}`,
+                            `Process backgrounded as ${jobId}${formatBackgroundEvidence(job)}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}`,
                     },
                 ],
                 details: undefined,

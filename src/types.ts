@@ -99,6 +99,12 @@ export interface JobResultDetails {
     partial?: boolean;
     /** Number of lines omitted by a head/tail or grep view, when known. */
     omittedLines?: number;
+    /** Best-effort cumulative severity counts for the job output log. */
+    severityCounts?: { err: number; warn: number; total: number };
+    /** Severity/line counts appended since this job's previous output read. */
+    severityDelta?: { err: number; warn: number; total: number };
+    /** True when one or more capped scans are needed to cover the current log. */
+    severityScanTruncated?: boolean;
     /** Original output size in UTF-8 bytes, when known. */
     byteCount?: number;
     /** Durable output path for foreground results when sidecar indexing is unavailable. */

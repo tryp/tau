@@ -5,6 +5,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
     parseDurationToMs,
     formatDuration,
@@ -131,7 +134,10 @@ function makeJob(
  * doesn't crash.
  */
 function createCallbackHarness() {
-    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const handlers = new Map<
+        string,
+        (event: unknown, ctx: unknown) => unknown
+    >();
     const sentUserMessages: Array<{ content: unknown; options: unknown }> = [];
     const sentMessages: Array<{ message: unknown; options: unknown }> = [];
     const appendedEntries: Array<{ customType: string; data: unknown }> = [];
@@ -149,7 +155,10 @@ function createCallbackHarness() {
     } | null = null;
 
     const pi = {
-        on(eventName: string, handler: (event: any, ctx: any) => unknown) {
+        on(
+            eventName: string,
+            handler: (event: unknown, ctx: unknown) => unknown
+        ) {
             handlers.set(eventName, handler);
         },
         registerTool(tool: { name: string; execute: unknown }) {
@@ -259,6 +268,48 @@ void describe("callback delivery while agent is busy", () => {
             String(h.sentUserMessages[0].content),
             /<callback id="cb-1"/
         );
+    });
+
+    void it("adds live log evidence to a firing linked reminder without changing auto-cancel semantics", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "tau-linked-reminder-"));
+        const logPath = join(dir, "job.log");
+        writeFileSync(logPath, "INFO start\nERROR: service unavailable\n");
+        try {
+            const state = new TauState();
+            const job = makeJob({
+                id: "job-linked-reminder-evidence",
+                status: "running",
+                startTime: Date.now() - 8_000,
+                logPath,
+            });
+            state.backgroundJobs.set(job.id, job);
+            const h = createCallbackHarness();
+            registerCallbacks(h.pi, state);
+            await h.invoke("session_start");
+            await h.getRemindTool().execute(
+                "tc-remind-evidence",
+                {
+                    message: "check the running job",
+                    delay: "0.001s",
+                    jobId: job.id,
+                },
+                null,
+                null,
+                null
+            );
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const delivered = h.sentUserMessages[0]?.content;
+            const message =
+                typeof delivered === "string"
+                    ? delivered
+                    : JSON.stringify(delivered ?? "");
+            assert.match(message, /Job progress: running 8s/);
+            assert.match(message, /2 lines \(1 err, 0 warn\)/);
+            assert.match(message, /first err: ERROR: service unavailable/);
+            assert.ok(message.length < 2_000);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     void it("delivers callback only via sendUserMessage, not via sendMessage (no duplicate)", async () => {
@@ -429,7 +480,7 @@ void describe("hasLinkedCallbacksForJob", () => {
     });
 
     void it("returns false for jobs without any linked callbacks", () => {
-        const state = new TauState();
+        const _state = new TauState();
         // No callbacks registered at all
         assert.equal(hasLinkedCallbacksForJob("job-nonexistent"), false);
     });

@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -13,6 +13,7 @@ import {
     clearAllCompletionBatches,
     formatJobOutput,
     getOutputMetadata,
+    formatBackgroundEvidence,
     lookupJob,
     startTimeoutTimer,
     handleTmuxCompletion,
@@ -315,6 +316,7 @@ void describe("jobs output — structured details", () => {
             byteCount: 0,
             empty: true,
             error: false,
+            severityCounts: { err: 0, warn: 0, total: 0 },
         });
         assert.equal(getOutputMetadata(" \n\t").empty, true);
         assert.equal(formatJobOutput({ text: " \n\t" }).empty, true);
@@ -367,6 +369,101 @@ void describe("jobs output — structured details", () => {
             assert.equal(details.error, false);
         } finally {
             unlinkSync(logPath);
+        }
+    });
+
+    void it("returns cumulative severity counts and per-read deltas", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "tau-job-severity-"));
+        const logPath = join(dir, "job.log");
+        writeFileSync(logPath, "INFO started\nERROR: failed\n");
+        const state = new TauState();
+        const job = makeJob({
+            id: "job-severity-output",
+            logPath,
+            status: "running",
+        });
+        state.backgroundJobs.set(job.id, job);
+        try {
+            const tool = captureJobsTool(state);
+            const first = await tool.execute(
+                "tc-severity-1",
+                {
+                    action: "output",
+                    jobId: job.id,
+                },
+                null,
+                null,
+                null
+            );
+            const firstDetails = first.details as {
+                severityCounts?: { err: number; warn: number; total: number };
+                severityDelta?: { err: number; warn: number; total: number };
+            };
+            assert.deepEqual(firstDetails.severityCounts, {
+                err: 1,
+                warn: 0,
+                total: 2,
+            });
+            assert.deepEqual(firstDetails.severityDelta, {
+                err: 1,
+                warn: 0,
+                total: 2,
+            });
+            assert.match(
+                first.content[0].text,
+                /Log severity: 2 lines \(1 err, 0 warn\)/
+            );
+
+            appendFileSync(logPath, "WARN retrying\n");
+            const second = await tool.execute(
+                "tc-severity-2",
+                {
+                    action: "output",
+                    jobId: job.id,
+                },
+                null,
+                null,
+                null
+            );
+            const secondDetails = second.details as {
+                severityCounts?: { err: number; warn: number; total: number };
+                severityDelta?: { err: number; warn: number; total: number };
+            };
+            assert.deepEqual(secondDetails.severityCounts, {
+                err: 1,
+                warn: 1,
+                total: 3,
+            });
+            assert.deepEqual(secondDetails.severityDelta, {
+                err: 0,
+                warn: 1,
+                total: 1,
+            });
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("adds bounded severity counts and last-line evidence to backgrounding text", () => {
+        const dir = mkdtempSync(join(tmpdir(), "tau-background-evidence-"));
+        const logPath = join(dir, "job.log");
+        writeFileSync(
+            logPath,
+            "INFO started\nERROR: disk full\nWARN retrying\nfinished\n"
+        );
+        try {
+            const suffix = formatBackgroundEvidence(
+                makeJob({
+                    id: "job-background-evidence",
+                    logPath,
+                    status: "running",
+                })
+            );
+            assert.match(suffix, /4 lines \(1 err, 1 warn\)/);
+            assert.match(suffix, /last: finished/);
+            assert.ok(suffix.length <= 300);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
         }
     });
 
@@ -1418,7 +1515,13 @@ void describe(
             assert.ok(msg.content.includes(job2.id));
         });
 
-        void it("waits for output indexing before delivering completion metadata", async () => {
+        void it("waits for output indexing and includes terminal log evidence", async () => {
+            const dir = mkdtempSync(join(tmpdir(), "tau-completion-evidence-"));
+            const logPath = join(dir, "job.log");
+            writeFileSync(
+                logPath,
+                "INFO completed\nERROR: final failure\nlast line\n"
+            );
             const state = new TauState();
             const sentMessages: unknown[] = [];
             const pi = {
@@ -1449,6 +1552,7 @@ void describe(
             );
             const job = makeJob({
                 id: "job-indexed-completion",
+                logPath,
                 status: "failed",
                 exitCode: 1,
                 wantsCompletionNotification: true,
@@ -1467,12 +1571,31 @@ void describe(
 
             assert.equal(sentMessages.length, 1);
             const message = sentMessages[0] as {
-                details: { sourceId?: string; chunkIds?: string[] };
+                content: string;
+                details: {
+                    sourceId?: string;
+                    chunkIds?: string[];
+                    severityCounts?: {
+                        err: number;
+                        warn: number;
+                        total: number;
+                    };
+                };
             };
             assert.equal(message.details.sourceId, "src-indexed-completion");
             assert.deepEqual(message.details.chunkIds, [
                 "src-indexed-completion_0001",
             ]);
+            assert.deepEqual(message.details.severityCounts, {
+                err: 1,
+                warn: 0,
+                total: 3,
+            });
+            assert.match(
+                message.content,
+                /Output evidence: 3 lines \(1 err, 0 warn\); last: last line/
+            );
+            rmSync(dir, { recursive: true, force: true });
         });
 
         void it("delivers successful tmux completions when notify is enabled", async () => {
@@ -2501,6 +2624,31 @@ void describe("evaluatePendingDecisionGate", () => {
         const control = evaluatePendingDecisionGate(state, pi, "job_decide");
         assert.equal(control.block, undefined);
         assert.equal(sent.length, 1);
+    });
+
+    void it("includes bounded progress evidence in the decision steer", () => {
+        const dir = mkdtempSync(join(tmpdir(), "tau-decision-evidence-"));
+        const logPath = join(dir, "job.log");
+        writeFileSync(logPath, "INFO running\nERROR: connection failed\n");
+        try {
+            const job = makeJob({
+                id: "job-decision-evidence",
+                logPath,
+                status: "running",
+                startTime: Date.now() - 5_000,
+            });
+            const { state, pi, sent } = makeGateState(job, job.id);
+            evaluatePendingDecisionGate(state, pi, "edit");
+            const content = (sent[0].message as { content: string }).content;
+            assert.match(content, /Progress: 5s elapsed/);
+            assert.match(content, /2 lines/);
+            assert.match(content, /output growth since launch yes/);
+            assert.match(content, /1 err, 0 warn/);
+            assert.match(content, /first err: ERROR: connection failed/);
+            assert.ok(content.length < 500);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     void it("re-steers when a different job becomes pending", () => {

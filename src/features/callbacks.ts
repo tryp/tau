@@ -33,6 +33,11 @@ import type { TauState } from "../state.ts";
 import type { JobTrigger } from "../types.ts";
 import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
+import {
+    formatLogCounts,
+    jobLogEvidenceTracker,
+    oneLine,
+} from "./log-classify.ts";
 import { ensureTriggerMonitor, triggerLabel } from "./trigger-monitor.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -373,10 +378,41 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
         Date.now() - new Date(cb.createdAt).getTime()
     );
 
-    // If linked to a running job, include a resource snapshot
+    // If linked to a running job, include compact output evidence and a resource snapshot.
     let resourceLine = "";
+    let progressLine = "";
     if (cb.linkedJobId && _tauState) {
         const job = _tauState.backgroundJobs.get(cb.linkedJobId);
+        if (job && job.status === "running") {
+            try {
+                const evidence = jobLogEvidenceTracker.scan(
+                    job.id,
+                    job.logPath
+                );
+                if (evidence) {
+                    const ageMs = Math.max(
+                        0,
+                        Date.now() - evidence.lastWriteAt
+                    );
+                    const activity =
+                        ageMs >= 60_000
+                            ? `no output growth for ${formatDuration(ageMs)}`
+                            : `last output ${formatDuration(ageMs)} ago`;
+                    const sample = evidence.firstError
+                        ? `; first err: ${oneLine(evidence.firstError, 88)}`
+                        : "";
+                    const scanNote = evidence.truncated
+                        ? "; log scan capped"
+                        : "";
+                    progressLine = `\nJob progress: ${oneLine(
+                        `running ${formatDuration(Date.now() - job.startTime)}; ${formatLogCounts(evidence.counts)}; +${evidence.delta.total} lines since prior check (${evidence.delta.err} err, ${evidence.delta.warn} warn); ${activity}${sample}${scanNote}`,
+                        260
+                    )}`;
+                }
+            } catch {
+                // Best-effort evidence must never suppress a reminder.
+            }
+        }
         if (job && job.status === "running" && job.pid) {
             const procInfo = readProcSnapshot(job.pid);
             if (procInfo) {
@@ -438,6 +474,9 @@ function buildCallbackMessage(cb: ScheduledCallback): string {
         message += "\n</other_callbacks_pending>";
     }
 
+    if (progressLine) {
+        message += progressLine;
+    }
     if (resourceLine) {
         message += resourceLine;
     }

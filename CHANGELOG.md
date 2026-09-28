@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Features
+
+* **background:** include bounded error/warning line counts and output tails in background, jobs, decision, reminder, and completion notifications. `jobs output` reports cumulative severity counts and deltas since that job's previous output read. Linked reminders retain their existing auto-cancel-on-completion behavior; terminal evidence is attached to the native completion notification instead, avoiding a duplicate wake.
+
 ## [2.7.0](https://github.com/Mearman/tau/compare/v2.6.0...v2.7.0) (2026-06-17)
 
 ### Features
