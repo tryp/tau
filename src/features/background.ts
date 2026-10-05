@@ -989,6 +989,45 @@ export function formatBackgroundEvidence(
     }
 }
 
+/**
+ * Completion notice appended to backgrounding tool results, followed by the
+ * event-subscription reminder. The wake sentence matches the delivery rules
+ * in flushCompletionBatch:
+ * - "guaranteed": the job carries an explicit completion request (bash_bg
+ *   with notify !== false, job_decide keep) — success and failure deliver.
+ * - "failure-only": auto-backgrounded foreground job — failures always
+ *   deliver; a successful completion is suppressed until the agent links a
+ *   reminder (remind with jobId).
+ * - "none": bash_bg with notify === false — nothing delivers.
+ * Linking a reminder both requests completion delivery and arms triggers,
+ * so the subscription hint doubles as the fix for the suppressed case.
+ */
+function backgroundCompletionNotice(
+    mode: "guaranteed" | "failure-only" | "none"
+): string {
+    const subscribe =
+        ` To subscribe to events while it runs, use remind with jobId and ` +
+        `triggers — e.g. triggers: [{type:"outputLines", value: 200}] (log ` +
+        `reaches 200+ lines) or triggers: [{type:"outputMatch", pattern: "ERROR"}] ` +
+        `(pattern appears in the log).`;
+    switch (mode) {
+        case "guaranteed":
+            return "You will be notified when it completes." + subscribe;
+        case "failure-only":
+            return (
+                "You will be notified if it fails. To be notified on success " +
+                "too, link a reminder (remind with jobId)." +
+                subscribe
+            );
+        case "none":
+            return (
+                "You will not be notified when it completes. To be notified, " +
+                "link a reminder (remind with jobId)." +
+                subscribe
+            );
+    }
+}
+
 function logEvidenceMetadata(
     job: BackgroundJob,
     finalize = false,
@@ -2328,7 +2367,7 @@ export function registerBackgroundJobs(
                                 type: "text" as const,
                                 text:
                                     silenceNotice +
-                                    `Process backgrounded as ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}`,
+                                    `Process backgrounded as ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${command}\nPID: ${job.pid}\nOutput: ${job.logPath}\n\n${backgroundCompletionNotice("failure-only")}`,
                             },
                         ],
                         details: undefined,
@@ -2510,7 +2549,7 @@ export function registerBackgroundJobs(
                     content: [
                         {
                             type: "text" as const,
-                            text: `Started background job ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${params.command}\nOutput: ${job.logPath}`,
+                            text: `Started background job ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${params.command}\nOutput: ${job.logPath}\n\n${backgroundCompletionNotice(shouldNotify ? "guaranteed" : "none")}`,
                         },
                     ],
                     details: jobDetails(job),
@@ -2644,7 +2683,7 @@ export function registerBackgroundJobs(
                             `Started background job ${jobId}${formatBackgroundEvidence(job)}\n` +
                             `Command: ${params.command}\n` +
                             `PID: ${proc.pid}\n` +
-                            `Output: ${logPath}${extra}`,
+                            `Output: ${logPath}${extra}\n\n${backgroundCompletionNotice(shouldNotify ? "guaranteed" : "none")}`,
                     },
                 ],
                 details: jobDetails(job),
@@ -3732,7 +3771,7 @@ async function executeTmuxForeground(
                         type: "text" as const,
                         text:
                             silenceNotice +
-                            `Process backgrounded as ${jobId}${formatBackgroundEvidence(job)}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}`,
+                            `Process backgrounded as ${jobId}${formatBackgroundEvidence(job)}\nCommand: ${command}\nTmux window: ${tmuxCtx.windowId}\nOutput: ${logPath}\n\n${backgroundCompletionNotice("failure-only")}`,
                     },
                 ],
                 details: undefined,

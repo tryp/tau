@@ -2070,6 +2070,18 @@ void describe("bash cwd validation", () => {
                 /detached the still-running command to the background instead of killing it/
             );
             assert.match(text, /Process backgrounded as /);
+            assert.ok(
+                text.includes(
+                    "You will be notified if it fails. To be notified on success too, link a reminder (remind with jobId)."
+                ),
+                "auto-backgrounded notice must state the failure-only wake guarantee"
+            );
+            assert.ok(
+                text.includes(
+                    "To subscribe to events while it runs, use remind with jobId and triggers"
+                ),
+                "auto-backgrounded notice must include the event-subscription reminder"
+            );
             assert.equal(
                 state.runningProcesses.size,
                 0,
@@ -2146,7 +2158,7 @@ void describe("bash cwd validation", () => {
         const sentMessages: unknown[] = [];
         const bashBgTool = captureBashTool(state, "bash_bg", sentMessages);
 
-        await bashBgTool.execute(
+        const result = await bashBgTool.execute(
             "tc-bg-success-notify",
             { command: "printf direct-success" },
             undefined,
@@ -2159,6 +2171,20 @@ void describe("bash cwd validation", () => {
                     setStatus() {},
                 },
             } as never
+        );
+        assert.ok(
+            String(
+                (result.content[0] as { text?: string })?.text ?? ""
+            ).includes("You will be notified when it completes."),
+            "bash_bg notice must state the completion wake guarantee"
+        );
+        assert.ok(
+            String(
+                (result.content[0] as { text?: string })?.text ?? ""
+            ).includes(
+                "To subscribe to events while it runs, use remind with jobId and triggers"
+            ),
+            "bash_bg notice must include the event-subscription reminder"
         );
 
         let job: BackgroundJob | undefined;
@@ -2185,7 +2211,7 @@ void describe("bash cwd validation", () => {
         const sentMessages: unknown[] = [];
         const bashBgTool = captureBashTool(state, "bash_bg", sentMessages);
 
-        await bashBgTool.execute(
+        const result = await bashBgTool.execute(
             "tc-bg-success-silent",
             { command: "printf direct-silent", notify: false },
             undefined,
@@ -2198,6 +2224,19 @@ void describe("bash cwd validation", () => {
                     setStatus() {},
                 },
             } as never
+        );
+        const silentText = String(
+            (result.content[0] as { text?: string })?.text ?? ""
+        );
+        assert.ok(
+            silentText.includes("You will not be notified when it completes."),
+            "notify:false notice must not promise a completion wake"
+        );
+        assert.ok(
+            silentText.includes(
+                "To subscribe to events while it runs, use remind with jobId and triggers"
+            ),
+            "notify:false notice must still include the event-subscription reminder"
         );
 
         let job: BackgroundJob | undefined;

@@ -264,6 +264,31 @@ void describe(
                 /Process backgrounded as/
             );
 
+            // The backgrounding notice states the wake guarantee and how to
+            // subscribe to events — the agent otherwise has to infer that a
+            // successful completion is suppressed until a reminder is linked.
+            const noticeText = String(
+                (result.content[0] as { text?: string })?.text ?? ""
+            );
+            assert.ok(
+                noticeText.includes(
+                    "You will be notified if it fails. To be notified on success too, link a reminder (remind with jobId)."
+                ),
+                "auto-backgrounded notice must state the failure-only wake guarantee"
+            );
+            assert.ok(
+                noticeText.includes(
+                    "To subscribe to events while it runs, use remind with jobId and triggers"
+                ),
+                "auto-backgrounded notice must include the event-subscription reminder"
+            );
+            assert.ok(
+                noticeText.includes(
+                    'triggers: [{type:"outputLines", value: 200}]'
+                ),
+                "subscription reminder must give a concrete trigger example"
+            );
+
             // The tool result is the authoritative backgrounding notice; no
             // duplicate bg-timeout follow-up should wake the model.
             assert.equal(
@@ -383,6 +408,14 @@ void describe(
                             (result.content[0] as { text?: string })?.text ?? ""
                         ),
                         /Process backgrounded as /
+                    );
+                    assert.ok(
+                        String(
+                            (result.content[0] as { text?: string })?.text ?? ""
+                        ).includes(
+                            "You will be notified if it fails. To be notified on success too, link a reminder (remind with jobId)."
+                        ),
+                        "auto-backgrounded notice must state the failure-only wake guarantee"
                     );
 
                     const job = [...state.backgroundJobs.values()].find(
