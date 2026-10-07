@@ -15,9 +15,11 @@ import {
     writeFileSync,
     unlinkSync,
     mkdtempSync,
+    rmSync,
     statSync,
     appendFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -26,21 +28,20 @@ let tmpDir: string;
 let logPath: string;
 
 before(() => {
-    tmpDir = mkdtempSync("/tmp/pi-trigger-test-");
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-trigger-test-"));
     logPath = join(tmpDir, "test.log");
 });
 
 after(() => {
-    try {
-        unlinkSync(logPath);
-    } catch {
-        /* file may already be gone */
-    }
-    try {
-        unlinkSync(tmpDir);
-    } catch {
-        /* dir may already be gone */
-    }
+    // `rmSync` removes the directory and the log inside it. `unlinkSync` was
+    // used here before and silently did nothing: removing a DIRECTORY with
+    // unlink throws EISDIR, and the bare catch that wrapped the call swallowed
+    // it, so every run leaked one directory while the suite still reported
+    // success.
+    //
+    // Guarded because `before` may have failed before assigning `tmpDir`, in
+    // which case the real error is the one worth reporting.
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 });
 
 function writeLog(lines: string[]) {

@@ -7,7 +7,8 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { TauState } from "../state.ts";
@@ -30,15 +31,18 @@ interface SentMessage {
 }
 
 before(() => {
-    tmpDir = mkdtempSync("/tmp/pi-trigger-monitor-test-");
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-trigger-monitor-test-"));
 });
 
 after(() => {
-    try {
-        unlinkSync(tmpDir);
-    } catch {
-        /* dir may already be gone */
-    }
+    // `rmSync` removes the directory. `unlinkSync` was used here before and
+    // silently did nothing: removing a DIRECTORY with unlink throws EISDIR, and
+    // the bare catch that wrapped the call swallowed it, so every run leaked
+    // one directory while the suite still reported success.
+    //
+    // Guarded because `before` may have failed before assigning `tmpDir`, in
+    // which case the real error is the one worth reporting.
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 });
 
 function makeJob(overrides: Partial<BackgroundJob> = {}): BackgroundJob {
