@@ -18,6 +18,7 @@ import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { TauState } from "./state.ts";
 import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
+import { registerTimeoutNerf } from "./features/timeout-nerf/index.ts";
 import { isSafeCommand } from "./plan-utils.ts";
 import { Text } from "@earendil-works/pi-tui";
 import {
@@ -351,6 +352,11 @@ export default function (pi: ExtensionAPI) {
 
         return {};
     });
+
+    // Shell `timeout` wrappers pre-empt pi's own budget: they kill a command
+    // before it can be detached, or kill it after detach. Registered after the
+    // handler above so a `block` decision still short-circuits first.
+    registerTimeoutNerf(pi);
 
     // Handoff disabled — file path tracking removed
     // pi.on("tool_result", async (event) => {

@@ -1,0 +1,1612 @@
+{
+  "generated_by": "scripts/extract_timeout_fixtures.py",
+  "window_days": 30,
+  "files_scanned": 2902,
+  "cases": [
+    {
+      "category": "leading",
+      "command": "timeout 120 venv/bin/python3 -m pytest tests/test_port_reflection_fabrication_baseline.py::test_reflection_fabrication_a",
+      "expected": {
+        "token": "120",
+        "seconds": 120.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 300 venv/bin/python3 -m pytest tests/test_port_convention_rulings.py -q 2>&1 | tail -4",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 300 venv/bin/python3 -m pytest tests/test_port_convention_rulings.py -q 2>&1 | grep -E \"passed|failed\" | tail -3",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 300 venv/bin/python3 -m pytest \"tests/test_aefie_analytic.py::TestRWGDConsistentOrientation\" -q 2>&1 | tail -8; ",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 600 venv/bin/python3 -m pytest tests/test_aefie3d_coarse.py tests/test_aefie_analytic.py -q 2>&1 | grep -E \"FAIL",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 900 venv/bin/python3 -m pytest $(ls tests/test_*.py | awk -F/ '$NF <= \"test_aefie_analytic.py\"' | tr '\\n' ' ') -",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 600 venv/bin/python3 -m pytest tests/test_aefie3d_coarse.py -q -p no:cacheprovider 2>&1 | grep -E \"passed|failed",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 900 venv/bin/python3 -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_gpu_benchmark_perf.py 2>&1 | ta",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 600 venv/bin/python3 -m pytest tests/test_aefie3d_eigenvalue_spread.py tests/test_aefie_system.py -q -p no:cache",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 300 venv/bin/python3 -m pytest tests/ --collect-only -q -p no:cacheprovider --ignore=tests/test_gpu_benchmark_pe",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 300 venv/bin/python3 -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_gpu_benchmark_perf.py -k \"solut",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 180 venv/bin/python3 -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_gpu_benchmark_perf.py -k \"solut",
+      "expected": {
+        "token": "180",
+        "seconds": 180.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "leading",
+      "command": "timeout 900 venv/bin/python3 -m pytest tests/test_calderon_gpu_hypothesis.py tests/test_gpu_deflation_hypothesis.py test",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/pi-session-analysis && timeout 60 python3 -m session_analysis.cli worktree inventory 2>&1 | head -100",
+      "expected": {
+        "token": "60",
+        "seconds": 60.0,
+        "start": 36,
+        "end": 46
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -c \"\nfrom backends.solvers.ports.catalog import coupling_report\nrows=c",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q 2>&1 | tail -5",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py tests/test_dense_dispatc",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q --tb=line -k \"runs_af",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q --tb=short 2>&1 | gre",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 1800 git commit -q -F - <<'MSG'\n«heredoc»",
+      "expected": {
+        "token": "1800",
+        "seconds": 1800.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 nice -n 19 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(STEP|CASE|live|VERDICT|  )\"\nf",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -c \"\nfrom backends.utils.bridge_capability_probe import probe_bridge_c",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python scripts/probe_cprime_block_structure.py --rungs 6 --out /tmp/verify_pr",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_cprime_frequency_cli.py -q 2>&1 | tail -3; echo \"",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q -p no:randomly 2>&1 |",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "cd-and-timeout",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -c \"import tests.test_gpu_dense_lu_analytic\" 2>&1 | grep -vE \"scipy|IN",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/pi-session-analysis && timeout 90 python3 -m session_analysis.cli worktree sessions 2>&1 | head -150",
+      "expected": {
+        "token": "90",
+        "seconds": 90.0,
+        "start": 36,
+        "end": 46
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q -k \"ClosedFormOracles",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 1800 venv/bin/python -m pytest tests/test_dense_dispatch.py tests/test_gpu_dense_lu.py tes",
+      "expected": {
+        "token": "1800",
+        "seconds": 1800.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu.py tests/test_dense_dispatch.py test",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q --tb=line -k \"closed_",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q --tb=long 2>&1 | grep",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && echo \"=== cited-artifacts lint ===\"; timeout 600 venv/bin/python scripts/lint_cited_artifacts.py 2",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 59,
+        "end": 70
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(shared|legacy|extended|fp64|fp32|rung|VE",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -u -c \"\nimport sys; sys.path.insert(0,'.')\nfrom scripts.measure_surfac",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && nice -n 19 timeout 600 venv/bin/python -c \"\nimport json,urllib.request\nd=json.load(open('tmp/caps.",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 33,
+        "end": 44
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_capacity_constant_ratchet.py -q --tb=short 2>&1 |",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && nice -n 19 timeout 900 venv/bin/python -c \"\nimport numpy as np, json\nfrom backends.solvers.operato",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 33,
+        "end": 44
+      }
+    },
+    {
+      "category": "embedded",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -p no:randomly 2>&1 | gr",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /tmp && rm -f nerf.log && setsid timeout 60 sleep 45 > nerf.log 2>&1 &\nsleep 0.3\nTPID=$(pgrep -f \"timeout 60 sleep 45",
+      "expected": {
+        "token": "60",
+        "seconds": 60.0,
+        "start": 36,
+        "end": 46
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q -k \"vandermonde\" 2>&1",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_vkfft_bridge_dense_lu_seam.py -q --tb=line 2>&1 |",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_dense_dispatch.py tests/test_gpu_dense_lu.py test",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"VERIFY\"\nimport sys; sys.path.insert(0,'.')",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -c \"\nimport sys; sys.path.insert(0,'.')\nfrom backends.peec_pfft.cut_st",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && git add doc/research/2026-10-06-dense-lu-size-ladder.md && timeout 1800 git commit -q -F - <<'MSG'",
+      "expected": {
+        "token": "1800",
+        "seconds": 1800.0,
+        "start": 81,
+        "end": 93
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(shared|  |legacy|extended|fp64|fp32|rung",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 1200 venv/bin/python -u scripts/probe_cprime_block_structure.py --rungs 6 2>&1 | grep -vE ",
+      "expected": {
+        "token": "1200",
+        "seconds": 1200.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python scripts/probe_streamed_factorization_feasibility.py 2>&1 | grep -vE \"s",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && cat > backends/solvers/operators/primitives/_ratchet_probe_tmp.py <<'EOF'\n«heredoc»\ntimeout 300 ve",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 106,
+        "end": 117
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && PYTHONPATH=/repo/src/sippi nice -n 19 timeout 600 venv/bin/python /tmp/route_probe.py 2>&1 | grep ",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 60,
+        "end": 71
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && echo \"=== 1. lint on the real repo ===\"; timeout 600 venv/bin/python scripts/lint_named_cause.py 2",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 63,
+        "end": 74
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 600 make lint-port-models lint-port-ratchet 2>&1 | tail -12; echo \"--- exit $? ---\"; git s",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py --collect-only -q 2>&1 |",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 600 make lint 2>&1 | tail -8; echo \"=== EXIT $? ===\"",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"RESULT|Error|error\" | head -8\nimport numpy",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | tail -18\nimport sys; sys.path.insert(0,'.')\nimport ",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python scripts/lint_cited_artifacts.py 2>&1 | tail -12",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 900 nice -n 19 venv/bin/python - <<'PYEOF' 2>&1 | tail -14\nimport numpy as np\nfrom backend",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(shared|device|fp64|fp32|rung|VERDICT)\"\nf",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 1500 venv/bin/python -u scripts/probe_cprime_block_structure.py --rungs 6 2>&1 | grep -vE ",
+      "expected": {
+        "token": "1500",
+        "seconds": 1500.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 1200 venv/bin/pyright 2>&1 | tail -4; echo \"=== are the failing files in MY change set? ==",
+      "expected": {
+        "token": "1200",
+        "seconds": 1200.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -B -m scripts.test_runner --collect-coverage 2>&1 | tail -6; echo \"RC=",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && PYTHONPATH=/repo/src/sippi timeout 300 venv/bin/python /tmp/gpu_probe.py 2>&1 | grep -E \"^(unbound",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 49,
+        "end": 60
+      }
+    },
+    {
+      "category": "pipeline",
+      "command": "cd /repo/src/sippi && sed -i 's|^        later = |        later = |' scripts/lint_named_cause.py; timeout 900 venv/bin/p",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 98,
+        "end": 109
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "nice -n 19 ionice -c 3 timeout --signal=TERM --kill-after=15s 180s make check-docs",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 23,
+        "end": 66
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 600s nice -n 19 ionice",
+      "expected": {
+        "token": "600s",
+        "seconds": 600.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 180s taskset -c 2 nice",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 330s nice -n 19 ionice",
+      "expected": {
+        "token": "330s",
+        "seconds": 330.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=15s 300s nice -n 19 ionice -c 3 make bridge-local",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=15s 300s nice -n 19 ionice -c 3 make lint",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=15s 180s nice -n 19 ionice -c 3 venv/bin/pyright backends/peec_pfft/rooftop/_g_matrix",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=15s 180s nice -n 19 ionice -c 3 make typecheck-doctor",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=10s 60s nice -n 19 ionice ",
+      "expected": {
+        "token": "60s",
+        "seconds": 60.0,
+        "start": 59,
+        "end": 101
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 120s nice -n 19 ionice",
+      "expected": {
+        "token": "120s",
+        "seconds": 120.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=15s 120s nice -n 19 ionice -c 3 venv/bin/python3 -m scripts.test_runner rooftop-pair-",
+      "expected": {
+        "token": "120s",
+        "seconds": 120.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=30s 5400s venv/bin/python3 tmp/analyze_vpath_terms.py --mesh-rungs 1 2 3 4 > tmp/vpat",
+      "expected": {
+        "token": "5400s",
+        "seconds": 5400.0,
+        "start": 0,
+        "end": 44
+      }
+    },
+    {
+      "category": "flag-kill-after",
+      "command": "timeout --signal=TERM --kill-after=30s 3600s ./venv/bin/python scripts/measure_parallel_plate_stub_ymirror_corner.py",
+      "expected": {
+        "token": "3600s",
+        "seconds": 3600.0,
+        "start": 0,
+        "end": 44
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "tail -12 tmp/gate-attempt5/full.log; cat tmp/gate-attempt5/run.jsonl | tail -8; pgrep -af 'timeout --signal=TERM 600 ven",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 91,
+        "end": 116
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "ps -p 3179141 -o pid,ppid,stat,etime,cmd; pgrep -af 'timeout --signal=TERM 600 venv/bin/python3 -u tmp/gate-attempt4.py'",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 53,
+        "end": 78
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 240s nice -n 19 ionice",
+      "expected": {
+        "token": "240s",
+        "seconds": 240.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 180s nice -n 19 ionice",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 59,
+        "end": 102
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=15s 90s nice -n 19 ionice ",
+      "expected": {
+        "token": "90s",
+        "seconds": 90.0,
+        "start": 59,
+        "end": 101
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "nice -n 19 ionice -c 3 make typecheck-doctor && timeout --signal=TERM --kill-after=15s 300s nice -n 19 ionice -c 3 make ",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 48,
+        "end": 91
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "timeout --signal=TERM --kill-after=15s 180s nice -n 19 ionice -c 3 make check-docs",
+      "expected": {
+        "token": "180s",
+        "seconds": 180.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "timeout --signal=TERM --kill-after=15s 240s nice -n 19 ionice -c 3 make typecheck",
+      "expected": {
+        "token": "240s",
+        "seconds": 240.0,
+        "start": 0,
+        "end": 43
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 timeout --signal=TERM --kill-after=10s 90s nice -n 19 ionice ",
+      "expected": {
+        "token": "90s",
+        "seconds": 90.0,
+        "start": 59,
+        "end": 101
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "timeout --signal=TERM --kill-after=15s 90s nice -n 19 ionice -c 3 venv/bin/python3 -m pytest tests/test_rooftop_pair_str",
+      "expected": {
+        "token": "90s",
+        "seconds": 90.0,
+        "start": 0,
+        "end": 42
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "mkdir -p tmp && timeout --signal=TERM --kill-after=30s 5400s venv/bin/python3 scripts/measure_surface_terminal_mode_impe",
+      "expected": {
+        "token": "5400s",
+        "seconds": 5400.0,
+        "start": 16,
+        "end": 60
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "timeout --signal=INT --kill-after=60s 21600s ./venv/bin/python -u scripts/measure_coax_g_streaming.py --stage stage2 > t",
+      "expected": {
+        "token": "21600s",
+        "seconds": 21600.0,
+        "start": 0,
+        "end": 44
+      }
+    },
+    {
+      "category": "flag-signal",
+      "command": "mkdir -p tmp/logs && timeout --signal=TERM 3600 ./venv/bin/python scripts/measure_parallel_plate_stub_transverse_corner.",
+      "expected": {
+        "token": "3600",
+        "seconds": 3600.0,
+        "start": 21,
+        "end": 47
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 120s tail -f /dev/null; ps -o pid,etime,time,%cpu,%mem,nlwp,stat -p 3708716; tail -3 tmp/logs/cprime-rung7-threa",
+      "expected": {
+        "token": "120s",
+        "seconds": 120.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 120s tail -f /dev/null; ps -o pid,etime,time,%cpu,%mem,nlwp,stat -p 3708716; ps -L -o time,%cpu,stat -p 3708716 ",
+      "expected": {
+        "token": "120s",
+        "seconds": 120.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "mkdir -p tmp/logs && timeout 300s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 n",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 21,
+        "end": 33
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 120s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nice -n 19 ionice -c 3",
+      "expected": {
+        "token": "120s",
+        "seconds": 120.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "mkdir -p tmp/logs && timeout 600s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 n",
+      "expected": {
+        "token": "600s",
+        "seconds": 600.0,
+        "start": 21,
+        "end": 33
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 300s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nice -n 19 ionice -c 3",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 600s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nice -n 19 ionice -c 3",
+      "expected": {
+        "token": "600s",
+        "seconds": 600.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 750s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nice -n 19 ionice -c 3",
+      "expected": {
+        "token": "750s",
+        "seconds": 750.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 360s nice -n 19 ionice -c 3 venv/bin/python3 -m pytest tests/test_calibrated_rung4_correspondence.py -q",
+      "expected": {
+        "token": "360s",
+        "seconds": 360.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "mkdir -p tmp/logs && timeout 90m nice -n 19 ionice -c 3 venv/bin/python3 -m pytest tests/test_calibrated_rung4_correspon",
+      "expected": {
+        "token": "90m",
+        "seconds": 5400.0,
+        "start": 21,
+        "end": 32
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 90m nice -n 19 ionice -c 3 venv/bin/python3 - <<'PY' 2>&1 | tee tmp/logs/calibrated-rung4-correspondence-values.",
+      "expected": {
+        "token": "90m",
+        "seconds": 5400.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 90m nice -n 19 ionice -c 3 venv/bin/python3 -m pytest tests/test_calibrated_terminal_source.py -q -vv",
+      "expected": {
+        "token": "90m",
+        "seconds": 5400.0,
+        "start": 0,
+        "end": 11
+      }
+    },
+    {
+      "category": "explicit-unit",
+      "command": "timeout 300s env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS",
+      "expected": {
+        "token": "300s",
+        "seconds": 300.0,
+        "start": 0,
+        "end": 12
+      }
+    },
+    {
+      "category": "quoted-mention",
+      "command": "cd /repo/src/pi-session-analysis && echo \"=== references to analyze_timeout_usage / analyze-timeout-usage ===\" && rg -n ",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "cd /repo/src/pi-session-analysis && grep -n \"timeout\" Makefile && echo \"=== .PHONY / help convention ===\" && sed -n '1,2",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "cd /repo/src/pi-session-analysis && make help 2>/dev/null | grep -E \"mutcheck|124|timeout-usage\" && echo \"=== full suite",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "ls ~/.pi/agent/local/ 2>/dev/null; echo \"=== any extension already rewriting bash timeout? ===\"; rg -rln \"tool_call\" ~/.",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "node --input-type=module -e '\nconst m = await import(\"./extensions/timeout-nerf/src/parse.ts\");\nfor (const c of [\"cd /x ",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "cat /tmp/pi-tmux-1482551/pi-bg-sippi-8da4088f.1482551-muwytzj7-ecvx.out; echo; grep -c \"Timeout\" /tmp/pi-tmux-1482551/pi",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "grep -n \"^test:\\|pytest\" Makefile | head -8; echo ---; timeout 240 venv/bin/python3 -m pytest \"tests/test_gpu_dgks.py::T",
+      "expected": {
+        "token": "240",
+        "seconds": 240.0,
+        "start": 55,
+        "end": 66
+      }
+    },
+    {
+      "category": "quoted-mention",
+      "command": "grep -n \"FAILED\\|=== FAILURES\\|Timeout\" tmp/dgks-attribution.out | head -8; sed -n '/=====/,$p' tmp/dgks-attribution.out",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "cd /repo/src/pi-session-analysis && make help 2>/dev/null | grep -E \"timeout-nerf|fixtures\" && make -n test-timeout-nerf",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "ps -eo pid,ppid,etime,pcpu,rss,stat,args | grep -E 'diagnose_xstar|timeout 3000' | grep -v grep",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "ps -eo pid,etime,pcpu,rss,stat,args | grep -E 'diagnose_xstar|timeout 3000' | grep -v grep; stat -c '%s %y' tmp/xstar-n2",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "date -u +%H:%M:%SZ; ps -eo pid,etime,pcpu,rss,stat,args | grep -E 'diagnose_xstar|timeout 3000' | grep -v grep; stat -c ",
+      "expected": null
+    },
+    {
+      "category": "quoted-mention",
+      "command": "date -u +%H:%M:%SZ; ps -eo pid,etime,pcpu,rss,stat,args | grep -E 'diagnose_xstar|timeout 3000' | grep -v grep; tail -c ",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && wc -l scripts/analyze_timeout_usage.py scripts/grant_subagent_job_tools.py scripts/s",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 scripts/analyze_timeout_usage.py --days 30 2>&1 | head -60; echo \"exit=$?\"",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && head -30 session_analysis/tests/test_predeploy_smoke.py && echo \"=== timeout.py head",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "ps -o pid,etime,%cpu,rss,cmd -C python3 2>/dev/null | grep -i timeout | head -3; echo \"=== files in last 30d ===\"; find ",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 -m pytest session_analysis/tests/test_timeout_usage.py -q 2>&1 | tail -40",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 -m pytest session_analysis/tests/test_timeout_usage.py -q 2>&1 | tail -25",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && sed -n '14,21p' Makefile && echo \"=== dry runs ===\" && make -n analyze-timeout-usage",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && ruff check session_analysis/timeout_usage.py session_analysis/tests/test_timeout_usa",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 scripts/analyze_timeout_usage.py --help 2>&1 | head -20",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 -m pytest session_analysis/tests/test_timeout_usage.py session_analysis/test",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 -m session_analysis.timeout_usage --project pi-session-analysis --limit 400 ",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 -m pytest session_analysis/tests/test_timeout_usage.py -q 2>&1 | tail -12 &&",
+      "expected": null
+    },
+    {
+      "category": "non-invocation",
+      "command": "cd /repo/src/pi-session-analysis && python3 tmp/mutcheck_timeout_usage.py 2>&1 | tail -25",
+      "expected": null
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q -k \"off_triangle\" 2>&",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && timeout 900 taskset -c 2 ./venv/bin/python3 -m pytest tests/test_rooftop_g_pair_contract.py -q 2>&",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && git cherry-pick 69628620a c734be46c 2>&1 | tail -1 && timeout 300 make check-docs 2>&1 | tail -1 &",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 76,
+        "end": 87
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi/tmp/worktrees/long-fixture-cert && timeout 300 make check-docs > /tmp/cdc.out 2>&1; echo \"docs: $?\" &",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 54,
+        "end": 65
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi/tmp/worktrees/ports-familya-rest && timeout 900 make worktree-setup REPLACE=1 > /tmp/wt-setup.log 2>&",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 55,
+        "end": 66
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "mkdir -p tmp/logs && nohup timeout --signal=INT --kill-after=60s 21600s ./venv/bin/python -u scripts/measure_coax_g_stre",
+      "expected": {
+        "token": "21600s",
+        "seconds": 21600.0,
+        "start": 27,
+        "end": 71
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "nohup timeout --signal=INT --kill-after=60s 21600s /repo/src/sippi/venv/bin/python -u /repo/src/sippi/scripts/measure_co",
+      "expected": {
+        "token": "21600s",
+        "seconds": 21600.0,
+        "start": 6,
+        "end": 50
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && mkdir -p tmp/logs && nohup timeout --signal=TERM 18000s ./venv/bin/python -u scripts/measure_coax_",
+      "expected": {
+        "token": "18000s",
+        "seconds": 18000.0,
+        "start": 49,
+        "end": 77
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi; mkdir -p tmp/logs; nohup timeout --signal=TERM 18000s ./venv/bin/python -u scripts/measure_coax_cost",
+      "expected": {
+        "token": "18000s",
+        "seconds": 18000.0,
+        "start": 45,
+        "end": 73
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && timeout 240 venv/bin/python -m pytest tests/test_port_source_dual_adjoint.py -q 2>&1 | tail -1 && ",
+      "expected": {
+        "token": "240",
+        "seconds": 240.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi && nohup timeout 3600 venv/bin/python -u scripts/probe_equipotential_port_coupling.py --width-ladder ",
+      "expected": {
+        "token": "3600",
+        "seconds": 3600.0,
+        "start": 28,
+        "end": 40
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/xfail-inventory && mkdir -p tmp/logs && nohup timeout 10800 nice -n 10 venv/bin/p",
+      "expected": {
+        "token": "10800",
+        "seconds": 10800.0,
+        "start": 85,
+        "end": 98
+      }
+    },
+    {
+      "category": "self-backgrounded",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/xfail-inventory && nohup timeout 5400 nice -n 5 venv/bin/python3 -u scripts/audit",
+      "expected": {
+        "token": "5400",
+        "seconds": 5400.0,
+        "start": 64,
+        "end": 76
+      }
+    },
+    {
+      "category": "network-client",
+      "command": "cd /tmp\ntimeout 120 curl -sL https://raw.githubusercontent.com/google/clspv/main/docs/OpenCLCOnVulkan.md -o clspv_onvulk",
+      "expected": {
+        "token": "120",
+        "seconds": 120.0,
+        "start": 8,
+        "end": 19
+      }
+    },
+    {
+      "category": "network-client",
+      "command": "cd /repo/src/sippi\necho \"=== clvk issue #657 (the one actually cited) ===\"\ntimeout 120 curl -sL \"https://api.github.com/",
+      "expected": {
+        "token": "120",
+        "seconds": 120.0,
+        "start": 75,
+        "end": 86
+      }
+    },
+    {
+      "category": "network-client",
+      "command": "find /nix/store -maxdepth 2 -iname '*xnec2c*' -o -iname '*nec2c*' 2>/dev/null | head -30; timeout 12 curl -ILsS https://",
+      "expected": {
+        "token": "12",
+        "seconds": 12.0,
+        "start": 90,
+        "end": 100
+      }
+    },
+    {
+      "category": "network-client",
+      "command": "cd /tmp && timeout 300 curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh && wc -l /tmp/uv-install.sh && s",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 11,
+        "end": 22
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "python3 -c 'from session_analysis.timeout_usage import timeout_invocation; cases=[\"cd /x && timeout 300 pytest -q\",\"rg \\",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 92,
+        "end": 103
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -v -k \"Device\" 2>&1 | gr",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m ruff check tests/test_gpu_dense_lu_analytic.py tests/test_dense_dis",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q --tb=long -k \"runs_af",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -v --tb=line -k \"LiveDis",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 1800 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py tests/test_dense_dispat",
+      "expected": {
+        "token": "1800",
+        "seconds": 1800.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 make check-docs 2>&1 | tail -8; echo \"=== rung 7 ===\"; grep -vE \"scipy|INFO|\\[log\\]\" t",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_derived_capacity.py tests/test_block_elimination.",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/pyright backends/solvers/operators/primitives/derived_capacity.py backends/so",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 1200 venv/bin/pyright --outputjson 2>/dev/null > /tmp/pyr.json; venv/bin/python -c \"\nimpor",
+      "expected": {
+        "token": "1200",
+        "seconds": 1200.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 1200 nice -n 19 venv/bin/python -m pytest tests/test_gpu_leaf_dispatch.py tests/test_gpu_d",
+      "expected": {
+        "token": "1200",
+        "seconds": 1200.0,
+        "start": 22,
+        "end": 34
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q -p no:randomly --co 2",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "long-command",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python -m pytest tests/test_lint_named_cause.py -q -p no:randomly -k SingleLi",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 300 python -c \"\nfrom backends.solvers.ports.catalog import coupling_report\nrows=coupling_r",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && rg -n '\\\\n' tests/test_vkfft_bridge_basic.py | head -5; echo \"=== run that file ===\"; timeout 600 ",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 108,
+        "end": 119
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | tail -20\nimport sys; sys.path.insert(0,'tests'); sy",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"VERIFY\" \nimport numpy as np\nfrom backends.",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 300 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^VERIFY\"\nimport sys; sys.path.insert(0,'.'",
+      "expected": {
+        "token": "300",
+        "seconds": 300.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -c \"\nimport sys; sys.path.insert(0,'.')\nfrom scripts.measure_surface_t",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 900 nice -n 19 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(SCENARIO|first|second|live|CO",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python - <<'PYEOF' 2>&1 | grep -E \"^(shared|fp64|fp32|rung|VERDICT|headroom)\"",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 22,
+        "end": 33
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && nice -n 19 timeout 600 venv/bin/python -c \"\nimport numpy as np, json\nd=np.load('tmp/cprime_cache/r",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 33,
+        "end": 44
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && nice -n 19 timeout 1800 venv/bin/python -u scripts/probe_cprime_block_structure.py --rungs 7 --out",
+      "expected": {
+        "token": "1800",
+        "seconds": 1800.0,
+        "start": 33,
+        "end": 45
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && nice -n 19 timeout 900 venv/bin/python -c \"\nimport numpy as np\nfrom backends.solvers.operators.pri",
+      "expected": {
+        "token": "900",
+        "seconds": 900.0,
+        "start": 33,
+        "end": 44
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && PYTHONPATH=/repo/src/sippi timeout 600 venv/bin/python /tmp/gpu_probe2.py 2>&1 | grep -vE \"scipy|I",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 49,
+        "end": 60
+      }
+    },
+    {
+      "category": "short-command",
+      "command": "cd /repo/src/sippi && timeout 600 venv/bin/python scripts/lint_named_cause.py 2>&1 | tail -5; echo \"exit=$?\"",
+      "expected": {
+        "token": "600",
+        "seconds": 600.0,
+        "start": 22,
+        "end": 33
+      }
+    }
+  ]
+}
