@@ -9,7 +9,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync } from "node:fs";
+import {
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -372,7 +378,7 @@ void describe("timeout-nerf agent messaging", () => {
 });
 
 void describe("timeout-nerf extension wiring", () => {
-    void it("mutates bash input in place, annotates its result, and clears pending rewrites", async () => {
+    void it("mutates bash input in place, annotates its result, and clears pending rewrites", async (t) => {
         const handlers = new Map<string, unknown[]>();
         const appendedEntries: Array<{ customType: string; data: unknown }> =
             [];
@@ -406,6 +412,7 @@ void describe("timeout-nerf extension wiring", () => {
         // A real directory: the hook refuses to lift one it cannot resolve,
         // because a directory that does not exist cannot be entered.
         const realDir = mkdtempSync(join(tmpdir(), "nerf-wiring-"));
+        t.after(() => rmSync(realDir, { recursive: true, force: true }));
         const event = {
             type: "tool_call",
             toolCallId: "call-1",
@@ -565,7 +572,7 @@ void describe("timeout-nerf extension wiring", () => {
         assert.equal(countOf("timeout-nerf-collision"), 1);
     });
 
-    void it("refuses to lift a `cd` that a symlink would make logical", async () => {
+    void it("refuses to lift a `cd` that a symlink would make logical", async (t) => {
         // The tool sets the process working directory, so the shell reports the
         // PHYSICAL path, while `cd` sets the LOGICAL one. `cd <symlink> && pwd`
         // and `pwd` with `cwd: <symlink>` therefore disagree, so the `cd` must
@@ -587,6 +594,7 @@ void describe("timeout-nerf extension wiring", () => {
         ) => unknown;
 
         const real = mkdtempSync(join(tmpdir(), "nerf-real-"));
+        t.after(() => rmSync(real, { recursive: true, force: true }));
         const nested = join(real, "nested");
         mkdirSync(nested);
         const link = join(real, "link");
@@ -781,8 +789,9 @@ void describe("timeout-nerf shell equivalence", () => {
         }
     }
 
-    void it("runs every rewritten command with the original's behavior", async () => {
+    void it("runs every rewritten command with the original's behavior", async (t) => {
         const tmp = mkdtempSync(join(tmpdir(), "nerf-equiv-"));
+        t.after(() => rmSync(tmp, { recursive: true, force: true }));
         const nested = join(tmp, "nested");
         mkdirSync(nested);
         const link = join(tmp, "link");
