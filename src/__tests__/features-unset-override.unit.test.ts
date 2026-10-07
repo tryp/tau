@@ -3,7 +3,7 @@
  * specific scope (in-memory or file-based).
  */
 
-import { afterEach, before, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -16,14 +16,16 @@ import {
 
 const TEST_ROOT = join(tmpdir(), "tau-test-features-unset");
 
-before(() => {
+// Each test starts from an empty root. Recreating it in `afterEach` instead
+// would leave one fixed-name directory behind after the last test, since
+// nothing runs after the final cleanup.
+beforeEach(() => {
     rmSync(TEST_ROOT, { recursive: true, force: true });
     mkdirSync(TEST_ROOT, { recursive: true });
 });
 
 afterEach(() => {
     rmSync(TEST_ROOT, { recursive: true, force: true });
-    mkdirSync(TEST_ROOT, { recursive: true });
 });
 
 function readJsonFile(path: string): Record<string, unknown> {
