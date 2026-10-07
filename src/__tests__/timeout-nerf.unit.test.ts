@@ -1123,10 +1123,17 @@ void describe("timeout-nerf shell equivalence", () => {
 
     function runShell(command: string): { code: number; output: string } {
         try {
-            const stdout = execFileSync("bash", ["-c", command], {
-                encoding: "utf8",
-                stdio: ["ignore", "pipe", "pipe"],
-            });
+            // `pipefail`, so a pipeline reports its failing member rather than
+            // the last command: without it `timeout 300 | /bin/cat` reports 0
+            // and the oracle assertion below would pass vacuously.
+            const stdout = execFileSync(
+                "bash",
+                ["-o", "pipefail", "-c", command],
+                {
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                }
+            );
             return { code: 0, output: stdout.trim() };
         } catch (error) {
             const failure = error as {
@@ -1182,6 +1189,78 @@ void describe("timeout-nerf shell equivalence", () => {
         }
     });
 
+    void it("refuses a short option's `=`, and a head that cannot name a program", () => {
+        // GNU getopt hands a SHORT option the whole remainder, so `-s=TERM` is
+        // the value `=TERM` and GNU exits 125 ("invalid signal"); splitting on
+        // `=` would rewrite a command that never ran. A long option does take
+        // `=`, and an attached short value does not use one.
+        for (const command of [
+            "timeout -s=TERM 300 make",
+            "timeout -k=5s 300 make",
+            "timeout -s= 300 make",
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "skip", command);
+            assert.equal(plan.reason, "unknown-flag", command);
+        }
+        for (const command of [
+            "timeout --signal=TERM 300 make",
+            "timeout --kill-after=5s 300 make",
+            "timeout -sTERM 300 make",
+            "timeout -k5s 300 make",
+        ]) {
+            assert.equal(planNerf(command).action, "rewrite", command);
+        }
+        // A construct opener is bash syntax rather than a program: `timeout`
+        // execs its argument, so these exit 127 as written while the same text
+        // alone runs. A quoted or expanded head may expand to nothing, which
+        // makes the original a commandless wrapper (exit 125) and the rewrite an
+        // empty command (exit 0). Refusing costs a rewrite and cannot produce a
+        // wrong one.
+        for (const command of [
+            "timeout 300 { make; }",
+            "timeout 300 [[ 1 ]]",
+            "timeout 300 ! make",
+            "timeout 300 (make)",
+            "timeout 300 ${CMD}",
+            "timeout 300 $CMD > /dev/null",
+            "timeout 300 $CMD 2>&1",
+            "timeout 300 $(which make)",
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "skip", command);
+            assert.equal(plan.reason, "not-a-command", command);
+        }
+        // A builtin with no external counterpart goes to the builtin guard, not
+        // to this one.
+        for (const command of [
+            "timeout 300 command make",
+            "timeout 300 time make",
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "skip", command);
+            assert.equal(plan.reason, "shell-builtin", command);
+        }
+        // Plain heads still rewrite, including the shapes the guard could be
+        // tempted to over-refuse: a head with a trailing separator, a quoted
+        // expansion and an expansion with literal text all leave an argument
+        // behind when the value is empty, so the two forms fail identically.
+        for (const command of [
+            "timeout 300 make",
+            "timeout 300 ./build.sh -j4",
+            "timeout 300 /usr/bin/make",
+            "timeout 300 [ -f /etc/hostname ]",
+            "timeout 300 make -j4",
+            "timeout 300 true; echo hi",
+            'timeout 300 "$CMD"',
+            "timeout 300 $CMD/x",
+            "timeout 300 $CMD make",
+            "timeout 300 $PY script.py",
+        ]) {
+            assert.equal(planNerf(command).action, "rewrite", command);
+        }
+    });
+
     void it("never rewrites a prefix GNU itself would have rejected", () => {
         // The rewrite claims that stripping the wrapper is equivalent, and for
         // the wrapper to have run the command at all GNU has to accept the
@@ -1198,18 +1277,25 @@ void describe("timeout-nerf shell equivalence", () => {
             "timeout -s 65 300 true",
             "timeout -s 999 300 true",
             "timeout -s FOO 300 true",
-            "timeout -s RTMIN+3 300 true",
+            "timeout -s=TERM 300 true",
+            "timeout -k=5s 300 true",
             "timeout -x 300 true",
             "timeout 300 && true",
             "timeout 300 | /bin/cat",
             "timeout 300 > /dev/null",
             "timeout 300 2>&1",
             "timeout 300\ntrue",
+            "timeout 300 (true)",
+            "timeout 300 { true; }",
+            "timeout 300 [[ 1 ]]",
+            "timeout 300 ${CMD}",
+            "timeout 300 command true",
             // GNU accepts the prefix: these must still rewrite, so a guard that
             // simply refuses more cannot satisfy this test either.
             "timeout 300 true",
             "timeout 1.5h true",
             "timeout -k 5s 300 true",
+            "timeout -k 1e3 300 true",
             "timeout -v 300 true",
             "timeout -- 300 true",
         ]) {
@@ -1220,6 +1306,21 @@ void describe("timeout-nerf shell equivalence", () => {
                 0,
                 `${command}: rewritten although GNU did not accept the prefix`
             );
+        }
+        // The guard refuses some forms GNU accepts, deliberately, and those are
+        // the one direction this test cannot check. An RT offset's bound is the
+        // libc's (`RTMIN+30` is accepted here, `RTMIN+31` is not) and a `-s`
+        // NUMBER is accepted by GNU in bands that no bound can express, so both
+        // are left alone rather than guessed at. The reason is asserted so a
+        // future guard cannot silently start rewriting them.
+        for (const command of [
+            "timeout -s RTMIN+3 300 true",
+            "timeout -s 9 300 true",
+            "timeout -s 15 300 true",
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "skip", command);
+            assert.equal(plan.reason, "signal-value", command);
         }
         for (const command of [
             "timeout 300 true",

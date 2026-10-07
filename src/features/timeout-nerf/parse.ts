@@ -75,14 +75,18 @@ const ATTACHED_ARG_FLAG_RE = /^-[ks][A-Za-z0-9_.+-]+$/;
 // case-insensitively and with or without the `SIG` prefix, so the POSIX set is
 // safe on every libc; the Linux-only names (`POLL`, `STKFLT`, `PWR`, `IOT`,
 // `CLD`) are left out, because refusing one costs a rewrite while accepting one
-// a libc lacks would run a command GNU rejected. A NUMBER is refused outright:
-// measured on coreutils 9.10, `-s 65` and `-s 100` exit 125 while `-s 128`,
-// `-s 256` and `-s 300` are accepted (the number wraps to a byte before the
-// range check), so no numeric bound is right. RT forms are accepted bare, never
-// with an offset, because the offset's bound is the libc's RT range (measured:
-// `RTMIN+30` accepted, `RTMIN+31` and `RTMAX+1` rejected). Measured corpus
-// usage: `--signal=TERM` (908 occurrences) and `--signal=INT` (13), both in the
-// set, so validating names preserves those rewrites.
+// a libc lacks would run a command GNU rejected. A NUMBER is refused outright,
+// because GNU's acceptance of one follows no rule a rewrite can rely on:
+// measured on coreutils 9.10, `-s 0` through `-s 64` are accepted but `-s 65`
+// through `-s 127` are not, `-s 128` through `-s 192` are accepted again, and
+// values at or above 2^32 are refused whatever their low bits are. So `-s 9`
+// and `-s 15` are refused although GNU accepts them, and no numeric bound would
+// be right. RT forms are accepted bare, never with an offset, because the
+// offset's bound is the libc's RT range (measured: `RTMIN+30` accepted,
+// `RTMIN+31` and `RTMAX+1` rejected). Measured corpus usage: 160 invocations
+// carry a signal flag and their values are `TERM` (155) and `INT` (5), both in
+// the set; no numeric or unknown-name value appears at all. So validating names
+// preserves every real signal rewrite while still refusing what GNU rejects.
 const SIGNAL_FLAGS = new Set(["-s", "--signal"]);
 const SIGNAL_NAMES = new Set([
     "HUP",
@@ -194,8 +198,13 @@ function resolvePrefix(rest: string): ResolvedPrefix | null {
         const token = rest.slice(position, end);
         if (token.startsWith("-")) {
             // Split the name from an attached value (`--signal=TERM`, `-k5s`) so
-            // the guard can check the value against the flag it belongs to.
-            const equalAt = token.indexOf("=");
+            // the guard can check the value against the flag it belongs to. Only
+            // a LONG option may carry its value after `=`: GNU getopt hands a
+            // short option the whole remainder, so `-s=TERM` is the value `=TERM`
+            // (GNU exits 125, "invalid signal") and splitting it would rewrite a
+            // command that never ran. `-s=TERM` and `-k=5s` then fall through to
+            // the flag check as unknown flags and are refused there.
+            const equalAt = token.startsWith("--") ? token.indexOf("=") : -1;
             const attached =
                 equalAt === -1 ? ATTACHED_ARG_FLAG_RE.exec(token) : null;
             const name =
@@ -309,6 +318,7 @@ const SHELL_ONLY_BUILTINS = new Set([
     "builtin",
     "caller",
     "cd",
+    "command",
     "compgen",
     "complete",
     "compopt",
@@ -342,6 +352,7 @@ const SHELL_ONLY_BUILTINS = new Set([
     "shopt",
     "source",
     "suspend",
+    "time",
     "times",
     "trap",
     "type",
@@ -354,6 +365,32 @@ const SHELL_ONLY_BUILTINS = new Set([
 ]);
 // The first bare word of a command, used only to spot such a target.
 const FIRST_WORD_RE = /^[^\s;&|<>()]+/;
+// Heads that are bash syntax rather than a program name.
+const CONSTRUCT_HEAD_RE = /^(?:\{|\[\[|\]\]|!)$/;
+
+/**
+ * Whether a head word can vanish entirely.
+ *
+ * An UNQUOTED expansion-only head (`${CMD}`, `$CMD`, `$(which make)`) expands to
+ * nothing when the value is empty, which leaves the original a commandless
+ * wrapper: measured, `timeout 300 ${UNSET}` exits 125 while the rewrite
+ * `${UNSET}` exits 0. A quoted expansion or one with literal text is different
+ * -- `timeout 300 "$UNSET"`, `"$UNSET"/x` and `$UNSET/x` all exit 127, the same
+ * as their rewrites, because the empty result is still an argument -- so those
+ * are left alone rather than refused.
+ */
+function headCanVanish(word: string): boolean {
+    if (/["']/.test(word)) return false;
+    return (
+        word
+            .replace(/\$\{[^}]*\}/g, "")
+            .replace(/\$\([^()]*\)/g, "")
+            .replace(/`[^`]*`/g, "")
+            .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, "")
+            .replace(/\$[0-9@*#?$!-]/g, "")
+            .trim() === ""
+    );
+}
 
 function skipped(
     command: string,
@@ -432,10 +469,45 @@ export function planNerf(command: string, options: NerfOptions = {}): NerfPlan {
     // not. All of those predate this change and are the same class: there is no
     // command after the prefix, so there is nothing safe to strip. A backslash
     // continuation is not a separator, so `timeout 300 \` + newline + `make`
-    // stays eligible. Measured corpus cost: 0 -- over 3,911 rewrites found in
-    // real sessions, no tail began with a control operator or a redirection -- so
-    // this guard too is correctness-only, not something a session needed.
-    if (/^[ \t]*[0-9]*[;&|<>()\r\n]/.test(command.slice(invocation.end))) {
+    // stays eligible. Measured corpus cost: 0 -- of 69,158 rewrites on the
+    // filtered 30d corpus (2,723 files), none began with a control operator, a
+    // redirection, a construct opener, or a quoted or expanded head -- so these
+    // guards too are correctness-only, not something a session needed.
+    const tailText = command.slice(invocation.end);
+    if (/^[ \t]*[0-9]*[;&|<>()\r\n]/.test(tailText)) {
+        return skipped(command, "not-a-command", invocation);
+    }
+    // The head has to be able to name a program. A construct opener is bash
+    // syntax rather than a program, and a head that vanishes leaves a commandless
+    // wrapper behind (see headCanVanish). Both measured as conversions:
+    // `timeout 300 { make; }` is 2 -> 0 and `timeout 300 ${UNSET}` is 125 -> 0.
+    // A vanishing head is only dangerous when nothing can take its place, so a
+    // later plain word keeps the rewrite: `timeout 300 $CMD make` and `timeout
+    // 300 $PY script.py` run the same thing either way (measured 0 -> 0), because
+    // an empty head simply leaves the next word as the command. A redirection is
+    // not a command, nor is the word after one, so `$CMD > f` and `$CMD 2>&1`
+    // are still refused. Trailing separators are stripped first, so `timeout 300
+    // true; echo hi` is left alone (measured 0 -> 0). A builtin with no external
+    // counterpart (`command`, `time`, `cd`) is caught below by
+    // SHELL_ONLY_BUILTINS instead.
+    const tailWords = tailText.trim().split(/\s+/);
+    const headWord = (tailWords[0] ?? "").replace(/^[;&|]+|[;&|]+$/g, "");
+    // A token split inside a substitution -- `$(which make)` contains a space, so
+    // the head token is only `$(which` -- is not the whole head and cannot be
+    // judged; it is refused rather than guessed at.
+    const headIsSplitSubstitution = /\$\([^()]*$|`[^`]*$/.test(headWord);
+    const rest = tailWords.slice(1);
+    const hasStandbyCommand = rest.some(
+        (word, index) =>
+            !/[;&|<>]/.test(word) &&
+            !/[;&|<>]$/.test(index === 0 ? headWord : (rest[index - 1] ?? ""))
+    );
+    if (
+        headWord !== "" &&
+        (CONSTRUCT_HEAD_RE.test(headWord) ||
+            headIsSplitSubstitution ||
+            (headCanVanish(headWord) && !hasStandbyCommand))
+    ) {
         return skipped(command, "not-a-command", invocation);
     }
     // A signal flag's value has to be one GNU resolves. A number cannot be
