@@ -356,7 +356,7 @@ export default function (pi: ExtensionAPI) {
     // Shell `timeout` wrappers pre-empt pi's own budget: they kill a command
     // before it can be detached, or kill it after detach. Registered after the
     // handler above so a `block` decision still short-circuits first.
-    registerTimeoutNerf(pi);
+    registerTimeoutNerf(pi, state);
 
     // Handoff disabled — file path tracking removed
     // pi.on("tool_result", async (event) => {

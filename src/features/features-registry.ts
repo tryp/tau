@@ -167,7 +167,7 @@ export const FEATURE_REGISTRY: ReadonlyArray<FeatureDef> = [
         defaultOn: true,
     },
 
-    // ── Background (3) ────────────────────────────────────────────
+    // ── Background (4) ────────────────────────────────────────────
     {
         id: "agent-background",
         label: "Agent backgrounding",
@@ -186,6 +186,14 @@ export const FEATURE_REGISTRY: ReadonlyArray<FeatureDef> = [
         id: "reload",
         label: "Reload tool",
         description: "Reload extensions, skills, prompts, and themes",
+        group: "Background",
+        defaultOn: true,
+    },
+    {
+        id: "timeout-nerf",
+        label: "Timeout nerf",
+        description:
+            "Replace leading shell `timeout` wrappers with pi's own process controls",
         group: "Background",
         defaultOn: true,
     },

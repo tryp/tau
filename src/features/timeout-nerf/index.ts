@@ -13,6 +13,8 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { TauState } from "../../state.ts";
+import { isFeatureEnabled } from "../features-helpers.ts";
 import { bashGuidelines, nerfNote } from "./messages.ts";
 import { planNerf } from "./parse.ts";
 import type { NerfPlan } from "./parse.ts";
@@ -72,8 +74,16 @@ function cwdLiftIsFaithful(dir: string): boolean {
     }
 }
 
-/** Register the timeout rewrite and its explicit agent-facing explanation. */
-export function registerTimeoutNerf(pi: ExtensionAPI): void {
+/**
+ * Register the timeout rewrite and its explicit agent-facing explanation.
+ *
+ * `state` is tau's feature state. It is optional so the feature stays loadable
+ * on its own (`pi -e src/features/timeout-nerf/index.ts`, which the end-to-end
+ * check relies on): with no state there is nothing to toggle, so the hook stays
+ * on. `src/index.ts` passes state, which is what makes the registry entry in
+ * `features-registry.ts` take effect at call time.
+ */
+export function registerTimeoutNerf(pi: ExtensionAPI, state?: TauState): void {
     const pending = new Map<string, NerfPlan>();
 
     const api = pi as PiWithOptionalGuidelines;
@@ -83,6 +93,9 @@ export function registerTimeoutNerf(pi: ExtensionAPI): void {
 
     pi.on("tool_call", (event) => {
         if (event.toolName !== "bash") return;
+        // Soft toggle. The registry entry is what makes `/tau set timeout-nerf
+        // off` a valid id; this is what makes the setting change behaviour.
+        if (state && !isFeatureEnabled(state, "timeout-nerf")) return;
         const input = event.input as BashInputWithCwd;
         const command = input.command;
         if (typeof command !== "string") return;

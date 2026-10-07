@@ -1,3 +1,11 @@
+/** A flag standing between `timeout` and its duration. */
+export interface TimeoutFlag {
+    /** The flag's name: `-k`, `--signal` (an attached value is split off). */
+    name: string;
+    /** Its value (`5s`, `KILL`), or null when the flag takes none. */
+    value: string | null;
+}
+
 /** A resolved shell `timeout` invocation inside a bash command string. */
 export interface TimeoutInvocation {
     /** Duration as written: "300", "90s", "1.5h", "2h30m". */
@@ -8,12 +16,17 @@ export interface TimeoutInvocation {
     start: number;
     /** Index just past that prefix. */
     end: number;
+    /** The flags the invocation carries, in order (`-k`, `--foreground`). */
+    flags: TimeoutFlag[];
 }
 
 /**
  * Resolve the FIRST resolvable `timeout` invocation, or null.
  *
- * This mirrors `session_analysis.timeout_usage.timeout_invocation`.
+ * This mirrors `session_analysis.timeout_usage.timeout_invocation`, which counts
+ * the habit and therefore stays permissive about flags. The rewrite guards in
+ * `planNerf` are deliberately stricter than the oracle: recognising a form as a
+ * `timeout` call and being willing to rewrite it are separate decisions.
  */
 export function findTimeoutInvocation(
     command: string
@@ -31,6 +44,7 @@ export function findTimeoutInvocation(
             seconds: resolved.seconds,
             start,
             end: afterName + resolved.offset,
+            flags: resolved.flags,
         };
     }
     return null;
@@ -43,7 +57,108 @@ const DURATION_UNIT_SECONDS: Record<string, number> = {
     h: 3600,
     d: 86400,
 };
+// GNU `timeout`'s option set, matching the wrapper pattern upstream uses in
+// `features/permissions/bash.ts`. Only these may precede the duration: an
+// unrecognised flag makes `timeout` itself fail (`timeout -x 300 cmd` exits 125
+// with "invalid option"), so the command never ran and stripping the wrapper
+// would convert that failure into a success.
+const BOOLEAN_FLAGS = new Set([
+    "-v",
+    "--verbose",
+    "--foreground",
+    "--preserve-status",
+]);
 const ARG_FLAGS = new Set(["-k", "--kill-after", "-s", "--signal"]);
+// `-k5s` / `-sKILL`: the value rides on the flag token instead of following it.
+const ATTACHED_ARG_FLAG_RE = /^-[ks][A-Za-z0-9_.+-]+$/;
+// `-s`/`--signal` is validated by NAME. GNU resolves a name through `str2sig`,
+// case-insensitively and with or without the `SIG` prefix, so the POSIX set is
+// safe on every libc; the Linux-only names (`POLL`, `STKFLT`, `PWR`, `IOT`,
+// `CLD`) are left out, because refusing one costs a rewrite while accepting one
+// a libc lacks would run a command GNU rejected. A NUMBER is refused outright:
+// measured on coreutils 9.10, `-s 65` and `-s 100` exit 125 while `-s 128`,
+// `-s 256` and `-s 300` are accepted (the number wraps to a byte before the
+// range check), so no numeric bound is right. RT forms are accepted bare, never
+// with an offset, because the offset's bound is the libc's RT range (measured:
+// `RTMIN+30` accepted, `RTMIN+31` and `RTMAX+1` rejected). Measured corpus
+// usage: `--signal=TERM` (908 occurrences) and `--signal=INT` (13), both in the
+// set, so validating names preserves those rewrites.
+const SIGNAL_FLAGS = new Set(["-s", "--signal"]);
+const SIGNAL_NAMES = new Set([
+    "HUP",
+    "INT",
+    "QUIT",
+    "ILL",
+    "TRAP",
+    "ABRT",
+    "BUS",
+    "FPE",
+    "KILL",
+    "USR1",
+    "SEGV",
+    "USR2",
+    "PIPE",
+    "ALRM",
+    "TERM",
+    "CHLD",
+    "CONT",
+    "STOP",
+    "TSTP",
+    "TTIN",
+    "TTOU",
+    "URG",
+    "XCPU",
+    "XFSZ",
+    "VTALRM",
+    "PROF",
+    "WINCH",
+    "SYS",
+]);
+const REALTIME_SIGNAL_RE = /^(?:SIG)?RT(?:MIN|MAX)$/;
+
+/** Whether GNU `timeout` itself would accept this `-s`/`--signal` value. */
+function isGnuSignal(value: string): boolean {
+    const upper = value.toUpperCase();
+    return (
+        SIGNAL_NAMES.has(upper.replace(/^SIG/, "")) ||
+        REALTIME_SIGNAL_RE.test(upper)
+    );
+}
+// GNU accepts a decimal number with at most one LOWERCASE unit suffix, and
+// rejects an uppercase one: `timeout 5S true` exits 125 ("invalid time
+// interval '5S'"). Measured as accepted: `5`, `5s`, `1.5h`, `.5s`, `+5s`,
+// `5.`, `05s`, `1e3`. Measured as rejected: `5S`, `5ss`, `5s5`, ``. `-k` takes
+// the same grammar, so it is validated by the same rule.
+const GNU_DURATION_RE = /^\+?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[smhd]?$/;
+
+/** Whether GNU `timeout` itself would accept this duration token. */
+function isGnuDuration(token: string): boolean {
+    return GNU_DURATION_RE.test(token);
+}
+
+/**
+ * Whether the invocation carries a flag GNU `timeout` accepts before its
+ * duration, with a value GNU would accept for that flag.
+ *
+ * Both halves matter for the same reason: `timeout -x 300 cmd` and
+ * `timeout -k foo 300 cmd` each make `timeout` itself exit 125 before the
+ * command runs, so stripping the wrapper would convert a failure into a
+ * success. A flag GNU would have accepted is stripped as usual.
+ */
+function isKnownTimeoutFlag(flag: TimeoutFlag): boolean {
+    if (flag.name === "--") return flag.value === null;
+    if (BOOLEAN_FLAGS.has(flag.name)) return flag.value === null;
+    if (flag.name === "-k" || flag.name === "--kill-after") {
+        // `-k`'s value is a time interval, so the same rule as the bound applies:
+        // GNU rejects `-k 5S` exactly as it rejects `5S`.
+        return flag.value !== null && isGnuDuration(flag.value);
+    }
+    // `-s`/`--signal` values are validated by the caller (see SIGNAL_FLAGS);
+    // reaching here means the value resolved, so the flag is accepted. Anything
+    // else is a flag GNU itself would have rejected.
+    if (SIGNAL_FLAGS.has(flag.name)) return true;
+    return false;
+}
 // GNU `timeout` accepts one number with at most ONE unit suffix: "300", "90s",
 // "1.5h". A compound token such as "2h30m" is rejected outright
 // (`timeout: invalid time interval`, exit 125), so accepting it here would
@@ -62,11 +177,14 @@ interface ResolvedPrefix {
     token: string;
     seconds: number;
     offset: number;
+    /** The flags between `timeout` and the duration, in order. */
+    flags: TimeoutFlag[];
 }
 
 /** Mirrors the Python oracle's whitespace/token/flag walking exactly. */
 function resolvePrefix(rest: string): ResolvedPrefix | null {
     let position = 0;
+    const flags: TimeoutFlag[] = [];
     while (position < rest.length) {
         while (position < rest.length && /\s/.test(rest[position])) position++;
         let end = position;
@@ -75,22 +193,43 @@ function resolvePrefix(rest: string): ResolvedPrefix | null {
 
         const token = rest.slice(position, end);
         if (token.startsWith("-")) {
-            position = end;
+            // Split the name from an attached value (`--signal=TERM`, `-k5s`) so
+            // the guard can check the value against the flag it belongs to.
             const equalAt = token.indexOf("=");
-            const flagName = equalAt === -1 ? token : token.slice(0, equalAt);
-            if (ARG_FLAGS.has(flagName) && equalAt === -1) {
+            const attached =
+                equalAt === -1 ? ATTACHED_ARG_FLAG_RE.exec(token) : null;
+            const name =
+                equalAt !== -1
+                    ? token.slice(0, equalAt)
+                    : attached
+                      ? token.slice(0, 2)
+                      : token;
+            let value =
+                equalAt !== -1
+                    ? token.slice(equalAt + 1)
+                    : attached
+                      ? token.slice(2)
+                      : null;
+            position = end;
+            if (ARG_FLAGS.has(name) && value === null) {
+                // `-k 5s`: the value is the next token.
                 while (position < rest.length && /\s/.test(rest[position]))
                     position++;
-                while (position < rest.length && !/\s/.test(rest[position]))
-                    position++;
+                let valueEnd = position;
+                while (valueEnd < rest.length && !/\s/.test(rest[valueEnd]))
+                    valueEnd++;
+                if (valueEnd === position) return null;
+                value = rest.slice(position, valueEnd);
+                position = valueEnd;
             }
+            flags.push({ name, value });
             continue;
         }
 
         const cleaned = token.replace(/^[;|&()<>]+|[;|&()<>]+$/g, "");
         const seconds = parseDurationSeconds(cleaned);
         if (seconds === null) return null;
-        return { token: cleaned, seconds, offset: end };
+        return { token: cleaned, seconds, offset: end, flags };
     }
     return null;
 }
@@ -105,6 +244,11 @@ export type SkipReason =
     | "network-client"
     | "shell-builtin"
     | "tool-timeout-set"
+    | "unknown-flag"
+    | "line-break"
+    | "non-gnu-duration"
+    | "not-a-command"
+    | "signal-value"
     | "disabled";
 
 export interface NerfPlan {
@@ -256,6 +400,61 @@ export function planNerf(command: string, options: NerfOptions = {}): NerfPlan {
     // the wrapper is left alone instead.
     if (invocation.seconds === 0) {
         return skipped(command, "no-bound", invocation);
+    }
+    // The flags and the duration must sit on the same line as `timeout`: a line
+    // break is a command separator in bash, so a prefix that crossed one belongs
+    // to a different command than the text following it. Upstream guards the
+    // same boundary with `[ \t]+` rather than `\s+` in
+    // `features/permissions/bash.ts`. This is checked here rather than inside
+    // `resolvePrefix` so that recognition stays permissive for the habit-counting
+    // oracle while the rewrite refuses a form whose bound cannot be trusted.
+    if (/[\r\n]/.test(command.slice(invocation.start, invocation.end))) {
+        return skipped(command, "line-break", invocation);
+    }
+    // The bound must be one GNU itself would accept. `parseDurationSeconds`
+    // above is deliberately permissive because it also mirrors the habit-counting
+    // oracle, which lowercases the unit; GNU does not. `timeout 5S true` exits 125
+    // ("invalid time interval '5S'") without running `true`, so stripping that
+    // wrapper would turn a command that never ran into one that runs. Measured
+    // corpus cost: 0 -- the uppercase forms appear only in this project's own
+    // transcripts. The guard is kept because the two parsers disagree by design,
+    // not because a session needed it.
+    if (!isGnuDuration(invocation.token)) {
+        return skipped(command, "non-gnu-duration", invocation);
+    }
+    // The text after the prefix must start a command. A newline separates
+    // commands, and a leading operator or redirection means the prefix is not a
+    // prefix: `timeout 300 && make` and `timeout 300 | cat` become `&& make` and
+    // `| cat`, which bash rejects with a syntax error (measured: the `|` form
+    // turns the original's exit 0 into exit 2), `timeout 300 > f` becomes `> f`,
+    // which creates an empty file where the original exited 125, and
+    // `timeout 300 2>&1 make` becomes something that runs where the original did
+    // not. All of those predate this change and are the same class: there is no
+    // command after the prefix, so there is nothing safe to strip. A backslash
+    // continuation is not a separator, so `timeout 300 \` + newline + `make`
+    // stays eligible. Measured corpus cost: 0 -- over 3,911 rewrites found in
+    // real sessions, no tail began with a control operator or a redirection -- so
+    // this guard too is correctness-only, not something a session needed.
+    if (/^[ \t]*[0-9]*[;&|<>()\r\n]/.test(command.slice(invocation.end))) {
+        return skipped(command, "not-a-command", invocation);
+    }
+    // A signal flag's value has to be one GNU resolves. A number cannot be
+    // checked at all (see SIGNAL_NAMES), and an unknown name makes GNU exit 125
+    // before the command runs, so both are refused here rather than falling
+    // through to the generic flag check, which would report the flag rather
+    // than the value that failed.
+    if (
+        invocation.flags.some(
+            (flag) =>
+                SIGNAL_FLAGS.has(flag.name) && !isGnuSignal(flag.value ?? "")
+        )
+    ) {
+        return skipped(command, "signal-value", invocation);
+    }
+    // Recognising only the flags upstream recognises keeps a command that could
+    // never have run from being rewritten into one that does.
+    if (invocation.flags.some((flag) => !isKnownTimeoutFlag(flag))) {
+        return skipped(command, "unknown-flag", invocation);
     }
 
     // A prologue is either empty or a `cd ... &&` / `cd ... ;` prefix. Anything

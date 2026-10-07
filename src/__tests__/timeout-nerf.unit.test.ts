@@ -33,6 +33,7 @@ import type {
     ToolCallEvent,
     ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
+import type { TauState } from "../state.ts";
 
 interface CorpusExpected {
     token: string;
@@ -67,8 +68,19 @@ void describe("timeout-nerf parser", () => {
 
         for (const fixtureCase of corpus.cases) {
             const result = findTimeoutInvocation(fixtureCase.command);
+            // The fixture holds the Python oracle's spans, and the oracle has no
+            // notion of `flags` (a rewrite-side addition), so compare the fields
+            // the oracle defines rather than the whole object.
+            const oracleFields = result
+                ? {
+                      token: result.token,
+                      seconds: result.seconds,
+                      start: result.start,
+                      end: result.end,
+                  }
+                : null;
             assert.deepEqual(
-                result,
+                oracleFields,
                 fixtureCase.expected,
                 `category=${fixtureCase.category} command=${JSON.stringify(fixtureCase.command)}`
             );
@@ -119,12 +131,14 @@ void describe("timeout-nerf parser", () => {
             seconds: 5400,
             start: 0,
             end: "timeout 1.5h".length,
+            flags: [],
         });
         assert.deepEqual(findTimeoutInvocation("/usr/bin/timeout 300 x"), {
             token: "300",
             seconds: 300,
             start: 0,
             end: "/usr/bin/timeout 300".length,
+            flags: [],
         });
         assert.equal(findTimeoutInvocation("timeout -k 5 300 x")?.token, "300");
         assert.equal(
@@ -374,6 +388,344 @@ void describe("timeout-nerf agent messaging", () => {
                 `${command}: remindDelay ${args.remindDelay} >= timeout ${args.timeout}s`
             );
         }
+    });
+});
+
+void describe("timeout-nerf alignment with upstream's timeout handling", () => {
+    void it("refuses an unrecognised flag, which GNU timeout would reject", () => {
+        // `timeout -x 300 make` exits 125 ("invalid option") without running the
+        // command, so stripping the wrapper would convert a failure into a
+        // success. Only the flags upstream's wrapper pattern accepts are allowed.
+        const plan = planNerf("timeout -x 300 make");
+        assert.equal(plan.action, "skip");
+        assert.equal(plan.reason, "unknown-flag");
+    });
+
+    void it("accepts the flags whose values GNU's grammar can verify", () => {
+        // A signal flag is accepted when its value is a name GNU resolves; a
+        // number or an unknown name is refused (see the signal test).
+        for (const flags of [
+            "-v 300",
+            "--verbose 300",
+            "--foreground 300",
+            "--preserve-status 300",
+            "-k 5s 300",
+            "-k5s 300",
+            "--kill-after=5s 300",
+            "--kill-after 5s 300",
+            "-s KILL 300",
+            "-sKILL 300",
+            "--signal=KILL 300",
+            "--signal KILL 300",
+            "-s TERM 300",
+            "--signal=SIGTERM 300",
+            "-s RTMIN 300",
+            "-- 300",
+        ]) {
+            const plan = planNerf(`timeout ${flags} make`);
+            assert.equal(plan.action, "rewrite", flags);
+            assert.equal(plan.rewritten, "make", flags);
+        }
+    });
+
+    void it("records each flag with the value it owns", () => {
+        assert.deepEqual(
+            findTimeoutInvocation("timeout -v -k 5s 300 make")?.flags,
+            [
+                { name: "-v", value: null },
+                { name: "-k", value: "5s" },
+            ]
+        );
+        assert.deepEqual(
+            findTimeoutInvocation("timeout --signal=KILL -k5s 300 make")?.flags,
+            [
+                { name: "--signal", value: "KILL" },
+                { name: "-k", value: "5s" },
+            ]
+        );
+        assert.deepEqual(findTimeoutInvocation("timeout 300 make")?.flags, []);
+    });
+
+    void it("refuses a kill-after value GNU would reject", () => {
+        // `-k` takes a time interval, so `timeout -k foo 300 make` exits 125
+        // ("invalid time interval") without running `make`; stripping the wrapper
+        // would hide that failure. The bound's own parser validates it here.
+        for (const command of [
+            "timeout -k foo 300 make",
+            "timeout -k 2h30m 300 make",
+            "timeout --kill-after=foo 300 make",
+            "timeout -k= 300 make",
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "skip", command);
+            assert.equal(plan.reason, "unknown-flag", command);
+        }
+    });
+
+    void it("refuses a duration GNU rejects even though the oracle accepts it", () => {
+        // `parseDurationSeconds` lowercases the unit because it also mirrors the
+        // habit-counting oracle; GNU does not. `timeout 5S true` exits 125
+        // ("invalid time interval '5S'") without running `true`, so stripping
+        // that wrapper would turn a command that never ran into one that runs.
+        for (const duration of ["5S", "5M", "5H", "5D", "2H", "1H"]) {
+            const plan = planNerf(`timeout ${duration} make`);
+            assert.equal(plan.action, "skip", duration);
+            assert.equal(plan.reason, "non-gnu-duration", duration);
+        }
+        // `-k` takes the same grammar, so its value is checked by the same rule.
+        for (const flag of ["-k 5S 300", "--kill-after=5S 300"]) {
+            const plan = planNerf(`timeout ${flag} make`);
+            assert.equal(plan.action, "skip", flag);
+            assert.equal(plan.reason, "unknown-flag", flag);
+        }
+        // The forms GNU accepts still rewrite. `+5s`, `.5s`, `5.` and `1e3` are
+        // also GNU-valid but are not recognised by the shared parser at all, so
+        // they are skipped earlier as `no-duration` -- a missed rewrite, never a
+        // wrong one.
+        for (const duration of ["300", "1.5h", "05s", "5m", "90s"]) {
+            const plan = planNerf(`timeout ${duration} make`);
+            assert.equal(plan.action, "rewrite", duration);
+        }
+        for (const duration of ["+5s", ".5s", "5.", "1e3"]) {
+            assert.equal(
+                planNerf(`timeout ${duration} make`).reason,
+                "no-duration"
+            );
+        }
+    });
+
+    void it("refuses a signal value it cannot resolve", () => {
+        // GNU's acceptance of a `-s` NUMBER is not reproducible: `-s 65` and
+        // `-s 100` exit 125, but `-s 128`, `-s 256` and `-s 300` are accepted
+        // (the number wraps to a byte before the range check), so no numeric
+        // bound is right and every number is refused. An unknown name exits 125
+        // too, and an RT offset's bound is the libc's (`RTMIN+30` accepted,
+        // `RTMIN+31` rejected), so offsets are refused as well.
+        for (const signal of [
+            "9",
+            "0",
+            "65",
+            "999",
+            "FOO",
+            "SIGFOO",
+            "RTMINX",
+            "RTMIN+3",
+            "SIGRTMAX-1",
+        ]) {
+            for (const form of [
+                `-s ${signal} 300 make`,
+                `-s${signal} 300 make`,
+                `--signal=${signal} 300 make`,
+                `--signal ${signal} 300 make`,
+            ]) {
+                const plan = planNerf(`timeout ${form}`);
+                assert.equal(plan.action, "skip", form);
+                assert.equal(plan.reason, "signal-value", form);
+            }
+        }
+        // An empty value is refused too. The `-s` forms above cannot express it:
+        // `-s` takes the next token as its value, which shifts the duration and
+        // fails recognition instead.
+        assert.equal(
+            planNerf("timeout --signal= 300 make").reason,
+            "signal-value"
+        );
+        // A name GNU resolves is accepted in every spelling and case, which is
+        // what keeps the corpus's `--signal=TERM` invocations rewritable.
+        for (const signal of [
+            "TERM",
+            "KILL",
+            "SIGKILL",
+            "kill",
+            "INT",
+            "SIGTERM",
+            "RTMIN",
+            "SIGRTMAX",
+        ]) {
+            for (const form of [
+                `-s ${signal} 300 make`,
+                `-s${signal} 300 make`,
+                `--signal=${signal} 300 make`,
+                `--signal ${signal} 300 make`,
+            ]) {
+                const plan = planNerf(`timeout ${form}`);
+                assert.equal(plan.action, "rewrite", form);
+                assert.equal(plan.rewritten, "make", form);
+            }
+        }
+    });
+
+    void it("refuses a prefix that spans a line break", () => {
+        // A newline is a command separator in bash, so a flag or duration on the
+        // next line belongs to a different command. Upstream guards the same
+        // boundary by matching `[ \t]+` rather than `\s+`.
+        const plan = planNerf("timeout\n300 make");
+        assert.equal(plan.action, "skip");
+        assert.equal(plan.reason, "line-break");
+    });
+
+    void it("refuses when the wrapped command starts on a later line", () => {
+        // `timeout 300` with no operand exits 125, so the original run failed
+        // before `make` ran; stripping the wrapper would hide that failure.
+        const plan = planNerf("timeout 300\nmake");
+        assert.equal(plan.action, "skip");
+        assert.equal(plan.reason, "not-a-command");
+    });
+
+    void it("refuses a tail with no command after the prefix", () => {
+        // Each of these leaves no command to strip the wrapper from. Measured,
+        // original vs the rewrite the extension used to produce:
+        //   `timeout 300 | cat`    exit 0   -> `| cat`    exit 2 (syntax error)
+        //   `timeout 300 > f`      exit 125 -> `> f`      exit 0, creates f
+        //   `timeout 300 2>&1`     exit 125 -> `2>&1`     exit 0
+        //   `timeout 300 && make`  exit 125 -> `&& make`  exit 2
+        for (const tail of [
+            "&& make",
+            "|| make",
+            "| cat",
+            "> f",
+            ">> f",
+            "< in",
+            "2>&1",
+            "2>&1 make",
+            "& sleep 1",
+            ";\nmake",
+        ]) {
+            const plan = planNerf(`timeout 300 ${tail}`);
+            assert.equal(plan.action, "skip", tail);
+            assert.equal(plan.reason, "not-a-command", tail);
+        }
+    });
+
+    void it("still rewrites a tail that starts a command, digit-led included", () => {
+        // A leading digit is only a redirection when a separator follows it, so
+        // `7z` and `2to3` are commands. `3>&1 make` does have a command, but
+        // telling that from `2>&1` needs a shell grammar, and refusing only
+        // costs a missed rewrite.
+        for (const [command, expected] of [
+            ["timeout 300 make -j4", "make -j4"],
+            ["timeout 300 7z x a.7z", "7z x a.7z"],
+            ["timeout 300 2to3 -w x.py", "2to3 -w x.py"],
+        ]) {
+            const plan = planNerf(command);
+            assert.equal(plan.action, "rewrite", command);
+            assert.equal(plan.rewritten, expected, command);
+        }
+        assert.equal(planNerf("timeout 300 3>&1 make").reason, "not-a-command");
+    });
+
+    void it("still rewrites a backslash continuation, which is not a separator", () => {
+        const plan = planNerf("timeout 300 \\\n  make");
+        assert.equal(plan.action, "rewrite");
+        assert.equal(plan.rewritten, "\\\n  make");
+    });
+
+    void it("still rewrites a multi-line command whose timeout is on one line", () => {
+        const plan = planNerf("cd /tmp &&\n  timeout 300 make");
+        assert.equal(plan.action, "rewrite");
+        assert.equal(plan.rewritten, "make");
+        assert.equal(plan.cwd, "/tmp");
+    });
+});
+
+void describe("timeout-nerf soft toggle", () => {
+    function fakePi() {
+        const handlers = new Map<string, unknown[]>();
+        const appended: Array<{ customType: string; data: unknown }> = [];
+        const pi = {
+            on(event: string, handler: unknown) {
+                const list = handlers.get(event) ?? [];
+                list.push(handler);
+                handlers.set(event, list);
+            },
+            appendEntry(customType: string, data: unknown) {
+                appended.push({ customType, data });
+            },
+            registerToolPromptGuidelines() {},
+        } as unknown as ExtensionAPI;
+        return { pi, handlers, appended };
+    }
+
+    function toolCallHandler(handlers: Map<string, unknown[]>) {
+        return handlers.get("tool_call")?.[0] as
+            | ((event: ToolCallEvent) => unknown)
+            | undefined;
+    }
+
+    function bashCall(command: string): ToolCallEvent {
+        // The declared return type supplies the contextual type, so no
+        // assertion is needed here.
+        return {
+            type: "tool_call",
+            toolCallId: "call-toggle",
+            toolName: "bash",
+            input: { command },
+        };
+    }
+
+    void it("does not rewrite when tau has the feature switched off", async () => {
+        const { pi, handlers, appended } = fakePi();
+        // tau passes its state, so `/tau set timeout-nerf off` lands in a layer
+        // the resolver reads before falling back to its default.
+        registerTimeoutNerf(pi, {
+            globalFeatures: { "timeout-nerf": false },
+        } as unknown as TauState);
+        const handler = toolCallHandler(handlers);
+        assert.ok(handler);
+
+        const event = bashCall("timeout 300 make");
+        await handler(event);
+        assert.equal(
+            (event.input as { command?: string }).command,
+            "timeout 300 make"
+        );
+        assert.equal(appended.length, 0);
+    });
+
+    void it("rewrites when the feature is on, and with no state at all", async () => {
+        for (const state of [
+            { globalFeatures: { "timeout-nerf": true } } as unknown as TauState,
+            undefined,
+        ]) {
+            const { pi, handlers } = fakePi();
+            registerTimeoutNerf(pi, state);
+            const handler = toolCallHandler(handlers);
+            assert.ok(handler);
+
+            const event = bashCall("timeout 300 make");
+            await handler(event);
+            assert.equal((event.input as { command?: string }).command, "make");
+        }
+    });
+
+    void it("reads the toggle per call, so a mid-session flip takes effect", async () => {
+        // tau mutates its state object in place, so the handler has to consult
+        // the current value rather than one captured when it was registered.
+        // Hoisting `isFeatureEnabled` to a `const` at registration time survives
+        // every other test in this file, so this one pins that property.
+        const state = {
+            globalFeatures: { "timeout-nerf": true },
+        } as unknown as TauState;
+        const { pi, handlers, appended } = fakePi();
+        registerTimeoutNerf(pi, state);
+        const handler = toolCallHandler(handlers);
+        assert.ok(handler);
+
+        const first = bashCall("timeout 300 make");
+        await handler(first);
+        assert.equal((first.input as { command?: string }).command, "make");
+
+        (state as { globalFeatures: Record<string, boolean> }).globalFeatures[
+            "timeout-nerf"
+        ] = false;
+
+        const second = bashCall("timeout 300 make");
+        await handler(second);
+        assert.equal(
+            (second.input as { command?: string }).command,
+            "timeout 300 make"
+        );
+        assert.equal(appended.length, 1);
     });
 });
 
@@ -827,6 +1179,58 @@ void describe("timeout-nerf shell equivalence", () => {
                 asWritten,
                 `${command} became ${plan.command} (cwd ${plan.cwd})`
             );
+        }
+    });
+
+    void it("never rewrites a prefix GNU itself would have rejected", () => {
+        // The rewrite claims that stripping the wrapper is equivalent, and for
+        // the wrapper to have run the command at all GNU has to accept the
+        // prefix. Checking the decision against GNU rather than against the same
+        // model the implementation uses is what catches a guard that is too
+        // narrow: `timeout 5S true` and `timeout -s 65 300 true` were both
+        // rewritten while GNU exited 125 without running the command.
+        for (const command of [
+            // GNU rejects the prefix, so none of these may be rewritten.
+            "timeout 5S true",
+            "timeout 5M true",
+            "timeout -k 5S 300 true",
+            "timeout -k foo 300 true",
+            "timeout -s 65 300 true",
+            "timeout -s 999 300 true",
+            "timeout -s FOO 300 true",
+            "timeout -s RTMIN+3 300 true",
+            "timeout -x 300 true",
+            "timeout 300 && true",
+            "timeout 300 | /bin/cat",
+            "timeout 300 > /dev/null",
+            "timeout 300 2>&1",
+            "timeout 300\ntrue",
+            // GNU accepts the prefix: these must still rewrite, so a guard that
+            // simply refuses more cannot satisfy this test either.
+            "timeout 300 true",
+            "timeout 1.5h true",
+            "timeout -k 5s 300 true",
+            "timeout -v 300 true",
+            "timeout -- 300 true",
+        ]) {
+            const plan = planNerf(command);
+            if (plan.action !== "rewrite") continue;
+            assert.equal(
+                runShell(command).code,
+                0,
+                `${command}: rewritten although GNU did not accept the prefix`
+            );
+        }
+        for (const command of [
+            "timeout 300 true",
+            "timeout 1.5h true",
+            "timeout -k 5s 300 true",
+            "timeout -v 300 true",
+            "timeout -- 300 true",
+            "timeout -s TERM 300 true",
+            "timeout --signal=SIGTERM 300 true",
+        ]) {
+            assert.equal(planNerf(command).action, "rewrite", command);
         }
     });
 });

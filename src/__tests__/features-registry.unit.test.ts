@@ -115,8 +115,13 @@ void describe("feature registry", () => {
         ]) {
             assert.ok(isKnownFeature(id), `missing: ${id}`);
         }
-        // Background (3)
-        for (const id of ["agent-background", "notifications", "reload"]) {
+        // Background (4)
+        for (const id of [
+            "agent-background",
+            "notifications",
+            "reload",
+            "timeout-nerf",
+        ]) {
             assert.ok(isKnownFeature(id), `missing: ${id}`);
         }
     });
