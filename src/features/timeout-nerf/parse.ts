@@ -369,8 +369,88 @@ const SHELL_ONLY_BUILTINS = new Set([
 ]);
 // The first bare word of a command, used only to spot such a target.
 const FIRST_WORD_RE = /^[^\s;&|<>()]+/;
-// Heads that are bash syntax rather than a program name.
-const CONSTRUCT_HEAD_RE = /^(?:\{|\[\[|\]\]|!)$/;
+// A `NAME=value` head is an assignment, not a program. `timeout` cannot exec it
+// (`timeout 240 TERM=dumb prog` exits 127 with "failed to run command
+// 'TERM=dumb'") while the rewrite exports it and runs prog. This is real usage:
+// an agent hit exactly that 127 in the filtered corpus and re-issued the command
+// as `TERM=dumb timeout 240 …`, which worked.
+const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// Heads that are bash syntax rather than a program name: the compound-command
+// openers and closers, `!`, and every reserved word. `timeout 300 if true; then
+// echo yes; fi` is 2 as written (bash reports a syntax error, because `timeout`
+// execs `if`) and 0 rewritten; `timeout 300 while true; do :; done` becomes an
+// unbounded loop with the kill removed. `time` and `coproc` are covered by the
+// builtin set instead. `compgen -k` lists 22 reserved words; 16 of them converted
+// before this set covered them, and the other six were already handled (`! { [[
+// ]]` here, `time` and `coproc` in the builtin set).
+const CONSTRUCT_HEAD_RE =
+    /^(?:\{|\[\[|\]\]|!|case|do|done|elif|else|esac|fi|for|function|if|in|select|then|until|while|})$/;
+
+/**
+ * A word with its escaping and surrounding quotes removed, so that `"cd"`,
+ * `c'd'` and `\cd` are recognised as the builtin they become. Matching the raw
+ * text let 100 spellings through in a sweep of head and standby shapes: the
+ * quoted forms were judged "not a builtin", rewritten, and then ran the builtin
+ * (127 -> 0).
+ */
+function unquote(word: string): string {
+    return word.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+}
+
+/**
+ * Remove `$(...)`, `${...}` and backtick spans, including nested ones, plus the
+ * simple `$NAME`, `$1` and `$@` forms.
+ *
+ * A regex cannot do this. `\$\([^()]*\)` does not match a substitution that
+ * contains parentheses, so `$(echo$(true))` stayed in the residual, the head was
+ * judged unable to vanish, and the command was rewritten -- measured,
+ * `timeout 300 $(echo$(true))` is 125 while its rewrite is 0. `$#`, `$?`, `$$`,
+ * `$0` and `$-` are deliberately NOT stripped: they are never empty, so a head
+ * made of one cannot vanish (`timeout 300 $# $Y` and `$# $Y` are both 127).
+ */
+function stripExpansions(word: string): string {
+    let out = "";
+    let i = 0;
+    while (i < word.length) {
+        const char = word[i] ?? "";
+        const next = word[i + 1];
+        if (char === "`") {
+            const end = word.indexOf("`", i + 1);
+            i = end === -1 ? word.length : end + 1;
+        } else if (char === "$" && (next === "(" || next === "{")) {
+            const open = next;
+            const close = next === "(" ? ")" : "}";
+            let depth = 0;
+            let j = i + 1;
+            for (; j < word.length; j++) {
+                if (word[j] === open) depth++;
+                else if (word[j] === close) {
+                    depth--;
+                    if (depth === 0) break;
+                }
+            }
+            // An unclosed expansion is consumed to the end of the word: the rest
+            // of the word belongs to it, and a fragment that never closes
+            // expands to nothing.
+            i = j < word.length ? j + 1 : word.length;
+        } else if (char === "$") {
+            // `$1`-`$9` may be empty, so they count as vanishing. `$10` and up do
+            // NOT: bash expands `$10` as `${1}0`, which is never empty (measured
+            // 127 in both forms), so stripping them would be an over-refusal.
+            // `$#`, `$?`, `$$`, `$-` and `$0` are never empty under `bash -c`,
+            // which is the shell pi uses, so they are not stripped either.
+            const simple = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9]|[@*!])/.exec(
+                word.slice(i)
+            );
+            i += simple ? simple[0].length : 1;
+            if (!simple) out += char;
+        } else {
+            out += char;
+            i++;
+        }
+    }
+    return out;
+}
 
 /**
  * Whether a head word can vanish entirely.
@@ -389,12 +469,7 @@ function headCanVanish(word: string): boolean {
     // $(echo"")` both exit 125 (measured) while their rewrites exit 0, because
     // the whole expansion disappears -- quotes included -- when it expands to
     // nothing.
-    const withoutExpansions = word
-        .replace(/\$\{[^}]*\}/g, "")
-        .replace(/\$\([^()]*\)/g, "")
-        .replace(/`[^`]*`/g, "")
-        .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, "")
-        .replace(/\$[0-9@*#?$!-]/g, "");
+    const withoutExpansions = stripExpansions(word);
     // A quote OUTSIDE an expansion leaves an empty argument behind, which fails
     // the same way in both forms (measured 127/127), so the word is kept.
     if (/["']/.test(withoutExpansions)) return false;
@@ -503,23 +578,41 @@ export function planNerf(command: string, options: NerfOptions = {}): NerfPlan {
     const headWord = (tailWords[0] ?? "").replace(/^[;&|]+|[;&|]+$/g, "");
     // A token split inside a substitution -- `$(which make)` contains a space, so
     // the head token is only `$(which` -- is not the whole head and cannot be
-    // judged; it is refused rather than guessed at.
-    const headIsSplitSubstitution = /\$\([^()]*$|`[^`]*$/.test(headWord);
-    const rest = tailWords.slice(1);
-    // A standby word has to be able to name the program itself: a word that can
-    // vanish too (`$UNSET $UNSET2`) leaves the command empty in the rewrite while
-    // the original was a commandless wrapper (measured 125 -> 0).
-    const hasStandbyCommand = rest.some(
-        (word, index) =>
-            !/[;&|<>]/.test(word) &&
-            !/[;&|<>]$/.test(
-                index === 0 ? headWord : (rest[index - 1] ?? "")
-            ) &&
-            !headCanVanish(word)
+    // judged; it is refused rather than guessed at. `${...}` needs the same
+    // treatment: `timeout 300 ${X:+"a b"}` splits into `${X:+"a` and `b"}`,
+    // and without this the fragment head vanishes while `b"}` becomes a legal
+    // standby word (measured 125 -> 0).
+    const headIsSplitSubstitution = /\$\([^()]*$|\$\{[^}]*$|`[^`]*$/.test(
+        headWord
     );
+    const rest = tailWords.slice(1);
+    // The word that would become the program after a vanishing head has to be a
+    // real program. A shell-only builtin or reserved word in that slot is not one
+    // (`timeout 300 $CMD cd /tmp` is 127 while `$CMD cd /tmp` runs, because the
+    // builtin guard only ever looks at the FIRST word), and a word that can vanish
+    // itself leaves the rewrite empty (`$CMD $CMD2`). Words that can vanish are
+    // skipped rather than ending the search, so `$CMD $Y make` is still allowed:
+    // both forms run `make` when `$Y` is unset and both run `$Y` when it is not.
+    const standbyWord = rest.find(
+        (word, index) =>
+            !headCanVanish(word) &&
+            !/[;&|<>]/.test(word) &&
+            !/[;&|<>]$/.test(index === 0 ? headWord : (rest[index - 1] ?? ""))
+    );
+    const standbyText = unquote(stripExpansions(standbyWord ?? ""));
+    const hasStandbyCommand =
+        standbyWord !== undefined &&
+        !SHELL_ONLY_BUILTINS.has(standbyText) &&
+        !CONSTRUCT_HEAD_RE.test(standbyText) &&
+        !ASSIGNMENT_RE.test(standbyText);
+    // The head is compared with its quoting and escaping removed, so `"cd"`,
+    // `c'd'` and `\cd` are recognised as the builtin they become rather than
+    // judged "not a builtin" and rewritten into a command that runs it.
+    const headText = unquote(stripExpansions(headWord));
     if (
         headWord !== "" &&
-        (CONSTRUCT_HEAD_RE.test(headWord) ||
+        (CONSTRUCT_HEAD_RE.test(headText) ||
+            ASSIGNMENT_RE.test(headText) ||
             headIsSplitSubstitution ||
             (headCanVanish(headWord) && !hasStandbyCommand))
     ) {
@@ -596,7 +689,7 @@ export function planNerf(command: string, options: NerfOptions = {}): NerfPlan {
         return skipped(command, "network-client", invocation, wrappedCommand);
     }
     const target = FIRST_WORD_RE.exec(wrappedCommand)?.[0] ?? "";
-    if (SHELL_ONLY_BUILTINS.has(target)) {
+    if (SHELL_ONLY_BUILTINS.has(unquote(stripExpansions(target)))) {
         return skipped(command, "shell-builtin", invocation, wrappedCommand);
     }
 

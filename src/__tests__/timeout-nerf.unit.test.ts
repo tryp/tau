@@ -1235,18 +1235,86 @@ void describe("timeout-nerf shell equivalence", () => {
             "timeout 300 $@",
             // A standby word that can itself vanish leaves the rewrite empty.
             "timeout 300 $CMD $CMD2",
+            "timeout 300 $CMD `echo`",
+            "timeout 300 $1",
+            // A shell-only builtin or a reserved word in the standby slot is not
+            // a program either: the builtin guard only looks at the FIRST word,
+            // so `timeout 300 $CMD cd /tmp` is 127 while `$CMD cd /tmp` runs.
+            "timeout 300 $CMD break",
+            "timeout 300 $CMD cd /tmp",
+            "timeout 300 $CMD : make",
+            "timeout 300 $CMD exit",
+            // Reserved words are bash syntax, not programs. `timeout 300 if true;
+            // then echo yes; fi` is 2 (bash reports a syntax error, because
+            // `timeout` execs `if`) and 0 rewritten, and `while true; do :; done`
+            // becomes an unbounded loop with the kill removed.
+            "timeout 300 if true; then echo yes; fi",
+            "timeout 300 while true; do echo x; break; done",
+            "timeout 300 for i in 1 2 3; do echo $i; done",
+            "timeout 300 until false; do echo y; break; done",
+            "timeout 300 case x in x) echo m;; esac",
+            "timeout 300 select x in a; do echo $x; done",
+            "timeout 300 function f { echo hi; }; f",
+            "timeout 300 } make",
+            "timeout 300 done",
+            "timeout 300 then",
+            "timeout 300 fi",
+            "timeout 300 esac",
+            "timeout 300 in",
+            "timeout 300 else",
+            // A substitution containing parentheses is still a substitution: a
+            // regex cannot match it, so the head was judged unable to vanish and
+            // rewritten (125 -> 0). A token split inside `${...}` is the same
+            // problem as one split inside `$(`.
+            "timeout 300 $(echo$(true))",
+            "timeout 300 $(echo$(echo))",
+            "timeout 300 $(x=$(true))",
+            'timeout 300 ${X:+"a b"}',
+            // A `NAME=value` head is an assignment, not a program: `timeout` cannot
+            // exec it (127, "failed to run command 'TERM=dumb'") while the rewrite
+            // exports it and runs the rest. Observed in the corpus, where the agent
+            // re-issued the command as `TERM=dumb timeout 240 …` and it worked.
+            "timeout 240 TERM=dumb venv/bin/python3 -m pytest -q",
+            "timeout 300 FOO=bar make",
+            "timeout 300 $CMD FOO=bar make",
+            // The head is matched after its quoting and escaping are removed, so
+            // a quoted RESERVED word is still syntax. (A quoted BUILTIN is caught
+            // earlier, by the first-word check, so those cases live below.)
+            'timeout 300 "if" true; then echo x; fi',
+            "timeout 300 $CMD 'cd' /tmp",
         ]) {
             const plan = planNerf(command);
             assert.equal(plan.action, "skip", command);
             assert.equal(plan.reason, "not-a-command", command);
         }
         // A quote OUTSIDE an expansion leaves an empty argument behind, which
-        // fails identically in both forms, so those heads are kept.
+        // fails identically in both forms, so those heads are kept. So are the
+        // positional parameters that are never empty -- `$#`, `$?`, `$$`, `$-`
+        // and `$0` -- which must not be treated as vanishing (`timeout 300 $# $Y`
+        // and `$# $Y` are both 127).
         for (const command of [
             "timeout 300 '' make",
             'timeout 300 "" make',
             "timeout 300 $V/ruff check",
             "timeout 300 'quoted' make",
+            "timeout 300 $# $Y",
+            "timeout 300 $? $Y",
+            "timeout 300 $$ $Y",
+            "timeout 300 $- $Y",
+            "timeout 300 $0 $Y",
+            "timeout 300 $CMD $Y make",
+            "timeout 300 $CMD > /dev/null make",
+            // The depth scan has to STOP at the matching paren: the expansion here
+            // vanishes but `X` does not, so the head is not expansion-only and
+            // both forms fail to run `X` (127/127). A scan that miscounted the
+            // depth would swallow the `X` too and over-refuse.
+            "timeout 300 $(echo$(true))X",
+            "timeout 300 $(echo$(echo))Y",
+            // `$10` is `${1}0`, which is never empty, so it must not be treated as
+            // vanishing (127 in both forms).
+            "timeout 300 $10",
+            "timeout 300 $10 $Y",
+            "timeout 300 $1 make",
         ]) {
             assert.equal(planNerf(command).action, "rewrite", command);
         }
@@ -1263,6 +1331,11 @@ void describe("timeout-nerf shell equivalence", () => {
             "timeout 300 break",
             "timeout 300 continue",
             "timeout 300 coproc make",
+            // A quoted or escaped spelling of a builtin is still that builtin.
+            'timeout 300 "cd" /tmp',
+            "timeout 300 'exit'",
+            "timeout 300 c'd' /tmp",
+            "timeout 300 \\cd /tmp",
         ]) {
             const plan = planNerf(command);
             assert.equal(plan.action, "skip", command);
