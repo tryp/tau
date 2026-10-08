@@ -1226,16 +1226,43 @@ void describe("timeout-nerf shell equivalence", () => {
             "timeout 300 $CMD > /dev/null",
             "timeout 300 $CMD 2>&1",
             "timeout 300 $(which make)",
+            // A quote INSIDE an expansion does not save it: the whole expansion
+            // disappears, quotes included, so the original is still a
+            // commandless wrapper while the rewrite is empty.
+            'timeout 300 ${CMD:+"x"}',
+            'timeout 300 $(echo"")',
+            "timeout 300 `echo`",
+            "timeout 300 $@",
+            // A standby word that can itself vanish leaves the rewrite empty.
+            "timeout 300 $CMD $CMD2",
         ]) {
             const plan = planNerf(command);
             assert.equal(plan.action, "skip", command);
             assert.equal(plan.reason, "not-a-command", command);
+        }
+        // A quote OUTSIDE an expansion leaves an empty argument behind, which
+        // fails identically in both forms, so those heads are kept.
+        for (const command of [
+            "timeout 300 '' make",
+            'timeout 300 "" make',
+            "timeout 300 $V/ruff check",
+            "timeout 300 'quoted' make",
+        ]) {
+            assert.equal(planNerf(command).action, "rewrite", command);
         }
         // A builtin with no external counterpart goes to the builtin guard, not
         // to this one.
         for (const command of [
             "timeout 300 command make",
             "timeout 300 time make",
+            // `:` is the no-op builtin (`: > file` is the usual idiom) and has
+            // no external counterpart, so `timeout 300 :` is 127 as written and
+            // 0 rewritten. `break`, `continue` and `coproc` are reserved words
+            // rather than programs.
+            "timeout 300 : make",
+            "timeout 300 break",
+            "timeout 300 continue",
+            "timeout 300 coproc make",
         ]) {
             const plan = planNerf(command);
             assert.equal(plan.action, "skip", command);
@@ -1290,14 +1317,6 @@ void describe("timeout-nerf shell equivalence", () => {
             "timeout 300 [[ 1 ]]",
             "timeout 300 ${CMD}",
             "timeout 300 command true",
-            // GNU accepts the prefix: these must still rewrite, so a guard that
-            // simply refuses more cannot satisfy this test either.
-            "timeout 300 true",
-            "timeout 1.5h true",
-            "timeout -k 5s 300 true",
-            "timeout -k 1e3 300 true",
-            "timeout -v 300 true",
-            "timeout -- 300 true",
         ]) {
             const plan = planNerf(command);
             if (plan.action !== "rewrite") continue;
@@ -1305,6 +1324,29 @@ void describe("timeout-nerf shell equivalence", () => {
                 runShell(command).code,
                 0,
                 `${command}: rewritten although GNU did not accept the prefix`
+            );
+        }
+        // GNU accepts these prefixes, so they must still rewrite. The assertion
+        // is on the action itself: a guard that simply refused more would pass
+        // the loop above, and an entry that stops rewriting would otherwise be
+        // silently skipped (which is how the duration-exponent branch went
+        // unpinned).
+        for (const command of [
+            "timeout 300 true",
+            "timeout 1.5h true",
+            "timeout -k 5s 300 true",
+            "timeout -k 1e3 300 true",
+            "timeout -k +5s 300 true",
+            "timeout -v 300 true",
+            "timeout -- 300 true",
+            "timeout -s TERM 300 true",
+            "timeout --signal=SIGTERM 300 true",
+        ]) {
+            assert.equal(planNerf(command).action, "rewrite", command);
+            assert.equal(
+                runShell(command).code,
+                0,
+                `${command}: GNU does not accept this prefix, so it does not belong here`
             );
         }
         // The guard refuses some forms GNU accepts, deliberately, and those are

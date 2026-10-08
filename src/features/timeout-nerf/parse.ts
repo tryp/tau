@@ -311,10 +311,12 @@ const NETWORK_CLIENT_RE = /\b(?:curl|wget|nc|ssh)\b/i;
 // absent: `timeout` runs them and the result matches. Measured at 0 of the 173
 // sampled corpus commands, but the class is real and the guard is free.
 const SHELL_ONLY_BUILTINS = new Set([
+    ":",
     ".",
     "alias",
     "bg",
     "bind",
+    "break",
     "builtin",
     "caller",
     "cd",
@@ -322,6 +324,8 @@ const SHELL_ONLY_BUILTINS = new Set([
     "compgen",
     "complete",
     "compopt",
+    "continue",
+    "coproc",
     "declare",
     "dirs",
     "disown",
@@ -380,16 +384,21 @@ const CONSTRUCT_HEAD_RE = /^(?:\{|\[\[|\]\]|!)$/;
  * are left alone rather than refused.
  */
 function headCanVanish(word: string): boolean {
-    if (/["']/.test(word)) return false;
-    return (
-        word
-            .replace(/\$\{[^}]*\}/g, "")
-            .replace(/\$\([^()]*\)/g, "")
-            .replace(/`[^`]*`/g, "")
-            .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, "")
-            .replace(/\$[0-9@*#?$!-]/g, "")
-            .trim() === ""
-    );
+    // Strip the expansions FIRST: a quote inside one does not make the word
+    // unable to vanish. `timeout 300 ${UNSET:+"x"}` and `timeout 300
+    // $(echo"")` both exit 125 (measured) while their rewrites exit 0, because
+    // the whole expansion disappears -- quotes included -- when it expands to
+    // nothing.
+    const withoutExpansions = word
+        .replace(/\$\{[^}]*\}/g, "")
+        .replace(/\$\([^()]*\)/g, "")
+        .replace(/`[^`]*`/g, "")
+        .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, "")
+        .replace(/\$[0-9@*#?$!-]/g, "");
+    // A quote OUTSIDE an expansion leaves an empty argument behind, which fails
+    // the same way in both forms (measured 127/127), so the word is kept.
+    if (/["']/.test(withoutExpansions)) return false;
+    return withoutExpansions.trim() === "";
 }
 
 function skipped(
@@ -497,10 +506,16 @@ export function planNerf(command: string, options: NerfOptions = {}): NerfPlan {
     // judged; it is refused rather than guessed at.
     const headIsSplitSubstitution = /\$\([^()]*$|`[^`]*$/.test(headWord);
     const rest = tailWords.slice(1);
+    // A standby word has to be able to name the program itself: a word that can
+    // vanish too (`$UNSET $UNSET2`) leaves the command empty in the rewrite while
+    // the original was a commandless wrapper (measured 125 -> 0).
     const hasStandbyCommand = rest.some(
         (word, index) =>
             !/[;&|<>]/.test(word) &&
-            !/[;&|<>]$/.test(index === 0 ? headWord : (rest[index - 1] ?? ""))
+            !/[;&|<>]$/.test(
+                index === 0 ? headWord : (rest[index - 1] ?? "")
+            ) &&
+            !headCanVanish(word)
     );
     if (
         headWord !== "" &&
