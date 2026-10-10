@@ -72,6 +72,7 @@ function observation(partial: Partial<PipeObservation> = {}): PipeObservation {
         faithful: true,
         caveat: null,
         viewDescription: "the bounded view your pipe would have printed",
+        pipeStageZero: null,
         ...partial,
     };
 }
@@ -351,6 +352,98 @@ void describe("pipe-nerf rewrite safety", () => {
     });
 });
 
+void describe("pipe-nerf stage-0 capture", () => {
+    const PATH_0 = "/tmp/stage0-test.log";
+
+    void it("tees stage 0 when the command still filters after the limiter", () => {
+        // The point: the result is filtered, so a re-grep has to run against the
+        // pre-filter output rather than a fresh execution. `tee` is the standard
+        // tool for this and leaves the pipeline's output and status untouched.
+        const p = planPipeNerf("seq 1 60 | grep -E '1|3' | tail -3", {
+            stageZeroPath: PATH_0,
+        });
+        assert.equal(p.rewritten, `seq 1 60 | tee ${PATH_0} | grep -E '1|3'`);
+        assert.ok(p.stageZero);
+        assert.equal(p.stageZero?.command, "seq 1 60");
+        assert.equal(p.stageZero?.path, PATH_0);
+    });
+
+    void it("does NOT tee when removing the limiter already leaves one command", () => {
+        // Its whole output is the capture, so a second file would duplicate it
+        // and double the sidecar sources for every piped call.
+        for (const c of ["pytest -q | tail -20", "cd /x && make | tail -20"]) {
+            const p = planPipeNerf(c, { stageZeroPath: PATH_0 });
+            assert.equal(p.stageZero, null, c);
+            assert.ok(!p.rewritten.includes("tee"), c);
+        }
+    });
+
+    void it("still refuses a count that only the filter could answer", () => {
+        // `grep -v 5 | wc -l` asks how many lines SURVIVED the filter. The
+        // capture is the filtered output, so its line count would be the wrong
+        // answer. Stage 0 makes it re-derivable in principle (re-run the grep
+        // against the file), but that is executing the agent's filter, not
+        // reproducing it -- so the note says the count is not shown rather than
+        // inventing one.
+        const p = planPipeNerf("seq 1 60 | grep -v 5 | wc -l", {
+            stageZeroPath: "/tmp/s0-shell.log",
+        });
+        assert.ok(p.stageZero, "stage 0 is still captured");
+        assert.equal(
+            applyLimiter("1\n2\n3", p.invocation!, {
+                truncated: false,
+                totalLines: 3,
+            }).faithful,
+            false
+        );
+    });
+
+    void it("leaves the pipeline's output byte-identical to the pipe's", () => {
+        // Verified against a real shell, not asserted: the rewrite must produce
+        // exactly what the agent's own pipeline printed, and stage 0 must hold
+        // the pre-filter lines that pipeline dropped.
+        // tail/head only: a counting limiter after a filter is deliberately
+        // NOT reconstructed (see the upstream-stage tests), because its answer is
+        // not derivable from the filtered capture.
+        for (const command of [
+            "seq 1 60 | grep -E '1|3' | tail -3",
+            "seq 1 40 | grep '[25]' | head -4",
+        ]) {
+            const p = planPipeNerf(command, { stageZeroPath: "/tmp/s0-shell.log" });
+            const view = (capture: string) =>
+                applyLimiter(
+                    capture.trimEnd(),
+                    p.invocation!,
+                    { truncated: false, totalLines: capture.trimEnd().split("\n").length }
+                ).text;
+            const shell = execFileSync("bash", ["-c", command], { encoding: "utf8" });
+            const capture = execFileSync("bash", ["-c", p.rewritten], {
+                encoding: "utf8",
+            });
+            assert.equal(view(capture), shell.trimEnd(), command);
+            // Stage 0 holds strictly more than the filtered capture.
+            const stage0 = execFileSync("bash", ["-c", "cat /tmp/s0-shell.log"], {
+                encoding: "utf8",
+            });
+            assert.ok(
+                stage0.trimEnd().split("\n").length >
+                    capture.trimEnd().split("\n").length,
+                `stage 0 should hold the pre-filter output: ${command}`
+            );
+        }
+    });
+
+    void it("refuses a `|&` operator rather than splicing tee into it", () => {
+        // `|&` is a both-streams redirect; injecting a stage there would change
+        // the command rather than capture it.
+        const p = planPipeNerf("make 2>&1 |& tail -5", { stageZeroPath: PATH_0 });
+        assert.ok(!p.rewritten.includes("tee") || p.stageZero === null);
+        if (p.stageZero) {
+            assert.ok(!p.rewritten.includes("tee /tmp/x |&"), p.rewritten);
+        }
+    });
+});
+
 void describe("pipe-nerf bounded view", () => {
     const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
     const invocationFor = (command: string) => {
@@ -550,6 +643,55 @@ void describe("pipe-nerf note", () => {
         );
         assert.match(note, /first 10 lines, as your pipe would have printed/);
         assert.match(note, /keeps the END/);
+    });
+
+    void it("names the pre-filter capture and how to re-filter it", () => {
+        // The whole point of stage 0: the result is filtered, so a different
+        // pattern has to run against the pre-filter output rather than a fresh
+        // execution of a build. Both the source id and the path are offered,
+        // because an agent that wants `sort` or `jq` needs a file.
+        const captured = pipeNote(
+            plan("make test 2>&1 | grep FAILED | tail -10"),
+            observation({
+                totalLines: 12,
+                visibleLines: 10,
+                fullOutputPath: "/tmp/pi-bg-job.log",
+                sourceId: "ctx_bg_post",
+                pipeStageZero: {
+                    path: "/home/dev/tmp/pi-pipe-stage0-call_00_x.log",
+                    command: "make test 2>&1",
+                    sourceId: "ctx_bg_stage0",
+                },
+                receiptLines: [
+                    `- Search it first: context_search query:"..." source_id:"ctx_bg_post"`,
+                ],
+            })
+        );
+        assert.match(captured, /pre-filter output/);
+        assert.match(captured, /ctx_bg_stage0/);
+        assert.match(captured, /re-running a DIFFERENT filter is a search/);
+        assert.match(captured, /grep -nE "pattern" .*pi-pipe-stage0/);
+        // Both sources are named: the filtered result and the pre-filter capture.
+        assert.match(captured, /ctx_bg_post/);
+    });
+
+    void it("falls back to the path when the pre-filter capture is not indexed", () => {
+        const captured = pipeNote(
+            plan("make test 2>&1 | grep FAILED | tail -10"),
+            observation({
+                pipeStageZero: {
+                    path: "/home/dev/tmp/pi-pipe-stage0-call_00_y.log",
+                    command: "make test 2>&1",
+                    sourceId: null,
+                },
+            })
+        );
+        assert.match(captured, /not indexed/);
+        assert.match(captured, /grep -nE "pattern" .*pi-pipe-stage0/);
+        assert.ok(
+            !/re-running a DIFFERENT filter is a search/.test(captured),
+            "an unindexed capture must not promise a sidecar search"
+        );
     });
 
     void it("offers the log path on the sidecar route too", () => {

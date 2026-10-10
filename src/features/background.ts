@@ -89,6 +89,7 @@ import type {
     JobResultDetails,
     RunningProcess,
     UiContext,
+    PipeStageZeroCapture,
 } from "../types.ts";
 import {
     MAX_LOG_BYTES,
@@ -1099,6 +1100,48 @@ function completionLogEvidence(job: BackgroundJob): {
  * that jobs output already returns for background jobs. Short complete output
  * stays lightweight; reduced output carries its recovery reference and size.
  */
+/**
+ * Index a `pipe-nerf` stage-0 capture so a re-filter can run against it.
+ *
+ * Stage 0 is the command's own output BEFORE any filter, which every later pipe
+ * stage is a deterministic function of. The command runs filtered, so this is
+ * the only copy of it that exists. Indexed with `force`, because the inline
+ * threshold that normally gates indexing is sized for "output nobody discarded",
+ * and this output has just been filtered away.
+ *
+ * Returns the source id so the removal note can name it, or null when indexing
+ * was unavailable -- which is not a failure: the file is still on disk at `path`
+ * and the note offers it as a path.
+ */
+async function indexStageZeroCapture(
+    capture: PipeStageZeroCapture,
+    command: string,
+    toolCallId: string,
+    ctx: UiContext,
+    exitCode?: number,
+    status?: string
+): Promise<string | null> {
+    try {
+        const outcome = await indexJobOutputWithOutcome(
+            {
+                id: `${toolCallId}-stage0`,
+                command,
+                logPath: capture.path,
+                exitCode,
+                status,
+            },
+            ctx,
+            "bash",
+            { force: true, useExternalApi: false }
+        );
+        return outcome.source?.sourceId ?? null;
+    } catch {
+        // A capture write that could not be indexed is still a file on disk; the
+        // note falls back to naming the path.
+        return null;
+    }
+}
+
 function preparedOutputDetails(
     prepared: Awaited<ReturnType<typeof prepareInlineOutput>>,
     logPath: string,
@@ -2233,6 +2276,7 @@ export function registerBackgroundJobs(
                         () => ""
                     );
                     const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
+                    const stageZero = state.pipeStageZeroCalls.get(toolCallId);
                     const prepared = await prepareInlineOutput(
                         {
                             id: jobId,
@@ -2255,6 +2299,18 @@ export function registerBackgroundJobs(
                     // The index decision has been made; do not let the flag
                     // survive to affect a later call.
                     state.pipeHoistedCalls.delete(toolCallId);
+                    let stageZeroSourceId: string | null = null;
+                    if (stageZero) {
+                        state.pipeStageZeroCalls.delete(toolCallId);
+                        stageZeroSourceId = await indexStageZeroCapture(
+                            stageZero,
+                            command,
+                            toolCallId,
+                            ctx,
+                            initialResult.code ?? undefined,
+                            initialResult.code === 0 ? "completed" : "failed"
+                        );
+                    }
                     return {
                         content: [
                             { type: "text" as const, text: prepared.text },
@@ -2262,11 +2318,22 @@ export function registerBackgroundJobs(
                         // A hoisted pipe means the agent is viewing a bounded
                         // slice, so the capture has to be reachable even when
                         // nothing was truncated or indexed.
-                        details: preparedOutputDetails(
-                            prepared,
-                            logPath,
-                            forcedIndex
-                        ),
+                        details: {
+                            ...preparedOutputDetails(
+                                prepared,
+                                logPath,
+                                forcedIndex
+                            ),
+                            ...(stageZero
+                                ? {
+                                      pipeStageZero: {
+                                          path: stageZero.path,
+                                          command: stageZero.command,
+                                          sourceId: stageZeroSourceId,
+                                      },
+                                  }
+                                : {}),
+                        },
                     };
                 }
 
@@ -2413,6 +2480,7 @@ export function registerBackgroundJobs(
                 state.backgroundJobs.delete(jobId);
 
                 const output = await readFile(logPath, "utf-8").catch(() => "");
+                const stageZero = state.pipeStageZeroCalls.get(toolCallId);
                 const prepared = await prepareInlineOutput(
                     {
                         id: jobId,
@@ -2426,6 +2494,39 @@ export function registerBackgroundJobs(
                     "bash",
                     { force: state.pipeHoistedCalls.has(toolCallId) }
                 );
+                // Stage 0 is indexed even when the command FAILED: a failed
+                // build's pre-filter output is still what a re-run would want,
+                // and this is its only copy. Cleared on every path so a later
+                // call cannot index a stale file.
+                let stageZeroSourceId: string | null = null;
+                if (stageZero) {
+                    state.pipeStageZeroCalls.delete(toolCallId);
+                    stageZeroSourceId = await indexStageZeroCapture(
+                        stageZero,
+                        command,
+                        toolCallId,
+                        ctx,
+                        raceResult.code ?? undefined,
+                        raceResult.code === 0 ? "completed" : "failed"
+                    );
+                }
+
+                const details = {
+                    ...preparedOutputDetails(
+                        prepared,
+                        logPath,
+                        state.pipeHoistedCalls.has(toolCallId)
+                    ),
+                    ...(stageZero
+                        ? {
+                              pipeStageZero: {
+                                  path: stageZero.path,
+                                  command: stageZero.command,
+                                  sourceId: stageZeroSourceId,
+                              },
+                          }
+                        : {}),
+                };
 
                 if (
                     raceResult.code !== 0 &&
@@ -2440,7 +2541,7 @@ export function registerBackgroundJobs(
 
                 return {
                     content: [{ type: "text" as const, text: prepared.text }],
-                    details: preparedOutputDetails(prepared, logPath),
+                    details,
                 };
             } finally {
                 clearInterval(pollTimer);
@@ -3596,20 +3697,57 @@ async function executeTmuxForeground(
                 "bash",
                 { force: state.pipeHoistedCalls.has(toolCallId) }
             );
+            // Stage 0's pre-filter capture, indexed on the same terms as the
+            // command's own output. The tmux backend is the default when tmux
+            // is available, so this is the path most piped commands actually
+            // take -- leaving it unwired made the capture invisible on the
+            // common path while it worked on the fallback.
+            const tmuxStageZero = state.pipeStageZeroCalls.get(toolCallId);
+            let tmuxStageZeroSourceId: string | null = null;
+            if (tmuxStageZero) {
+                state.pipeStageZeroCalls.delete(toolCallId);
+                tmuxStageZeroSourceId = await indexStageZeroCapture(
+                    tmuxStageZero,
+                    command,
+                    toolCallId,
+                    ctx,
+                    initialResult ?? undefined,
+                    initialResult === 0 ? "completed" : "failed"
+                );
+            }
             // Clean up tmux window. Keep the session alive so the next
             // spawnInTmux call reuses it via new-window instead of creating
             // a fresh session — avoids tmux server state accumulation across
             // hundreds of create/destroy cycles which causes fork()+waitpid()
             // deadlocks (child exits but parent waitpid never returns).
             killWindow(tmuxCtx.windowId);
+            const tmuxDetails = {
+                ...preparedOutputDetails(
+                    prepared,
+                    logPath,
+                    state.pipeHoistedCalls.has(toolCallId)
+                ),
+                ...(tmuxStageZero
+                    ? {
+                          pipeStageZero: {
+                              path: tmuxStageZero.path,
+                              command: tmuxStageZero.command,
+                              sourceId: tmuxStageZeroSourceId,
+                          },
+                      }
+                    : {}),
+            };
             if (initialResult !== 0 && initialResult !== null) {
+                // A failed command's stage-0 capture is still indexed and its
+                // source id still reported: the file is on disk either way, and
+                // a failed build is exactly when an agent wants to re-filter.
                 throw new Error(
                     prepared.text || `Command exited with code ${initialResult}`
                 );
             }
             return {
                 content: [{ type: "text" as const, text: prepared.text }],
-                details: preparedOutputDetails(prepared, logPath),
+                details: tmuxDetails,
             };
         }
 
@@ -3823,6 +3961,7 @@ async function executeTmuxForeground(
             2000,
             tmuxCtx.outputFile
         );
+        const raceStageZero = state.pipeStageZeroCalls.get(toolCallId);
         const prepared = await prepareInlineOutput(
             {
                 id: jobId,
@@ -3836,9 +3975,38 @@ async function executeTmuxForeground(
             "bash",
             { force: state.pipeHoistedCalls.has(toolCallId) }
         );
+        let raceStageZeroSourceId: string | null = null;
+        if (raceStageZero) {
+            state.pipeStageZeroCalls.delete(toolCallId);
+            raceStageZeroSourceId = await indexStageZeroCapture(
+                raceStageZero,
+                command,
+                toolCallId,
+                ctx,
+                raceResult.code ?? undefined,
+                raceResult.code === 0 ? "completed" : "failed"
+            );
+        }
         killWindow(tmuxCtx.windowId);
         // Session is intentionally kept alive — reuse avoids tmux server
         // state accumulation that causes waitpid deadlocks.
+
+        const raceDetails = {
+            ...preparedOutputDetails(
+                prepared,
+                logPath,
+                state.pipeHoistedCalls.has(toolCallId)
+            ),
+            ...(raceStageZero
+                ? {
+                      pipeStageZero: {
+                          path: raceStageZero.path,
+                          command: raceStageZero.command,
+                          sourceId: raceStageZeroSourceId,
+                      },
+                  }
+                : {}),
+        };
 
         if (raceResult.code !== 0 && raceResult.code !== null) {
             throw new Error(
@@ -3848,7 +4016,7 @@ async function executeTmuxForeground(
 
         return {
             content: [{ type: "text" as const, text: prepared.text }],
-            details: preparedOutputDetails(prepared, logPath),
+            details: raceDetails,
         };
     } finally {
         clearInterval(pollTimer);

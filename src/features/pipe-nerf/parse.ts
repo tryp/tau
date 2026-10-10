@@ -100,6 +100,15 @@ export interface PipePlan {
     invocation: PipeInvocation | null;
     /** The command that will actually run. */
     rewritten: string;
+    /**
+     * Where stage 0's output is being written, when the command still filters
+     * after the limiter was hoisted.
+     *
+     * Set only when the rewritten command still contains a pipeline: if removing
+     * the limiter left a single command, its whole output IS the capture and a
+     * second file would duplicate it.
+     */
+    stageZero: { path: string; command: string; operatorAt: number } | null;
 }
 
 /**
@@ -222,6 +231,57 @@ function controlOperatorIn(text: string): number {
     }
     return -1;
 }
+/**
+ * Index of the command's FIRST top-level pipe operator, or -1.
+ *
+ * This marks the end of stage 0 -- the command whose output every later stage is
+ * a deterministic function of. Capturing stage 0 is what lets an agent re-run a
+ * DIFFERENT filter against it without re-executing the command; capturing a
+ * later stage does not, because that stage is re-derivable from stage 0.
+ *
+ * `|&` is skipped rather than matched: injecting `| tee` into it would splice a
+ * new stage into a both-streams redirect and change the command.
+ */
+export function firstPipeOperator(command: string): number {
+    let quote = "";
+    let depth = 0;
+    let found = -1;
+    let i = 0;
+    const n = command.length;
+    while (i < n) {
+        const ch = command[i];
+        if (quote) {
+            if (ch === "\\" && quote === '"' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (ch === quote) {
+                quote = "";
+            }
+            i += 1;
+            continue;
+        }
+        if (ch === "'" || ch === '"') {
+            quote = ch;
+        } else if (ch === "\\" && i + 1 < n) {
+            i += 2;
+            continue;
+        } else if (ch === "(") {
+            depth += 1;
+        } else if (ch === ")") {
+            depth = Math.max(0, depth - 1);
+        } else if (ch === "|" && depth === 0) {
+            if (command[i + 1] === "|" || command[i + 1] === "&") {
+                i += 2;
+                continue;
+            }
+            return i;
+        }
+        i += 1;
+    }
+    return found;
+}
+
 /**
  * The last top-level control operator, and whether it reads a status.
  *
@@ -584,6 +644,7 @@ function skipped(
         original: command,
         invocation,
         rewritten: command,
+        stageZero: null,
     };
 }
 
@@ -620,7 +681,10 @@ function stageBindsOutput(kind: LimiterKind, args: string): boolean {
  * has to be what determines what the tool ends up showing, and its output has
  * to be the command's last word.
  */
-export function planPipeNerf(command: string, options: { enabled?: boolean } = {}): PipePlan {
+export function planPipeNerf(
+    command: string,
+    options: { enabled?: boolean; stageZeroPath?: string } = {}
+): PipePlan {
     const at = lastPipeOperator(command);
     if (at < 0) return skipped(command, "no-pipe");
 
@@ -697,11 +761,50 @@ export function planPipeNerf(command: string, options: { enabled?: boolean } = {
             ? beforeSegment
             : `${beforeSegment}${separator}${afterSegment.replace(/^\s+/, "")}`;
 
+    // Stage 0's output is what a re-filter would want, and it is NOT recoverable
+    // if the command still filters after the limiter is hoisted: the capture is
+    // the filtered output, so a different grep cannot be run against it. Tee it
+    // at the first operator. `tee` writes the stage's output to the file AND
+    // passes it on, so the pipeline's result and exit status are unchanged
+    // (verified byte-for-byte and by status against a real shell).
+    //
+    // Only when a pipeline REMAINS. If the rewrite left a single command, its
+    // whole output is already the capture and a second file duplicates it -- and
+    // would double the sidecar sources for every piped call.
+    let stageZero: PipePlan["stageZero"] = null;
+    if (options.stageZeroPath) {
+        const operatorAt = firstPipeOperator(rewritten);
+        if (operatorAt > 0) {
+            const command0 = rewritten.slice(0, operatorAt).trim();
+            // Storage is auxiliary: if the path cannot be used, run the command
+            // unchanged rather than fail the call the agent asked for.
+            stageZero = { path: options.stageZeroPath, command: command0, operatorAt };
+        }
+    }
+    // The seam is normalized to one space either side. `rewritten` can carry the
+    // whitespace of the removed limiter (`ls  | grep`), and an unnormalized join
+    // is what produced `ls  | tee /tmp/x | grep`.
+    // `<stage-0> | tee <path> | <rest>`: the two pipe operators come back, one on
+    // each side of the tee. `rewritten.slice(0, operatorAt)` deliberately EXCLUDES
+    // the operator it was measured at, so both `|` are added here.
+    const final = stageZero
+        ? [
+              rewritten.slice(0, stageZero.operatorAt).replace(/\s+$/, ""),
+              "| tee",
+              stageZero.path,
+              "|",
+              rewritten.slice(stageZero.operatorAt + 1).replace(/^\s+/, ""),
+          ]
+              .join(" ")
+              .replace(/\s*\|\s*(\|\s+tee)/, "|$1")
+        : rewritten;
+
     return {
         action: "rewrite",
         reason: null,
         original: command,
         invocation,
-        rewritten: rewritten.trim(),
+        rewritten: final.trim(),
+        stageZero,
     };
 }

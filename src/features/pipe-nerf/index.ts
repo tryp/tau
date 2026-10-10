@@ -24,6 +24,8 @@ import type { TauState } from "../../state.ts";
 import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
 import { bashGuidelines, pipeNote } from "./messages.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { applyLimiter, planPipeNerf } from "./parse.ts";
 import type { LimiterView, PipeInvocation } from "./parse.ts";
 import type { PipePlan } from "./parse.ts";
@@ -61,6 +63,12 @@ type PiWithOptionalGuidelines = ExtensionAPI & {
 };
 
 /** The tools this hook rewrites. `bash_bg` is included deliberately. */
+/** Home of the auxiliary stage captures, beside every other job log. */
+function stageZeroPathFor(toolCallId: string): string {
+    const bare = toolCallId.replace(/[^A-Za-z0-9_-]/g, "");
+    return join(homedir(), "tmp", `pi-pipe-stage0-${bare}.log`);
+}
+
 const HOOKED_TOOLS = new Set(["bash", "bash_bg"]);
 
 interface BashInput {
@@ -169,10 +177,26 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
         const command = input.command;
         if (typeof command !== "string" || !command.trim()) return;
 
-        const plan = planPipeNerf(command);
+        // Stage 0's output is what a re-filter would want. It is only worth
+        // writing when the command still filters AFTER the limiter is hoisted: if
+        // the rewrite left a single command, its whole output is already the
+        // capture. `planPipeNerf` decides that, so the path is offered rather
+        // than prescribed.
+        const stageZeroPath = stageZeroPathFor(event.toolCallId);
+        const plan = planPipeNerf(command, { stageZeroPath });
         if (plan.action !== "rewrite") return;
 
         input.command = plan.rewritten;
+        if (plan.stageZero) {
+            // The bash tool owns output capture, and it is the only place with
+            // the session context the sidecar needs. Record the path so it can
+            // index this file alongside its own, and clear it once consumed.
+            state?.pipeStageZeroCalls.set(event.toolCallId, {
+                path: plan.stageZero.path,
+                command: plan.stageZero.command,
+                lineCount: null,
+            });
+        }
         // The result will be a BOUNDED view, so the rest of the output has to be
         // captured for the agent to read later. The sidecar's own threshold is
         // 300 lines / 24KB, and the commands this touches are usually smaller
@@ -198,6 +222,15 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             filter: plan.invocation?.kind ?? null,
             limit: plan.invocation?.limit ?? null,
             mergedStderr: plan.invocation?.mergedStderr ?? false,
+            // Recorded so the habit and the stage-0 capture rate can be measured
+            // together: how often does a rewrite leave a pipeline in place, which
+            // is the only case where the pre-filter output is not the capture.
+            stageZero: plan.stageZero
+                ? {
+                      path: plan.stageZero.path,
+                      command: plan.stageZero.command,
+                  }
+                : null,
         });
     });
 
@@ -215,6 +248,10 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
         const details =
             (event as { details?: BashResultDetails }).details ?? {};
+        // Teed to by the rewrite when the command still filtered.
+        const stageZero =
+            (details as { pipeStageZero?: { path: string; command: string; sourceId: string | null } })
+                .pipeStageZero ?? null;
         const truncation = details.truncation;
         const text = event.content
             .map((block) =>
@@ -264,6 +301,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 view,
                 isReceipt ? "receipt" : undefined
             ),
+            pipeStageZero: stageZero,
         });
         if (!note) return;
 

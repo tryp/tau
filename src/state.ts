@@ -20,6 +20,16 @@ import type {
     PermissionRule,
 } from "./features/permissions/types.js";
 
+/** A stage-0 (pre-filter) capture the bash tool still has to index. */
+export interface PipeStageZeroCapture {
+    /** File stage 0's output was teed to. */
+    path: string;
+    /** The command whose output that was, for the sidecar's tool summary. */
+    command: string;
+    /** Line count, when the rewrite could count it. Always indexed, not skipped. */
+    lineCount: number | null;
+}
+
 export class TauState {
     // ── Background jobs ──────────────────────────────────────────────
 
@@ -47,6 +57,16 @@ export class TauState {
      * Entries are removed once the result has been prepared.
      */
     pipeHoistedCalls = new Set<string>();
+
+    /**
+     * Tool call id -> the stage-0 capture written by `pipe-nerf`.
+     *
+     * Set when a rewrite leaves a pipeline in place, so stage 0's (pre-filter)
+     * output is teed to a file the bash tool then indexes alongside its own. The
+     * entry is removed once the bash tool has consumed it, so a leak cannot make
+     * a later call index a stale file.
+     */
+    pipeStageZeroCalls = new Map<string, PipeStageZeroCapture>();
 
     /** Whether tmux is available for the tmux-backed bash backend. */
     tmuxAvailable = false;

@@ -31,6 +31,15 @@ export interface PipeObservation {
     caveat: string | null;
     /** How the agent's own pipe would have bounded what it now sees. */
     viewDescription: string;
+    /**
+     * The pre-filter (stage-0) capture, when the command still filtered after
+     * the limiter was hoisted. This is the data a re-filter will want.
+     */
+    pipeStageZero: {
+        path: string;
+        command: string;
+        sourceId: string | null;
+    } | null;
 }
 
 /** Visible line count, or the capture total, whichever the hook reported. */
@@ -136,6 +145,28 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
         lines.push(
             `Captured ${counts} lines (${observed.err} err, ${observed.warn} warn). The err/warn counts cover everything captured, not just the part shown.`
         );
+    }
+
+    if (observed.pipeStageZero) {
+        // The command's own output BEFORE any filter. The result is filtered, so
+        // a re-grep with a different pattern has to run against this rather than
+        // against a fresh execution of a build.
+        const { path, command, sourceId } = observed.pipeStageZero;
+        lines.push(
+            `Your command also filtered its output, so the pre-filter output of ${JSON.stringify(command)} was teed to a file: ${path}.`
+        );
+        if (sourceId) {
+            lines.push(
+                `It is indexed in the context sidecar as ${JSON.stringify(sourceId)}, so re-running a DIFFERENT filter is a search, not another execution.`
+            );
+            lines.push(
+                `- Re-filter it: context_search query:"pattern" source_id:"${sourceId}" or grep -nE "pattern" ${path}`
+            );
+        } else {
+            lines.push(
+                `It is on disk but was not indexed. Read or re-filter it there: grep -nE "pattern" ${path}`
+            );
+        }
     }
 
     if (observed.sourceId) {
