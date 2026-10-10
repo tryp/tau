@@ -2793,6 +2793,44 @@ void describe("evaluatePendingDecisionGate", () => {
         assert.equal(sent.length, 0, "no steer in the blocking case");
     });
 
+    void it("lets read-only inspection tools through even when nothing else can run", () => {
+        // Measured: while the gate was closed the only way to read a file was
+        // `sed -n 'A,Bp'` through the exempt bash, and 77.4% of file reads went
+        // that way. A read cannot conflict with a decision, so it is exempt in
+        // the blocking branch too, not only in the steering one.
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        (pi as { getActiveTools: () => string[] }).getActiveTools = () => [];
+        for (const tool of ["read", "grep", "find", "ls"]) {
+            const result = evaluatePendingDecisionGate(state, pi, tool);
+            assert.equal(
+                result.block,
+                undefined,
+                `${tool} must not be blocked`
+            );
+        }
+        assert.equal(sent.length, 0, "a read must not steer either");
+    });
+
+    void it("does not steer on read-only inspection tools", () => {
+        // The steer is aimed at the decision, so it must not fire for a tool
+        // that cannot resolve it: otherwise the file content the agent asked
+        // for is replaced by the gate reason.
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        for (const tool of ["read", "grep", "find", "ls"]) {
+            evaluatePendingDecisionGate(state, pi, tool);
+        }
+        assert.equal(sent.length, 0, "no steer for read-only inspection tools");
+    });
+
+    void it("still steers on tools that can conflict with the decision", () => {
+        const job = makeJob({ id: "job-1-1", status: "running" });
+        const { state, pi, sent } = makeGateState(job);
+        evaluatePendingDecisionGate(state, pi, "edit");
+        assert.equal(sent.length, 1, "a mutating tool still gets the steer");
+    });
+
     void it("clears stale terminal jobs instead of steering on them", () => {
         const job = makeJob({ id: "job-1-1", status: "completed" });
         const { state, pi, sent } = makeGateState(job);

@@ -563,6 +563,18 @@ export function lookupJob(
 }
 
 /**
+ * Tools that only inspect and cannot conflict with a pending decision.
+ *
+ * The exemption list used to be `job_decide`/`jobs`/`bash` — exactly the wrong
+ * side of the line for a read-only inspection tool, since `bash` (and its
+ * `sed -n 'A,Bp' FILE` idiom) stayed available while `read` did not. These
+ * four are unconditionally exempt: they read the working tree, cannot mutate
+ * state, and a steer aimed at them would be noise that replaces the read the
+ * agent asked for.
+ */
+const READ_ONLY_INSPECTION_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
+/**
  * Decide how the tool_call gate treats a tool call while a background job
  * decision is pending.
  *
@@ -573,6 +585,15 @@ export function lookupJob(
  * proceed, and the model is steered once per pending decision instead; only
  * the no-control-tools case still blocks, because there the model has no way
  * to resolve the decision at all.
+ *
+ * Read-only inspection tools are exempt from BOTH branches. Measured over 90
+ * days of sippi sessions, the previous blocking gate (live through August)
+ * refused 2,975 reads and 22,503 calls in total while exempting foreground
+ * bash — and while the gate was closed, `sed -n 'A,Bp' FILE` was the only way
+ * left to read a file. A read cannot conflict with a decision, so the gate was
+ * manufacturing the shell idiom it then had to measure: 77.4% of file reads
+ * were shell line-range reads that month, falling to 62.6% once the gate
+ * stopped blocking.
  */
 export function evaluatePendingDecisionGate(
     state: TauState,
@@ -587,6 +608,14 @@ export function evaluatePendingDecisionGate(
         job?.status === "running"
             ? "still running"
             : (job?.status ?? "unknown");
+    if (READ_ONLY_INSPECTION_TOOLS.has(toolName)) {
+        // A read cannot conflict with a decision, so it neither blocks nor
+        // steers: the model looking at a file is not ignoring the job, and a
+        // refused read is what pushed agents into `sed -n 'A,Bp'` via bash.
+        // Exempt in BOTH branches, including the no-control-tools case where
+        // nothing else can run.
+        return {};
+    }
     const controls = getActiveBackgroundControlTools(pi);
     if (controls.length === 0) {
         const progress =
