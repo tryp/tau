@@ -1,9 +1,6 @@
 import type { PipeInvocation, PipePlan } from "./parse.ts";
 import { BUILTIN_MAX_BYTES, BUILTIN_MAX_LINES } from "./parse.ts";
 
-/** Longest command rendered in full in the prose line of the note. */
-const MAX_PREVIEW_CHARS = 200;
-
 /** What the tool actually captured, as far as the result can report it. */
 export interface PipeObservation {
     /**
@@ -36,6 +33,11 @@ export interface PipeObservation {
     viewDescription: string;
 }
 
+/** Visible line count, or the capture total, whichever the hook reported. */
+function visibleLines(observed: PipeObservation): number {
+    return observed.totalLines ?? observed.visibleLines ?? 100;
+}
+
 /** Render the removed stage so the note never claims a bound it did not read. */
 function boundText(invocation: PipeInvocation): string {
     if (invocation.limit === null) return `| ${invocation.kind}`;
@@ -58,6 +60,27 @@ function preview(command: string): string {
 function inlineBudget(): string {
     return `the last ${BUILTIN_MAX_LINES} lines or ${Math.round(BUILTIN_MAX_BYTES / 1024)}KB`;
 }
+
+const PURE_READ_RE =
+    /^\s*(?:\/usr\/bin\/)?(?:cat|head|tail|sed|awk|rg|grep|ls|find|stat|pwd|git\s+(?:show|diff|log|blame))\b/;
+
+/**
+ * Whether re-running the command is idempotent.
+ *
+ * \"Re-run without a pipe\" is safe advice for a reader and bad advice for a
+ * build: `cat f | tail -5` re-run for more lines is free, while
+ * `pytest | tail -5` re-run can produce different output against a tree that
+ * changed underneath it. Telling an agent to re-run a suite to see 20 more lines
+ * is the exact wasted work this nerf is meant to remove, so the case must be
+ * split rather than answered with a blanket re-run.
+ */
+function pureReadCommand(command: string): boolean {
+    const first = command.split(/[\n;&|]/)[0] ?? "";
+    return PURE_READ_RE.test(first);
+}
+
+/** Longest command rendered in full in the prose line of the note. */
+const MAX_PREVIEW_CHARS = 200;
 
 /**
  * The agent-facing note prepended to every modified call's result.
@@ -105,6 +128,9 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
         );
     }
 
+    // `visibleLines` is null when the content is the tool's own sidecar receipt:
+    // the receipt carries the true totals, so substituting its own line count
+    // reported "Captured 7 lines" next to a receipt saying 60.
     const counts = observed.totalLines ?? observed.visibleLines;
     if (counts !== null && counts !== undefined) {
         lines.push(
@@ -118,27 +144,48 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
         );
         lines.push(...observed.receiptLines);
     }
-    if (observed.fullOutputPath && !observed.sourceId) {
+    // The path is offered on BOTH routes, not just the disk one. The sidecar
+    // source is for `context_*` retrieval, but an agent that wants to re-filter
+    // or post-process (`sort`, `jq`, `awk`, a different grep) needs something it
+    // can point a tool at, and the log file is that. It was previously only
+    // surfaced when nothing was indexed, so the indexed case -- the common one for
+    // large output -- offered no way to post-process at all.
+    if (observed.fullOutputPath) {
+        const lines_total = observed.totalLines ?? visibleLines(observed);
         lines.push(
-            `The full output is on disk at ${observed.fullOutputPath}. Do not re-run the command to read it: grep it, or read a range.`
+            `The full output is also on disk at ${observed.fullOutputPath} -- re-filter or post-process it there instead of re-running the command.`
         );
         lines.push(
-            `- Search it: grep -nE "pattern" ${observed.fullOutputPath}`
+            `- Re-filter it: grep -nE "your-pattern" ${observed.fullOutputPath}`
         );
         lines.push(
-            `- Read a range: sed -n '${Math.max(1, (observed.totalLines ?? 1) - 99)},${observed.totalLines ?? 100}p' ${observed.fullOutputPath}`
+            `- Read a range: sed -n '${Math.max(1, lines_total - 99)},${lines_total}p' ${observed.fullOutputPath}`
         );
     }
     if (!observed.fullOutputPath && !observed.sourceId) {
-        // The capture fits inline, so there is no separate retrieval route -- but
-        // the agent still asked for a BOUNDED view of it. Saying "what is shown
-        // is the complete output" would be false (the view is 3 lines of 60) and
-        // would leave the agent no route to the rest, which is the re-run this
-        // nerf exists to prevent. So say plainly that the capture was inline and
-        // the remainder has to be re-requested.
+        // There is no RECOVERABLE capture, but the agent still asked for a bounded
+        // view of one. Saying "what is shown is the complete output" would be
+        // false (the view is 3 lines of 60), and telling it to re-run the same
+        // command would repeat work for output that was never captured.
+        //
+        // The split that matters is whether re-execution is safe at all: a reader
+        // (`cat`, `git show`, `ls`) is idempotent, so a different bound gives a
+        // different slice of the same data. A runner (`pytest`, `make`, `ruff`)
+        // is not -- its output depends on the tree, so re-running to see 20 more
+        // lines can produce different output and is precisely the wasted work
+        // this nerf exists to remove. Point that case at bash_bg instead.
         lines.push(
-            `The capture fits within ${inlineBudget()}, so nothing was written to disk and there is no sidecar source. Everything captured is counted above; to read the part not shown above, re-run the same command without a pipe.`
+            `The output was small enough to return inline, so nothing was written to disk or indexed. The lines above are a bounded view; the rest were never captured and cannot be retrieved afterwards.`
         );
+        if (pureReadCommand(plan.rewritten)) {
+            lines.push(
+                `Your command only reads, so it is idempotent: run it again with a different bound (tail -N, head -N) or with no pipe to see any part you want.`
+            );
+        } else {
+            lines.push(
+                `Your command runs rather than only reads, so do NOT re-run it just to see more lines. Use bash_bg with the plain command next time: it writes the full output to a log and indexes it, so every part stays readable at any size.`
+            );
+        }
     }
 
     return lines.join("\n");

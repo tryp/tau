@@ -113,9 +113,16 @@ function retrievalLines(details: BashResultDetails): string[] {
  * unbounded block of it reads as if the capture were still filtered, and the
  * agent then either re-runs for the rest or believes it already saw everything.
  */
-function describeView(invocation: PipeInvocation, view: LimiterView): string {
+function describeView(
+    invocation: PipeInvocation,
+    view: LimiterView,
+    viewDescriptionOverride?: "receipt"
+): string {
     if (!view.faithful) {
         return `the full captured output (your ${invocation.kind} view could not be reproduced from it)`;
+    }
+    if (viewDescriptionOverride === "receipt") {
+        return "a summary of the captured output, with its totals and how to read the rest";
     }
     const limit = invocation.limit;
     switch (invocation.kind) {
@@ -208,22 +215,35 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
         const details =
             (event as { details?: BashResultDetails }).details ?? {};
+        const truncation = details.truncation;
         const text = event.content
             .map((block) =>
                 block.type === "text" ? (block.text ?? "") : ""
             )
             .join("\n");
-        // The err/warn mix is computed over the WHOLE captured text, so it is
-        // the stat the agent would otherwise re-run the command to get, even
-        // though the view below is bounded to the lines they asked for.
-        const severity = visibleSeverity(text);
-        const truncation = details.truncation;
-        const truncated = truncation?.truncated === true;
 
-        const view = applyLimiter(text, plan.invocation, {
-            truncated,
-            totalLines: truncation?.totalLines ?? null,
-        });
+        // Indexed output arrives as a RECEIPT, not as the output. Bounding a
+        // receipt is meaningless, and the numbers in it are not the output's --
+        // the case produced "Captured 7 lines" against a 60-line total, and then
+        // a tail -3 of the receipt prose. When the tool already reduced the
+        // content to a receipt, the receipt IS the bounded result: it carries the
+        // source id, the byte/line totals, and the retrieval calls.
+        const isReceipt = text.startsWith("[context-sidecar]");
+
+        const view = isReceipt
+            ? { text, faithful: true, caveat: null }
+            : applyLimiter(text, plan.invocation, {
+                  truncated: truncation?.truncated === true,
+                  totalLines: truncation?.totalLines ?? null,
+              });
+
+        // The err/warn mix is computed over the WHOLE captured text, so it is the
+        // stat the agent would otherwise re-run the command to get, even though
+        // the view below is bounded to the lines they asked for. A receipt is not
+        // the output, so classifying it would count the receipt's own words.
+        const severity = isReceipt
+            ? { err: 0, warn: 0, lines: text.split("\n").length }
+            : visibleSeverity(text);
 
         const note = pipeNote(plan, {
             // Core computes `totalLines` before its own truncation, so it counts
@@ -233,13 +253,17 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             totalLines: truncation?.totalLines ?? null,
             err: severity.err,
             warn: severity.warn,
-            visibleLines: severity.lines,
+            visibleLines: isReceipt ? null : severity.lines,
             fullOutputPath: details.fullOutputPath ?? null,
             sourceId: details.sourceId ?? null,
             receiptLines: retrievalLines(details),
             faithful: view.faithful,
             caveat: view.caveat,
-            viewDescription: describeView(plan.invocation, view),
+            viewDescription: describeView(
+                plan.invocation,
+                view,
+                isReceipt ? "receipt" : undefined
+            ),
         });
         if (!note) return;
 

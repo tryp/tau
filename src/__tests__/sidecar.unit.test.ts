@@ -26,6 +26,7 @@ import {
     prepareInlineOutput,
 } from "../features/sidecar.ts";
 import type { BackgroundJob } from "../types.ts";
+import { planPipeNerf } from "../features/pipe-nerf/parse.ts";
 
 // ─── Fixture helpers ────────────────────────────────────────────────
 
@@ -414,6 +415,63 @@ void describe("indexJobOutputInSidecar", () => {
         writeFileSync(p, content, "utf-8");
         return p;
     }
+
+    void it("retains a bash_bg job's WHOLE log after pipe-nerf hoists the pipe", async () => {
+        // Issue #3: bash_bg indexes through indexJobOutputWithOutcome, which has
+        // NO inline threshold -- unlike prepareInlineOutput (the bash path, 300
+        // lines). So a 60-line log a bash_bg produced is indexed in full. The
+        // agent asked for `| tail -3` and still gets 3 lines inline, but all 60
+        // are readable afterwards.
+        //
+        // This matters because bash_bg is the high-value case: 54% of background
+        // jobs end in a limiter, and a job's log is the only record it has.
+        createDb(tmpDir);
+        const full = Array.from({ length: 60 }, (_, i) => `bg-line-${i + 1}`).join(
+            "\n"
+        );
+        const job = testJob({
+            id: "job-bg-hoisted",
+            command: planPipeNerf("make test 2>&1 | tail -3").rewritten,
+            logPath: writeLog(full),
+        });
+
+        // The rewrite must strip the pipe so the job writes an unfiltered log.
+        assert.equal(planPipeNerf("make test 2>&1 | tail -3").rewritten, "make test 2>&1");
+
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            { cwd: tmpDir },
+            "bash_bg",
+            { useExternalApi: false }
+        );
+        assert.equal(outcome.status, "indexed");
+        assert.ok(outcome.source, "the job must have a sidecar source");
+
+        const back = await readJobOutputFromSidecar("job-bg-hoisted");
+        assert.equal(back?.split("\n").length, 60);
+        assert.equal(back, full);
+    });
+
+    void it("does not apply the inline threshold to a background job", async () => {
+        // The two capture paths differ on purpose: prepareInlineOutput skips
+        // indexing below 300 lines so ordinary small output is not indexed, while
+        // indexJobOutputWithOutcome indexes any non-empty output because a
+        // background job's log is its only record.
+        createDb(tmpDir);
+        const job = testJob({
+            id: "job-bg-small",
+            logPath: writeLog("one\ntwo\nthree"),
+        });
+
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            { cwd: tmpDir },
+            "bash_bg",
+            { useExternalApi: false }
+        );
+        assert.equal(outcome.status, "indexed");
+        assert.equal(await readJobOutputFromSidecar("job-bg-small"), "one\ntwo\nthree");
+    });
 
     void it("classifies an unavailable sidecar without failing the job", async () => {
         const job = testJob({ id: "job-skip-1", logPath: writeLog("hello") });

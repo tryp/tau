@@ -1101,9 +1101,21 @@ function completionLogEvidence(job: BackgroundJob): {
  */
 function preparedOutputDetails(
     prepared: Awaited<ReturnType<typeof prepareInlineOutput>>,
-    logPath: string
+    logPath: string,
+    /**
+     * Include `fullOutputPath` even when nothing was truncated or indexed.
+     *
+     * The log file exists for every bash call regardless of size, so returning
+     * `undefined` here hid a real path from the agent: measured over 7 days,
+     * 361,451 of 364,362 bash results carried no path at all, which is every
+     * small command. An agent that piped its output had no way to re-filter the
+     * captured text locally, and re-ran instead.
+     */
+    alwaysIncludePath = false
 ): Partial<JobResultDetails> | undefined {
-    if (!prepared.truncated && !prepared.source) return undefined;
+    if (!prepared.truncated && !prepared.source && !alwaysIncludePath) {
+        return undefined;
+    }
     return {
         ...(prepared.totalLines !== undefined
             ? { totalLines: prepared.totalLines }
@@ -2220,6 +2232,7 @@ export function registerBackgroundJobs(
                     const output = await readFile(logPath, "utf-8").catch(
                         () => ""
                     );
+                    const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
                     const prepared = await prepareInlineOutput(
                         {
                             id: jobId,
@@ -2237,7 +2250,7 @@ export function registerBackgroundJobs(
                         // A hoisted pipe means the agent is shown a bounded
                         // view of this output, so the rest exists only here.
                         // Index it even when it is under the inline threshold.
-                        { force: state.pipeHoistedCalls.has(toolCallId) }
+                        { force: forcedIndex }
                     );
                     // The index decision has been made; do not let the flag
                     // survive to affect a later call.
@@ -2246,7 +2259,14 @@ export function registerBackgroundJobs(
                         content: [
                             { type: "text" as const, text: prepared.text },
                         ],
-                        details: preparedOutputDetails(prepared, logPath),
+                        // A hoisted pipe means the agent is viewing a bounded
+                        // slice, so the capture has to be reachable even when
+                        // nothing was truncated or indexed.
+                        details: preparedOutputDetails(
+                            prepared,
+                            logPath,
+                            forcedIndex
+                        ),
                     };
                 }
 

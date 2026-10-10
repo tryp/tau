@@ -511,7 +511,8 @@ void describe("pipe-nerf note", () => {
         assert.match(note, /\| tail -50/);
         assert.match(note, /Effective command: "make -j8 2>&1"/);
         assert.match(note, /stderr into stdout/);
-        assert.match(note, /2000 lines or 50KB/);
+        assert.match(note, /small enough to return inline/);
+        assert.match(note, /do NOT re-run it just to see more lines/);
     });
 
     void it("reports the err/warn mix with the line count", () => {
@@ -551,6 +552,28 @@ void describe("pipe-nerf note", () => {
         assert.match(note, /keeps the END/);
     });
 
+    void it("offers the log path on the sidecar route too", () => {
+        // The source id is for context_* retrieval, but an agent that wants to
+        // re-filter (`sort`, `jq`, a different grep) needs something it can point
+        // a tool at. The path was previously offered only when nothing was
+        // indexed, so the common large-output case had no post-process route.
+        const note = pipeNote(
+            plan("pytest -q | tail -20"),
+            observation({
+                totalLines: 1204,
+                sourceId: "ctx_bg_abc",
+                fullOutputPath: "/tmp/pi-bg-job.log",
+                receiptLines: [
+                    `- Search it first: context_search query:"..." source_id:"ctx_bg_abc"`,
+                ],
+            })
+        );
+        assert.match(note, /context_search query/);
+        assert.match(note, /on disk at \/tmp\/pi-bg-job\.log/);
+        assert.match(note, /re-filter or post-process it there/);
+        assert.match(note, /grep -nE "your-pattern" \/tmp\/pi-bg-job\.log/);
+    });
+
     void it("is honest when the capture fit inline and the view is bounded", () => {
         // `| wc -l` on 4 lines: the view IS the whole output, so the note says
         // nothing was written to disk. But for a bounded view over an inline
@@ -566,6 +589,25 @@ void describe("pipe-nerf note", () => {
             !/complete output/.test(bounded),
             "an inline capture with a bounded view is not the complete output"
         );
+    });
+
+    void it("tells a pure reader it can safely re-run with a different bound", () => {
+        // A reader is idempotent, so a different bound is a valid answer to
+        // "show me more". A runner is not, and must be steered to bash_bg rather
+        // than told to re-run.
+        const read = pipeNote(
+            plan("cat f | tail -3"),
+            observation({ totalLines: 60, visibleLines: 3 })
+        );
+        assert.match(read, /only reads, so it is idempotent/);
+        assert.match(read, /different bound/);
+
+        const run = pipeNote(
+            plan("pytest -q | tail -3"),
+            observation({ totalLines: 60, visibleLines: 3 })
+        );
+        assert.match(run, /do NOT re-run it just to see more lines/);
+        assert.match(run, /bash_bg with the plain command/);
     });
 
     void it("falls back to the visible count when the tool reports no detail", () => {
@@ -676,7 +718,8 @@ void describe("pipe-nerf registration", () => {
         assert.match(note, /\[pipe-nerf\]/);
         assert.match(note, /900 lines \(0 err, 1 warn\)/);
         assert.match(note, /on disk at \/tmp\/out\.log/);
-        assert.match(note, /grep -nE "pattern" \/tmp\/out\.log/);
+        assert.match(note, /grep -nE "your-pattern" \/tmp\/out\.log/);
+        assert.match(note, /instead of re-running the command/);
         // The original content is preserved after the note.
         assert.equal(result.content[1].text, "FAILED tests/x");
     });
@@ -774,6 +817,52 @@ void describe("pipe-nerf registration", () => {
         // as if it were the answer it asked for.
         assert.match(note, /already dropped/);
         assert.match(note, /on disk at \/tmp\/out\.log/);
+    });
+
+    void it("does not bound the tool's own sidecar receipt", () => {
+        // Indexed output arrives as a RECEIPT, not as the output. Bounding it
+        // produced "Captured 7 lines" against a 60-line total and a tail -3 of
+        // the receipt's prose -- the note contradicted the detail field beside
+        // it. The receipt already carries the totals and the retrieval calls, so
+        // it IS the bounded result and is passed through untouched.
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+
+        const receipt = [
+            "[context-sidecar] Large bash output indexed locally",
+            "Source: ctx_bg_abc",
+            "Chunks: 1; original size: 1011 bytes, 60 lines",
+            "- Search snippets first: context_search query:\"...\" source_id:\"ctx_bg_abc\"",
+        ].join("\n");
+
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "receipted",
+            input: { command: "seq 1 60 | tail -3" },
+        });
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "receipted",
+            content: [{ type: "text", text: receipt }],
+            details: {
+                truncation: { truncated: true, totalLines: 60 },
+                sourceId: "ctx_bg_abc",
+                chunkIds: ["ctx_bg_abc_0001"],
+                fullOutputPath: "/tmp/pi-bg-job.log",
+            },
+        }) as { content: { text: string }[] };
+
+        const note = result.content[0].text;
+        const body = result.content.slice(1).map((part) => part.text).join("\n");
+        // The receipt is untouched, not sliced to its last 3 lines.
+        assert.equal(body, receipt);
+        // The note speaks about the capture it was GIVEN, and does not invent a
+        // line count from the receipt's own text.
+        assert.ok(
+            !/Captured 7 lines/.test(note),
+            `the note counted the receipt's lines: ${note}`
+        );
+        assert.match(note, /a summary of the captured output/);
     });
 
     void it("leaves a filter command alone and adds no note", () => {
