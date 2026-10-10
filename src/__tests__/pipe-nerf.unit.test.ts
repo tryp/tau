@@ -1103,12 +1103,14 @@ void describe("pipe-nerf registration", () => {
         // Hoisting the read to registration time is the bug this pins: the flag
         // is set after the extension loads, so a captured value would keep
         // rewriting commands the user just turned the feature off for.
+        const overrides = new Map<string, boolean>();
         const state = {
-            featureOverridesSession: new Map<string, boolean>(),
+            featureOverridesSession: overrides,
             // The nerf records hoisted calls here so the bash tool forces an
             // index for them. A double that omits it made the optional chaining
             // hide a missing field instead of failing.
             pipeHoistedCalls: new Set<string>(),
+            pipeStageZeroCalls: new Map<string, unknown>(),
         } as unknown as TauState;
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never, state);
@@ -1123,7 +1125,7 @@ void describe("pipe-nerf registration", () => {
         assert.equal(first.command, "ls");
 
         // Turned off mid-session: the very next call must be left alone.
-        state.featureOverridesSession.set("pipe-nerf", false);
+        overrides.set("pipe-nerf", false);
         const second = { command: "ls | tail -5" };
         fire(handlers, "tool_call", {
             toolName: "bash",
@@ -1133,7 +1135,7 @@ void describe("pipe-nerf registration", () => {
         assert.equal(second.command, "ls | tail -5");
 
         // And turned back on: the flag is read again, not cached either way.
-        state.featureOverridesSession.delete("pipe-nerf");
+        overrides.delete("pipe-nerf");
         const third = { command: "ls | tail -5" };
         fire(handlers, "tool_call", {
             toolName: "bash",
@@ -1150,6 +1152,7 @@ void describe("pipe-nerf registration", () => {
         const state = {
             featureOverridesSession: new Map<string, boolean>(),
             pipeHoistedCalls: new Set<string>(),
+            pipeStageZeroCalls: new Map<string, unknown>(),
         } as unknown as TauState;
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never, state);
@@ -1174,6 +1177,7 @@ void describe("pipe-nerf registration", () => {
         const state = {
             featureOverridesSession: new Map<string, boolean>(),
             pipeHoistedCalls: new Set<string>(),
+            pipeStageZeroCalls: new Map<string, unknown>(),
         } as unknown as TauState;
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never, state);

@@ -57,6 +57,8 @@ export interface PipeInvocation {
     limitToken: string | null;
     /** Index of the `|` operator that introduces this stage. */
     start: number;
+    /** Index of the limiter's first character (after the operator). */
+    stageStart: number;
     /** Index just past the limiter's own arguments (end of the stage). */
     end: number;
     /** Whether the stage begins with `2>&1`, so stderr was merged into it. */
@@ -74,6 +76,16 @@ export interface PipeInvocation {
      * reported as a number.
      */
     hasUpstreamStage: boolean;
+}
+
+/** Options controlling the rewrite, mirrors `NerfOptions` in timeout-nerf. */
+export interface PipeOptions {
+    enabled?: boolean;
+    /**
+     * Where to tee stage 0's pre-filter output when the command still filters
+     * after the limiter is hoisted. Omit to skip the capture.
+     */
+    stageZeroPath?: string;
 }
 
 export type SkipReason =
@@ -683,7 +695,7 @@ function stageBindsOutput(kind: LimiterKind, args: string): boolean {
  */
 export function planPipeNerf(
     command: string,
-    options: { enabled?: boolean; stageZeroPath?: string } = {}
+    options: PipeOptions = {}
 ): PipePlan {
     const at = lastPipeOperator(command);
     if (at < 0) return skipped(command, "no-pipe");

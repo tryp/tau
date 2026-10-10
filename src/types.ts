@@ -113,6 +113,22 @@ export interface JobResultDetails {
     fullOutputPath?: string;
 }
 
+/**
+ * A stage-0 (pre-filter) capture the bash tool still has to index.
+ *
+ * Written by `pipe-nerf` when a rewrite leaves a pipeline in place: the result
+ * is filtered, so stage 0's output is the only copy that a re-filter can run
+ * against without re-executing the command.
+ */
+export interface PipeStageZeroCapture {
+    /** File stage 0's output was teed to. */
+    path: string;
+    /** The command whose output that was, for the sidecar's tool summary. */
+    command: string;
+    /** Line count, when the rewrite could count it. Always indexed, not skipped. */
+    lineCount: number | null;
+}
+
 export interface BackgroundJob {
     id: string;
     command: string;

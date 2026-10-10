@@ -10,6 +10,7 @@ import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import type {
     BackgroundJob,
     PendingBackgroundAgent,
+    PipeStageZeroCapture,
     RunningProcess,
     Task,
     WorkflowRun,
@@ -19,16 +20,6 @@ import type {
     PermissionMode,
     PermissionRule,
 } from "./features/permissions/types.js";
-
-/** A stage-0 (pre-filter) capture the bash tool still has to index. */
-export interface PipeStageZeroCapture {
-    /** File stage 0's output was teed to. */
-    path: string;
-    /** The command whose output that was, for the sidecar's tool summary. */
-    command: string;
-    /** Line count, when the rewrite could count it. Always indexed, not skipped. */
-    lineCount: number | null;
-}
 
 export class TauState {
     // ── Background jobs ──────────────────────────────────────────────
