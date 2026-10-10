@@ -18,6 +18,7 @@ import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { TauState } from "./state.ts";
 import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
+import { registerPipeNerf } from "./features/pipe-nerf/index.ts";
 import { registerTimeoutNerf } from "./features/timeout-nerf/index.ts";
 import { isSafeCommand } from "./plan-utils.ts";
 import { Text } from "@earendil-works/pi-tui";
@@ -357,6 +358,7 @@ export default function (pi: ExtensionAPI) {
     // before it can be detached, or kill it after detach. Registered after the
     // handler above so a `block` decision still short-circuits first.
     registerTimeoutNerf(pi, state);
+    registerPipeNerf(pi, state);
 
     // Handoff disabled — file path tracking removed
     // pi.on("tool_result", async (event) => {

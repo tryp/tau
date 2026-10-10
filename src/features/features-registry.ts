@@ -197,6 +197,14 @@ export const FEATURE_REGISTRY: ReadonlyArray<FeatureDef> = [
         group: "Background",
         defaultOn: true,
     },
+    {
+        id: "pipe-nerf",
+        label: "Pipe nerf",
+        description:
+            "Replace trailing output-limiting pipes (`| tail`, `| head`, `| wc -l`) with pi's own capture and sidecar",
+        group: "Background",
+        defaultOn: true,
+    },
 ];
 
 const BY_ID: ReadonlyMap<string, FeatureDef> = new Map(

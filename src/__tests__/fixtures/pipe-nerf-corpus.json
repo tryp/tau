@@ -1,0 +1,1872 @@
+{
+  "generated_by": "scripts/extract_pipe_fixtures.py",
+  "window_days": 30,
+  "files_scanned": 3253,
+  "cases": [
+    {
+      "category": "leading",
+      "command": "pi-whoami | head -5",
+      "expected": {
+        "kind": "head",
+        "limit": 5,
+        "start": 10,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "leading",
+      "command": "pi-whoami | head -3; git status --short; git rev-parse HEAD; cat context.md; cat plan.md",
+      "expected": {
+        "kind": "head",
+        "limit": 3,
+        "start": 10,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "leading",
+      "command": "env | grep -E 'SIPPI_GPU_EVIDENCE|S1|HMAC' || true; grep -R \"s1-rerun-2026-09-11\" -n doc tmp 2>/dev/null | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 105,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/gpu-integration && grep -n \"^lint[a-z-]*:\" Makefile | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 91,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/gpu-integration && make lint 2>&1 | tail -40",
+      "expected": {
+        "kind": "tail",
+        "limit": 40,
+        "start": 73,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && grep -n \"^#\\|^##\\|^###\" doc/todo.md | head -120",
+      "expected": {
+        "kind": "head",
+        "limit": 120,
+        "start": 58,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && python3 scripts/audit_production_reachability.py 2>&1 | tail -45; echo \"EXIT=${PIPESTATUS[0]}\"",
+      "expected": {
+        "kind": "tail",
+        "limit": 45,
+        "start": 76,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && rg -n \"_DISPATCH_CLAIM|_UNIT_MENTION\" -B4 -A10 scripts/lint_counter_units.py | head -45",
+      "expected": {
+        "kind": "head",
+        "limit": 45,
+        "start": 99,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && git show e7519e6f7 -- scripts/lint_leg_evidence.py | head -160",
+      "expected": {
+        "kind": "head",
+        "limit": 160,
+        "start": 73,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && python3 scripts/worktree_cleanup.py prune-branches --yes 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 84,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && pi-whoami 2>&1 | head -20; git status --short; git rev-parse --short HEAD",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 37,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && pi-whoami 2>&1 | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 37,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && git diff backends/solvers/operators/mixed_aefie_block.py | head -120",
+      "expected": {
+        "kind": "head",
+        "limit": 120,
+        "start": 79,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi && grep -rn \"Hammerstad\" doc/todo.md doc/research/*.md 2>/dev/null | cut -c1-220 | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 100,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && grep -rn \"logical dispatch\" doc/ | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 99,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "cd-and-pipe",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && git show --stat b62905194 2>/dev/null | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 104,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi; python3 scripts/validate_global_refinement_result.py --help 2>&1 | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 85,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi; python3 scripts/lint_text_hygiene.py --help 2>&1 | head -12",
+      "expected": {
+        "kind": "head",
+        "limit": 12,
+        "start": 69,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi; venv/bin/python3 scripts/validate_global_refinement_result.py --help 2>&1 | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 94,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/la-rooftop-g-batched && make lint-changed 2>&1 | tail -45",
+      "expected": {
+        "kind": "tail",
+        "limit": 45,
+        "start": 86,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi && python3 scripts/worktree_cleanup.py prune 2>&1 | tail -60",
+      "expected": {
+        "kind": "tail",
+        "limit": 60,
+        "start": 69,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi && echo \"=== reap dry run ===\"; python3 scripts/worktree_cleanup.py reap 2>&1 | tail -20",
+      "expected": {
+        "kind": "tail",
+        "limit": 20,
+        "start": 97,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi && git maintenance run --task=gc 2>&1 | tail -20; echo \"EXIT=$?\"; du -sh .git",
+      "expected": {
+        "kind": "tail",
+        "limit": 20,
+        "start": 57,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "pi-whoami 2>&1 | head -8",
+      "expected": {
+        "kind": "head",
+        "limit": 8,
+        "start": 15,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "pi-whoami 2>&1 | head -30; git -C /repo/src/sippi status --short; git -C /repo/src/sippi rev-parse --short HEAD",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 15,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "ls -d /repo/src/sippi/venv 2>&1; /repo/src/sippi/venv/bin/python3 -c \"import sys; print(sys.version)\" 2>&1 | head -3",
+      "expected": {
+        "kind": "head",
+        "limit": 3,
+        "start": 107,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && make lint-imperative-xfail 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 83,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "ls -la ~/.cache/pre-commit 2>&1 | head -5; du -sh ~/.cache/pre-commit 2>/dev/null",
+      "expected": {
+        "kind": "head",
+        "limit": 5,
+        "start": 32,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "stderr-merged",
+      "command": "cd /repo/src/sippi && timeout 600 make lint 2>&1 | tail -8; echo \"=== EXIT $? ===\"",
+      "expected": {
+        "kind": "tail",
+        "limit": 8,
+        "start": 49,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi; grep -n '^#\\{1,3\\} ' doc/todo.md | head -60; echo \"=== total lines ===\"; wc -l doc/todo.md",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 53,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi; sed -n '1,60p' scripts/check_test_counts.py | grep -n \"expected\\|manifest\\|json\\|path\" | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 107,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi; grep -n \"def _run_dense_operation\" -A45 backends/utils/sparse_utils.py | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 91,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && rg -rn \"last_gpu_timings\" --glob '!*.md' . | rg -v \"\\.pyc\" | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 81,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && rg -n \"^worktree-setup:\" -A25 Makefile | head -35",
+      "expected": {
+        "kind": "head",
+        "limit": 35,
+        "start": 61,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && sed -n '/^## Current decision and next action/,/^## /p' doc/todo.md | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 90,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && echo \"=== does d3827e9ac touch the xfail artifact? ===\"; git show --stat d3827e9ac | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 105,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "git diff -- scripts/land_branch.py; git diff --cached -- scripts/land_branch.py | head -8; git status --short",
+      "expected": {
+        "kind": "head",
+        "limit": 8,
+        "start": 80,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && git show --format=fuller --no-ext-diff cfc8770d9 -- | head -180",
+      "expected": {
+        "kind": "head",
+        "limit": 180,
+        "start": 74,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && git diff tests/test_matmat_protocol.py backends/benchmark/segmented_device_operator.py | head -100",
+      "expected": {
+        "kind": "head",
+        "limit": 100,
+        "start": 109,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi && git show --stat 949097a35 | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 48,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && git show f57c1c39c | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 85,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "chain",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && cat .pre-commit-config.yaml | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 94,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi; ls -lt doc/research/ | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 41,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi; grep -n \"test-counts:\" -A12 Makefile | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 57,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && sed -n '/## Current decision and next action/,/^## /p' doc/todo.md | head -120",
+      "expected": {
+        "kind": "head",
+        "limit": 120,
+        "start": 89,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && rg -n \"component_timings\" -A12 tests/test_rooftop_g_krylov.py | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 84,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && rg -n \"_BATCHED_BLOCK_APPLY|def gpu_matvec_block\" backends/ --type py | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 92,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && git show 630475cae -- backends/peec_pfft/aefie_build.py | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 78,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && grep -n \"def collect_static\" -A 60 scripts/audit_xfail_markers.py | head -75",
+      "expected": {
+        "kind": "head",
+        "limit": 75,
+        "start": 88,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "./venv/bin/python scripts/lint_inventory.py --check; ./venv/bin/python scripts/lint_inventory.py --emit-hook | head -5",
+      "expected": {
+        "kind": "head",
+        "limit": 5,
+        "start": 109,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && git log --oneline -3 --name-only | head -40; echo \"=== DIFF STAT ===\"; git diff --stat",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 55,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi && git diff tests/test_segmented_device_operator.py | head -160",
+      "expected": {
+        "kind": "head",
+        "limit": 160,
+        "start": 71,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && git diff backends/peec_pfft/rooftop/_k_matrix.py | head -70",
+      "expected": {
+        "kind": "head",
+        "limit": 70,
+        "start": 100,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && git show --stat 68488ee79 | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 92,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "trailing-segment",
+      "command": "sed -n '674,690p' scripts/test_runner.py; venv/bin/python3 -B -m scripts.test_runner --help | head -60;",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 92,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi; grep -n '|' tmp/review-capability-matrix.md | sed -n '1,80p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 80,
+        "start": 64,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi; grep -rn \"text-hygiene\\|text_hygiene\" Makefile scripts/*.sh 2>/dev/null | head -5",
+      "expected": {
+        "kind": "head",
+        "limit": 5,
+        "start": 92,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && rg -n \"shrink|xfail|heterogeneous|width\" tests/test_block_elimination.py | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 95,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/la-rooftop-g-batched && rg -n \"^lint|^test:|^check\" Makefile | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 100,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && rg -n \"^## |^### \" doc/research/2026-10-07-lint-runner-cost-controls.md | tail -18",
+      "expected": {
+        "kind": "tail",
+        "limit": 18,
+        "start": 94,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && grep -n \"2.1.1\\|linear\\|cherry-pick\\|no-ff\\|merge commit\" AGENTS.md | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 90,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && git diff --name-only master..wave3/feed-cell-width-campaign | grep '^doc/research' | tail -30",
+      "expected": {
+        "kind": "tail",
+        "limit": 30,
+        "start": 105,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && grep -n \"^#\\|^##\\|^###\" doc/todo.md | head -60; echo \"---LINES---\"; wc -l doc/todo.md",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 58,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && grep -rn \"length-doubling\\|length doubling\" doc/ --include=*.md | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 86,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && grep -rln \"19.0935\\|19\\.09\\|Hammerstad\" doc/ --include=*.md | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 82,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "ps -o pid,etime,pcpu,args -C python3 2>/dev/null | grep -i pytest | head -3 || echo \"consumer sweep process gone\"",
+      "expected": {
+        "kind": "head",
+        "limit": 3,
+        "start": 66,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "tail -8 tmp/counter-units-hook-tree.log; rg -n \"lint-counter-units|FAIL|PASS\" tmp/counter-units-hook-tree.log | tail -8",
+      "expected": {
+        "kind": "tail",
+        "limit": 8,
+        "start": 110,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "multi-stage",
+      "command": "cd /repo/src/sippi && grep -n \"Rooftop\\|AEFIE\\|ROOFTOP\\|AEFIE_\\|declared\" backends/solvers/ports/catalog.py | head -50",
+      "expected": {
+        "kind": "head",
+        "limit": 50,
+        "start": 108,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi; grep -n \"Last updated\" doc/todo.md | head -2",
+      "expected": {
+        "kind": "head",
+        "limit": 2,
+        "start": 55,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi; git diff doc/reference/capability-matrix.md | head -70",
+      "expected": {
+        "kind": "head",
+        "limit": 70,
+        "start": 64,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && sed -n '/Priority order and paused work/,/^## [A-Z]/p' doc/todo.md | head -150",
+      "expected": {
+        "kind": "head",
+        "limit": 150,
+        "start": 89,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && rg -n -B5 -A25 \"^class Check\" scripts/lint_inventory.py | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 78,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && rg -n \"EXPECTED_HOOK\" -B3 -A12 tests/test_lint_inventory_consistency.py | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 94,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && python3 scripts/worktree_cleanup.py reap 2>&1 | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 68,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && grep -n \"bridge-abi-check\" -B 12 -A 8 .pre-commit-config.yaml | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 84,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "ps -eo pid,pcpu,pmem,comm,args --sort=-pcpu | head -12",
+      "expected": {
+        "kind": "head",
+        "limit": 12,
+        "start": 44,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "ps -eo pid,pcpu,pmem,comm,args --sort=-pcpu | head -10",
+      "expected": {
+        "kind": "head",
+        "limit": 10,
+        "start": 44,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi && cat tmp/laneA-stream-seam.md 2>/dev/null | head -50",
+      "expected": {
+        "kind": "head",
+        "limit": 50,
+        "start": 63,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && cat scripts/resolve_hook_python.sh 2>/dev/null | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 98,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && grep -rn \"lint-cited-commits\" doc/ | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 101,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "head",
+      "command": "ls doc/ doc/plans/ doc/plans-completed/ 2>/dev/null | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 52,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi; make lint 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 35,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi; bash scripts/parallel_full_lint.sh scripts/validate_global_refinement_result.py 2>&1 | tail -30",
+      "expected": {
+        "kind": "tail",
+        "limit": 30,
+        "start": 105,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && python scripts/audit_production_reachability.py 2>&1 | tail -40; echo \"EXIT=$?\"",
+      "expected": {
+        "kind": "tail",
+        "limit": 40,
+        "start": 75,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/la-rooftop-g-batched && make lint-gpu-ratchet 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 90,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && python3 scripts/worktree_cleanup.py prune-branches 2>&1 | tail -70",
+      "expected": {
+        "kind": "tail",
+        "limit": 70,
+        "start": 78,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && python3 scripts/worktree_cleanup.py prune --force 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 77,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && echo \"=== full push dry-run output ===\"; git push --dry-run origin master 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 101,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && git show lane/s6-guard:backends/utils/dimensional_gate.py | tail -180",
+      "expected": {
+        "kind": "tail",
+        "limit": 180,
+        "start": 80,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && make worktree-setup VENV_SOURCE=/repo/src/sippi/venv 2>&1 | tail -25",
+      "expected": {
+        "kind": "tail",
+        "limit": 25,
+        "start": 109,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && git rebase 949097a35 2>&1 | tail -5; git log --oneline -2",
+      "expected": {
+        "kind": "tail",
+        "limit": 5,
+        "start": 77,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "rg -n \"ALL CHECKS PASSED|EXIT=|FAIL\" tmp/fix2-tree.log | tail -8; tail -4 tmp/fix2-tree.log",
+      "expected": {
+        "kind": "tail",
+        "limit": 8,
+        "start": 55,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && timeout 900 venv/bin/python -m pytest tests/test_gpu_dense_lu_analytic.py -q 2>&1 | tail -5",
+      "expected": {
+        "kind": "tail",
+        "limit": 5,
+        "start": 104,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "tail",
+      "command": "cd /repo/src/sippi && sleep 40; cat /tmp/pi-tmux-3806894/pi-bg-sippi-8da4088f.3806894-mux13h0d-vdmg.out | tail -20",
+      "expected": {
+        "kind": "tail",
+        "limit": 20,
+        "start": 104,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo/src/sippi; ls doc/issues/ | tail -30; echo \"=== COUNT ===\"; ls doc/issues/ | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 84,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "git status --short; printf 'STAGED='; git diff --cached --name-only | wc -l; printf 'HEAD='; git rev-parse --short HEAD",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 68,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "git ls-files | wc -l; du -sh backends tests venv 2>/dev/null; git rev-parse 5cdef734d^",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 13,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo && find .pi/agent/sessions -name '*.jsonl' 2>/dev/null | wc -l; du -sh .pi/agent/sessions 2>/dev/null",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 64,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "git status --short | grep -v \"^ M doc/reference\"; echo ===; ls doc/research/2026-10-07-luna-*.md | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 97,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "ls /repo/tmp/nerf-corpus-flat | head -5; ls /repo/tmp/nerf-corpus-flat | wc -l; du -sh /repo/tmp/nerf-corpus-flat",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 71,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo/tmp/nerf-corpus-flat && ls -l --time-style=+%Y-%m-%d | head -3; date -u; find . -newermt \"-30 days\" | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 109,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo/src/sippi && ls scripts/ 2>/dev/null | head -80; echo \"=== COUNT ===\"; ls scripts/ | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 92,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo/src/sippi && ls tests/test_*.py | wc -l; ls scripts/test_*.py | wc -l; python3 - <<'EOF'\n«heredoc»",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 71,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "ls ~/.pi/agent/sessions/ | head -50; echo \"---\"; ls ~/.pi/agent/sessions/ | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 74,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd ~/.pi/agent/sessions && rg -l \"pi-worktree\" --glob \"*.jsonl\" 2>/dev/null | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 76,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "cd /repo/src/sippi && ls tmp/ | head -40; echo \"--- count ---\"; ls tmp/ | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 72,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "wc",
+      "command": "find /repo/src/sippi/backends /repo/src/sippi/scripts /repo/src/sippi/tests -name \"*.py\" | wc -l",
+      "expected": {
+        "kind": "wc",
+        "limit": null,
+        "start": 89,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "cd /repo/src/sippi; pi-whoami 2>&1 | head -20; echo \"=== git ===\"; git log --oneline -1; git status --short | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 108,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "date +%Y-%m-%d; ls /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 79,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && grep -rn \"lint-runner-cost-controls\" tests/*.py | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 114,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "rg -n \"class Panel|@dataclass.*Panel|Panel =\" backends/peec_pfft -g '*.py' | head;",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 75,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "rg -n \"class Panel\" backends | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 29,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "ls -la /repo/tmp/pi-subagent-nKdljf/ 2>/dev/null; echo \"---\"; ls -la /repo/src/sippi/tmp/scratch/ 2>/dev/null | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 110,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "ps -eo pid,etimes,pcpu,args | grep -E \"pytest\" | grep -v grep | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 62,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/la-multirhs-verify && git rev-parse HEAD && git status --porcelain | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 106,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "grep -rn \"def via_mesh\" tests/ | head; ls tests/conftest.py conftest.py 2>&1 | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 77,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/review-guard-predicate && ls doc/ && ls doc/issues 2>/dev/null | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 102,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/acc-0646-precond && grep -rn \"TriRWGProjector\" --include=*.py backends/ | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 111,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "pdfinfo /tmp/song2003_iccad.pdf | grep Pages; grep -n $'\\f' /tmp/song2003_iccad.txt | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 84,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "no-count",
+      "command": "df -h /tmp /home 2>/dev/null | head; echo \"---\"; ls -la /tmp | head",
+      "expected": {
+        "kind": "head",
+        "limit": null,
+        "start": 61,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi; sed -n '1,30p' scripts/validate_global_refinement_result.py | grep -n \"import\\|from\"",
+      "expected": null
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi; grep -n \"^## \\|^### \" doc/todo.md | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 54,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && grep -n \"^#\\|^##\\|^###\" doc/reference/capability-matrix.md | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 81,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && rg -n \"paragraph|doc_scan|scan_doc|def .*doc\" scripts/lint_counter_units.py | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 98,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && rg -n \"def .*reap|ORPHAN|never killed|compute\" scripts/worktree_cleanup.py | head -30",
+      "expected": {
+        "kind": "head",
+        "limit": 30,
+        "start": 97,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && awk '/^### 2\\.1\\.1/,/^### 2\\.1\\.2|^## 2\\.2/' AGENTS.md | head -60",
+      "expected": {
+        "kind": "head",
+        "limit": 60,
+        "start": 77,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "grep -n '^def select_files_to_run\\|^def _carried_runtime\\|^def run_sweep' scripts/audit_xfail_markers.py",
+      "expected": null
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && rg -n \"_path_edge_events|events =|path crosses\" backends/peec_pfft/surface_field_path.py",
+      "expected": null
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && grep -rln \"_ScaledResistiveCurrent\\|MixedCurrentChargeBlockOperator\" --include=*.py . | head -20",
+      "expected": {
+        "kind": "head",
+        "limit": 20,
+        "start": 108,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/luna-a4b && grep -n \"^lint\\|^check\\|lint-all\\|^\\.PHONY\" Makefile | head -40",
+      "expected": {
+        "kind": "head",
+        "limit": 40,
+        "start": 104,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "rg -n \"complete:|EXIT=|FAIL\" tmp/fix2-make-lint.log | tail -8; tail -8 tmp/fix2-make-lint.log",
+      "expected": {
+        "kind": "tail",
+        "limit": 8,
+        "start": 52,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "grep -n \"dispatch count\\|logical dispatch\\|16 = 2 columns\" /tmp/sippi-master-chk/doc/reference/completed-items.md",
+      "expected": null
+    },
+    {
+      "category": "quoted-pipe",
+      "command": "cd /repo/src/sippi && grep -n \"^[a-z-]*:\" Makefile | grep -i \"doc\\|lint\\|ref\\|style\" | head -15",
+      "expected": {
+        "kind": "head",
+        "limit": 15,
+        "start": 85,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '3061,3110p' backends/vkfft_wrapper.py | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '137,166p' tests/test_gpu_leaf_dispatch.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '31,46p' tests/test_gpu_leaf_dispatch.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && grep -rn \"tmp/probe_gpu_route_overhead\" doc/ | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '4990,5040p' backends/vkfft_wrapper.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '112,140p' scripts/probe_gpu_dense_route_overhead.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '586,612p' tests/test_gpu_leaf_dispatch.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '552,612p' tests/test_gpu_leaf_dispatch.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && echo \"=== tree-scope failure detail ===\"; sed -n '60,110p' /tmp/c29.log | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi && sed -n '1440,1535p' tests/test_gpu_dense_lu.py | cat -n | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi\necho \"=== section headings ===\"\ngrep -n \"^#\\{1,3\\} \" doc/reference/gpu-coexistence.md | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "cd /repo/src/sippi\ngit diff -U6 scripts/test_runner.py | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-transform",
+      "command": "sed -n '1,60p' /repo/tmp/lane-schur-e2e.md 2>/dev/null | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi && git show af3e38752 -- backends/utils/reporting/metrics.py | sed -n '1,210p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 210,
+        "start": 80,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/tmp/2026-10-09/rcu && awk '/^### /{print} /Passed$|Failed$|Skipped$/{print}' pc_matrix.log | sed -n '1,200p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 200,
+        "start": 100,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && grep -n \"\" scripts/lint_inventory.py | sed -n '1,120p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 120,
+        "start": 103,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "sed -n '1,40p' /tmp/sippi-master-chk/doc/reference/completed-items.md | cat -n | sed -n '1,40p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 40,
+        "start": 79,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi && git show worktree/lint-inventory-0627:scripts/lint_inventory.py | sed -n '14,60p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 60,
+        "start": 86,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "nl -ba backends/peec_pfft/rooftop/_g_matrix.py | sed -n '401,590p';",
+      "expected": {
+        "kind": "sed",
+        "limit": 590,
+        "start": 47,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "nl -ba backends/peec_pfft/rooftop/_g_matrix.py | sed -n '25,38p;400,430p;540,710p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 710,
+        "start": 47,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "nl -ba backends/peec_pfft/rooftop/_g_matrix.py | sed -n '390,402p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 402,
+        "start": 47,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "nl -ba tests/test_layered_cprime_asymptotic_extraction.py | sed -n '1,560p'",
+      "expected": {
+        "kind": "sed",
+        "limit": 560,
+        "start": 58,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "nl -ba tests/test_layered_cprime_asymptotic_extraction.py | sed -n '390,510p';",
+      "expected": {
+        "kind": "sed",
+        "limit": 510,
+        "start": 58,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi && grep -n \"^## \\|^### \" doc/reference/development-standards.md | sed -n 1,40p",
+      "expected": {
+        "kind": "sed",
+        "limit": 40,
+        "start": 83,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi && grep -n \"record_buffer_copy\" -A 4 external/bridge/vkfft_dense_lu.cpp | sed -n 1,60p",
+      "expected": {
+        "kind": "sed",
+        "limit": 60,
+        "start": 91,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "sed-range",
+      "command": "cd /repo/src/sippi && rg -n \"_capability_probe\" -A 30 backends/solvers/ddm/interface_batch_containment.py | sed -n 1,48p",
+      "expected": {
+        "kind": "sed",
+        "limit": 48,
+        "start": 106,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "awk-transform",
+      "command": "ps -eo pid,ppid,etime,%cpu,args | awk '$2==4135492 || $2==4135491 || $1==4135492 {print}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "ps -eo pid,ppid,etime,%cpu,%mem,stat,cmd | awk '$2==3703118 || $1==3703118 {print}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "cd /repo/src/sippi && sed -n '56,57p' doc/todo.md | awk '{print substr($0, length($0)-250)}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "ps aux | grep probe_sphere_g_assembly_cost | grep -v grep | awk '{print $2,$3,$4,$6,$9,$10,$11}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "ps -o pid,etime,%cpu,%mem,rss,stat -p 419530; ls -lh /proc/419530/status 2>/dev/null | awk '{print $5}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "for i in 1 2 3; do cat /proc/1999548/stat | awk '{print \"utime+stime (ticks):\", $14+$15}'; sleep 5; done",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "cd /repo/.pi/worktree-checkouts/core-turn-diagnostics && git status --short | awk '{print $2}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "ls -la /repo/src/pi-session-analysis/context.md /repo/src/pi-session-analysis/plan.md 2>/dev/null | awk '{print $9, $5}'",
+      "expected": null
+    },
+    {
+      "category": "awk-transform",
+      "command": "ps aux | grep -E \"pre-commit|parallel_lint|git commit\" | grep -v grep | head -4 | awk '{print $2, $11, $12, $13}'",
+      "expected": null
+    },
+    {
+      "category": "awk-bound",
+      "command": "cd ~/.pi/agent/sessions && rg -c \"pi-worktree\" --glob \"*.jsonl\" 2>/dev/null | awk -F: '{s+=$NF} END {print s}'",
+      "expected": {
+        "kind": "awk",
+        "limit": null,
+        "start": 76,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "awk-bound",
+      "command": "ps -o pid,etime,%cpu,%mem,rss,stat -p 419530; free -h | awk 'NR==2{print \"available=\" $7}'",
+      "expected": {
+        "kind": "awk",
+        "limit": null,
+        "start": 54,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "awk-bound",
+      "command": "ps -o etime=,pcpu=,stat= -p 2837165; free -m | awk 'NR==2 {print $3,$7}'",
+      "expected": {
+        "kind": "awk",
+        "limit": null,
+        "start": 45,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-filter",
+      "command": "make -n land BRANCH=demo DRY_RUN=1; echo MAKE_N_EXIT=$?; make help | grep 'make land'; echo HELP_EXIT=${PIPESTATUS[0]}",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "cd /repo/src/sippi && git show cfc8770d9:tests/test_aefie_block_two_port.py | grep '^def test_'",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "cd /repo/src/sippi/tmp/agent-worktrees/lint-counter-units-gate && ls tests/ | grep -i \"lint\\|hook\\|precommit\" ",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "ls tests/fixtures | grep layered_cprime",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "ls -lt /tmp/pi-tmux-2516933/s | head; ps -ef | grep -E 'cat|bash' | grep 'review-a4b\\|pi-bg-luna' | grep -v grep",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "cd /repo/src/sippi && sed -n 100,135p scripts/probe_dense_lu_capability.py | grep -n \"wrapper\\|VkFFTWrapper\\|preflight\" ",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "PYTHONPATH=. venv/bin/python scripts/test_runner.py --list-suites | grep -E 'worktree-tooling|production'",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "cd /repo/src/sippi; sed -n '1,60p' doc/issues/2026-08-20-*0562* 2>/dev/null; ls doc/issues/ | grep -E \"0562|0547\"",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "cd /repo/src/sippi; grep -rn \"def _grid_from_mesh\" backends/ --include=*.py | grep -v agent-worktrees",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "ps -eo pid,etime,%cpu,cmd | grep -E 'probe_svs3d|<stdin>' | grep -v grep",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "ps -eo pid,etimes,pcpu,rss,stat,args | grep '1507254' | grep -v grep",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "pi-whoami; pwd; git status --short --branch; git worktree list | grep -E 's6-coverage|HEAD'",
+      "expected": null
+    },
+    {
+      "category": "grep-filter",
+      "command": "venv/bin/python3 scripts/lint_assembly_discovery.py | grep -E '^(COVERED|UNcovered).*svs3d|assembly discovery:'",
+      "expected": null
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /tmp/review-multirhs && ls prefix | wc -l; ls prefix | grep -c venv; echo \"---\"; head -c 1200 /dev/null",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 56,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "sleep 15; git worktree list | grep -c 59e41224",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 28,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /repo/.pi/worktree-checkouts/lsp-outside-workspace-hint && npx tsc --noEmit 2>&1 | grep -c \"error TS\"",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 84,
+        "mergedStderr": true
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "pkill -f \"lsp_publish_latency.py --file tmp/slowproj\" ; sleep 1; ps aux | grep -c \"[l]sp_publish_latency\"",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 72,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /repo/src/sippi && git log --oneline -2 && git status --short | grep -c \"^ M\\|^??\"",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 65,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /repo/src/sippi && ps aux | grep \"[p]ytest\" | grep -c . && venv/bin/python - <<'EOF'\n«heredoc»",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 47,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "wc -l /repo/src/sippi/tmp/fullsuite.log 2>/dev/null; ps aux | grep -c \"[p]ytest\"",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 60,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /repo/src/sippi && git log --oneline -3; git status --short | grep -c \"^ M\"",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 63,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "grep-count",
+      "command": "cd /repo/src/sippi && git log --oneline -1 && git worktree list | grep -c master",
+      "expected": {
+        "kind": "grep",
+        "limit": null,
+        "start": 64,
+        "mergedStderr": false
+      }
+    },
+    {
+      "category": "control-operator",
+      "command": "ls -la /repo/src/sippi/tmp/audit-workers/ 2>/dev/null || echo \"not yet created\"",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "command -v pre-commit || true; ls venv/bin/pre-commit",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pwd; pi-whoami 2>/dev/null || true; git rev-parse --show-toplevel; git rev-parse --short HEAD; git status --short",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "git grep -nE 'setdefault\\([\"'\"'\"']converged[\"'\"'\"']' -- backends scripts '*.py' 2>/dev/null || true;",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "ls doc/issues/2026-10-08-0657* 2>/dev/null || true;",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "command -v ruff || true; ls -l /repo/src/sippi/venv/bin/ruff /repo/src/sippi/venv/bin/python 2>&1 | sed 's/^/  /'",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "command -v py-spy || true; cat /proc/3694544/wchan 2>/dev/null;",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pi-whoami 2>/dev/null || true; git status --short; git rev-parse --short HEAD; pwd",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "ps -p 3084207 -o pid,ppid,etimes,args || true; tail -5 tmp/issue-bindings-measure.txt",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pgrep -af 'flock -x /tmp/sippi-gpu-la.lock timeout 900' | cut -c1-240 || true",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pi-whoami || true; git status --short; git rev-parse --short HEAD; ls context.md plan.md",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pi-whoami || true; git status --short; git log --oneline -2; pwd",
+      "expected": null
+    },
+    {
+      "category": "control-operator",
+      "command": "pi-whoami || true; git rev-parse --show-toplevel; git status --short; git rev-parse --short HEAD",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '1,120p' doc/todo.md",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '180,330p' doc/todo.md",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '3201,3345p' doc/todo.md",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '3245,3345p' doc/todo.md",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '1308,1340p' Makefile",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '120,165p' scripts/validate_global_refinement_result.py",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '215,300p' scripts/validate_global_refinement_result.py",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '/^def _valid_bounds/,/^def /p' scripts/lint_record_provenance.py",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '36,60p' doc/reference/capability-matrix.md | cut -c1-160",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; echo \"=== safe_lstsq definition ===\"; grep -n \"def safe_lstsq\" -A25 backends/utils/sparse_utils.py",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi; sed -n '1236,1300p' backends/utils/sparse_utils.py",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi && sed -n '2875,2925p' doc/todo.md",
+      "expected": null
+    },
+    {
+      "category": "non-pipe",
+      "command": "cd /repo/src/sippi && sed -n '1,100p' doc/issues/2026-09-24-0613-svs3d-z-efie-raw-gpu-upload-fails-on-eve.md",
+      "expected": null
+    }
+  ]
+}
