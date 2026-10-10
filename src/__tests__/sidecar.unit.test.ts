@@ -21,6 +21,7 @@ import {
 import {
     chunkText,
     formatSidecarReceipt,
+    INLINE_CONTEXT_MAX_LINES,
     INLINE_FALLBACK_MAX_CHARS,
     prepareInlineOutput,
 } from "../features/sidecar.ts";
@@ -779,6 +780,63 @@ void describe("indexJobOutputInSidecar", () => {
             .get(prepared.source?.sourceId) as { count: number };
         assert.equal(severity.count, 0);
         check.close();
+    });
+
+    void it("indexes sub-threshold output when forced", async () => {
+        // `pipe-nerf` shows the agent a bounded view, so the remainder has to be
+        // captured. The commands it touches are usually BELOW the inline
+        // threshold (an agent writes `| tail -5` on short output), which is
+        // exactly where the default would skip the index and the rest of the
+        // output would exist nowhere.
+        createDb(tmpDir);
+        const output = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join(
+            "\n"
+        );
+        assert.ok(output.split("\n").length <= INLINE_CONTEXT_MAX_LINES);
+        const job = testJob({
+            id: "job-forced-small",
+            logPath: writeLog(output),
+        });
+
+        // Without force: inline, no source, nothing retained.
+        const plain = await prepareInlineOutput(
+            job,
+            { cwd: tmpDir },
+            output,
+            "bash"
+        );
+        assert.equal(plain.source, undefined);
+        assert.equal(plain.truncated, false);
+
+        // With force: indexed, receipt returned, full output recoverable.
+        const forced = await prepareInlineOutput(job, { cwd: tmpDir }, output, "bash", {
+            force: true,
+        });
+        assert.ok(forced.source, "a forced index must produce a source");
+        assert.equal(forced.truncated, true);
+        assert.match(forced.text, /\[context-sidecar\]/);
+        assert.equal(await readJobOutputFromSidecar(job.id), output);
+    });
+
+    void it("keeps inline text when a forced index cannot be created", async () => {
+        // A forced index must never make the result worse: if the sidecar is
+        // unavailable, the output is returned as-is rather than replaced by a
+        // receipt that points nowhere.
+        const output = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join(
+            "\n"
+        );
+        const job = testJob({
+            id: "job-forced-no-db",
+            logPath: writeLog(output),
+        });
+
+        const prepared = await prepareInlineOutput(job, {}, output, "bash", {
+            force: true,
+        });
+
+        assert.equal(prepared.source, undefined);
+        assert.equal(prepared.truncated, false);
+        assert.equal(prepared.text, output);
     });
 
     void it("bounds large foreground output when the sidecar is unavailable", async () => {

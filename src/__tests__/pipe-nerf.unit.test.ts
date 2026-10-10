@@ -820,6 +820,10 @@ void describe("pipe-nerf registration", () => {
         // rewriting commands the user just turned the feature off for.
         const state = {
             featureOverridesSession: new Map<string, boolean>(),
+            // The nerf records hoisted calls here so the bash tool forces an
+            // index for them. A double that omits it made the optional chaining
+            // hide a missing field instead of failing.
+            pipeHoistedCalls: new Set<string>(),
         } as unknown as TauState;
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never, state);
@@ -852,6 +856,51 @@ void describe("pipe-nerf registration", () => {
             input: third,
         });
         assert.equal(third.command, "ls");
+    });
+
+    void it("records a hoisted call so the bash tool forces an index", () => {
+        // The sidecar's own threshold is 300 lines / 24KB, and the commands
+        // this nerf touches are usually smaller. Without this flag the agent
+        // gets a bounded view of output that exists nowhere else.
+        const state = {
+            featureOverridesSession: new Map<string, boolean>(),
+            pipeHoistedCalls: new Set<string>(),
+        } as unknown as TauState;
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never, state);
+
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "hoist",
+            input: { command: "seq 1 60 | tail -3" },
+        });
+        assert.equal(state.pipeHoistedCalls.has("hoist"), true);
+
+        // Consumed by the result hook, so a later unrelated call is not indexed.
+        fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "hoist",
+            content: [{ type: "text", text: "58\n59\n60" }],
+        });
+        assert.equal(state.pipeHoistedCalls.has("hoist"), false);
+    });
+
+    void it("does not record a call it chose not to rewrite", () => {
+        const state = {
+            featureOverridesSession: new Map<string, boolean>(),
+            pipeHoistedCalls: new Set<string>(),
+        } as unknown as TauState;
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never, state);
+
+        for (const command of ["ls | grep foo", "make -j8"]) {
+            fire(handlers, "tool_call", {
+                toolName: "bash",
+                toolCallId: `plain-${command}`,
+                input: { command },
+            });
+        }
+        assert.equal(state.pipeHoistedCalls.size, 0);
     });
 
     void it("drops pending state on shutdown", () => {

@@ -551,6 +551,20 @@ async function tryIndexViaExternalApi(
 export interface SidecarIndexOptions {
     classify?: (text: string) => LogCounts;
     useExternalApi?: boolean;
+    /**
+     * Index even when the output is under the inline threshold.
+     *
+     * The threshold exists so ordinary small output is not indexed, which is
+     * right for output nobody has discarded. It is wrong when a pipe was hoisted
+     * off the command: the agent then sees a bounded view (say 5 of 60 lines)
+     * and the other 55 exist nowhere. `pipe-nerf` sets this for exactly those
+     * calls, because the capture is the only route to what the view hides.
+     *
+     * The caller is responsible for only setting it when a view was actually
+     * applied; indexing unconditionally would put every small command in
+     * context.db.
+     */
+    force?: boolean;
 }
 
 /**
@@ -577,13 +591,43 @@ export async function prepareInlineOutput(
             ? 0
             : output.split("\n").length - (output.endsWith("\n") ? 1 : 0);
     const empty = output.trim().length === 0;
-    if (!isLargeInlineOutput(output)) {
+    if (!isLargeInlineOutput(output) && !options.force) {
         return {
             text: output || "(no output)",
             truncated: false,
             totalLines,
             byteCount: bytes,
             empty,
+        };
+    }
+    // A forced index still needs the inline form bounded: the point is to record
+    // the output, not to push all of it into the reply.
+    if (!isLargeInlineOutput(output)) {
+        const indexOutcome = await indexJobOutputWithOutcome(
+            job,
+            ctx,
+            toolName,
+            options
+        );
+        if (indexOutcome.source) {
+            return {
+                text: formatSidecarReceipt(toolName, indexOutcome.source, bytes, totalLines),
+                truncated: true,
+                partial: true,
+                totalLines,
+                byteCount: bytes,
+                empty,
+                source: indexOutcome.source,
+                indexOutcome,
+            };
+        }
+        return {
+            text: output || "(no output)",
+            truncated: false,
+            totalLines,
+            byteCount: bytes,
+            empty,
+            indexOutcome,
         };
     }
 

@@ -2233,8 +2233,15 @@ export function registerBackgroundJobs(
                         },
                         ctx,
                         output,
-                        "bash"
+                        "bash",
+                        // A hoisted pipe means the agent is shown a bounded
+                        // view of this output, so the rest exists only here.
+                        // Index it even when it is under the inline threshold.
+                        { force: state.pipeHoistedCalls.has(toolCallId) }
                     );
+                    // The index decision has been made; do not let the flag
+                    // survive to affect a later call.
+                    state.pipeHoistedCalls.delete(toolCallId);
                     return {
                         content: [
                             { type: "text" as const, text: prepared.text },
@@ -2396,7 +2403,8 @@ export function registerBackgroundJobs(
                     },
                     ctx,
                     output,
-                    "bash"
+                    "bash",
+                    { force: state.pipeHoistedCalls.has(toolCallId) }
                 );
 
                 if (
@@ -3565,7 +3573,8 @@ async function executeTmuxForeground(
                 },
                 ctx,
                 output,
-                "bash"
+                "bash",
+                { force: state.pipeHoistedCalls.has(toolCallId) }
             );
             // Clean up tmux window. Keep the session alive so the next
             // spawnInTmux call reuses it via new-window instead of creating
@@ -3804,7 +3813,8 @@ async function executeTmuxForeground(
             },
             ctx,
             output,
-            "bash"
+            "bash",
+            { force: state.pipeHoistedCalls.has(toolCallId) }
         );
         killWindow(tmuxCtx.windowId);
         // Session is intentionally kept alive — reuse avoids tmux server

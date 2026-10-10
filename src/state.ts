@@ -33,6 +33,21 @@ export class TauState {
     /** Job id the pending-decision steer was last sent for (avoid repeat steers). */
     decisionSteerJobId: string | undefined;
 
+    /**
+     * Tool call ids whose command had a limiting output pipe hoisted off it by
+     * `pipe-nerf`.
+     *
+     * The nerf shows the agent a bounded view of the output, so the remainder
+     * exists only if something captured it. The sidecar's own threshold (300
+     * lines / 24KB) is right for output nobody discarded, but wrong here: the
+     * calls this nerf touches are exactly the small ones an agent bounded with
+     * a pipe, and those fall below it. The bash tool consults this set to force
+     * an index for those calls and nothing else.
+     *
+     * Entries are removed once the result has been prepared.
+     */
+    pipeHoistedCalls = new Set<string>();
+
     /** Whether tmux is available for the tmux-backed bash backend. */
     tmuxAvailable = false;
     /** Whether the tmux-unavailable warning has been shown this session. */
