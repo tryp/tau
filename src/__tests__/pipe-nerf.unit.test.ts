@@ -220,13 +220,37 @@ void describe("pipe-nerf parser", () => {
         );
     });
 
-    void it("marks a non-final stage separately from having no pipe", () => {
-        assert.equal(plan("git log | tail -5; git status").reason, "last-stage-only");
-        assert.equal(plan("a | tail -5 && b").reason, "last-stage-only");
-        // Reported apart so a reader comparing reasons can tell "no pipe" from
-        // "a pipe that is not the last word".
+    void it("rewrites after a `;` but not before an `&&`", () => {
+        // `;` separates statements: the next one runs whatever the previous
+        // returned, so the limiter can be removed.
+        assert.equal(plan("echo a; seq 1 50 | tail -3").action, "rewrite");
+        assert.equal(plan("echo a; seq 1 50 | tail -3").rewritten, "echo a; seq 1 50");
+        assert.equal(plan("echo X; make 2>&1 | tail -40").rewritten, "echo X; make 2>&1");
+        assert.equal(plan("a\nb | tail -5").rewritten, "a\nb");
+        // `&&` / `||` chain on the stage's status, so the limiter stays.
+        assert.equal(plan("a | tail -5 && b").reason, "status-bearing-operator");
+        assert.equal(plan("a | tail -5 || b").reason, "status-bearing-operator");
+        // A `cd ... &&` prologue is BEFORE the pipe, so it is lifted with it.
+        assert.equal(plan("cd /x && make | tail -20").rewritten, "cd /x && make");
+    });
+
+    void it("reports having no pipe separately from a status-bearing one", () => {
         assert.equal(plan("ls").reason, "no-pipe");
         assert.equal(plan("ls || tail -5").reason, "no-pipe");
+    });
+
+    void it("keeps the same control flow when a limiter follows a `;`", () => {
+        // The `;` form is rewritten, so the rewrite must reach the same
+        // statements: every line the original printed is still printed.
+        for (const command of [
+            "false | tail -5; echo done",
+            "true | head -2; echo done",
+            "echo a; seq 1 50 | tail -3",
+            "echo X; seq 1 20 2>&1 | tail -4",
+        ]) {
+            assert.equal(plan(command).action, "rewrite", command);
+            superset(command);
+        }
     });
 });
 
@@ -270,10 +294,15 @@ void describe("pipe-nerf rewrite safety", () => {
         // `tail -f` never returns; removing it hands the tool a hanging command.
         assert.equal(plan("cat f | tail -f").reason, "not-a-limiter");
         assert.equal(plan("cat f | tail -f | wc -l").action, "rewrite");
-        // A limiter that is not the command's last stage is left alone: in
-        // `a | tail -5 && b` its output is interleaved with b's, so removing it
-        // would change b's context too.
-        assert.equal(plan("seq 1 100 | tail -5 && echo done").reason, "last-stage-only");
+        // A limiter before `&&` / `||` is left alone: the chain reads the
+        // stage's exit status, so removing it changes what runs (measured,
+        // `false | tail -5 && echo done` prints `done`; `false && echo done`
+        // prints nothing).
+        assert.equal(
+            plan("seq 1 100 | tail -5 && echo done").reason,
+            "status-bearing-operator"
+        );
+        assert.equal(plan("a | tail -5 || b").reason, "status-bearing-operator");
     });
 
     void it("never drops an output line", () => {

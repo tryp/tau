@@ -68,8 +68,13 @@ export type SkipReason =
     | "no-pipe"
     /** A `tail -f` follows its input rather than bounding it. */
     | "not-a-limiter"
-    /** A limiter exists but is not the command's last stage. */
-    | "last-stage-only"
+    /**
+     * An `&&` or `||` follows the limiter, so the chain reads the stage's exit
+     * status. Removing the stage changes what runs: measured,
+     * `false | tail -5 && echo done` prints `done` (tail exits 0) while
+     * `false && echo done` prints nothing.
+     */
+    | "status-bearing-operator"
     /** Nothing runs before the limiter, so removing it leaves no command. */
     | "empty-command"
     | "disabled"
@@ -204,12 +209,21 @@ function controlOperatorIn(text: string): number {
     }
     return -1;
 }
-
-/** End of the last top-level control operator (`&&`, `||`, `;`, newline). */
-function lastControlOperator(command: string): number {
+/**
+ * The last top-level control operator, and whether it reads a status.
+ *
+ * `;` and a newline separate statements: the next one runs regardless of what
+ * the previous returned. `&&` and `||` chain on it: they read the previous
+ * stage's exit status. That difference decides whether a limiter placed before
+ * the operator can be removed, and conflating the two is what a single
+ * "not-the-last-stage" guard does -- it refused 116,786 corpus calls that the
+ * `;` form makes safe.
+ */
+function lastControlOperator(command: string): { at: number; statusBearing: boolean } {
     let quote = "";
     let depth = 0;
-    let found = -1;
+    let at = -1;
+    let statusBearing = false;
     let i = 0;
     const n = command.length;
     while (i < n) {
@@ -219,7 +233,9 @@ function lastControlOperator(command: string): number {
                 i += 2;
                 continue;
             }
-            if (ch === quote) quote = "";
+            if (ch === quote) {
+                quote = "";
+            }
             i += 1;
             continue;
         }
@@ -233,20 +249,21 @@ function lastControlOperator(command: string): number {
         } else if (ch === ")") {
             depth = Math.max(0, depth - 1);
         } else if (depth === 0) {
-            if (ch === "\n") {
-                found = i;
-            } else if (ch === ";") {
-                found = i;
-            } else if (ch === "&" && command[i + 1] === "&") {
-                found = i;
-            } else if (ch === "|" && command[i + 1] === "|") {
-                found = i;
+            if (ch === "\n" || ch === ";") {
+                at = i;
+                statusBearing = false;
+            } else if (
+                (ch === "&" && command[i + 1] === "&") ||
+                (ch === "|" && command[i + 1] === "|")
+            ) {
+                at = i;
+                statusBearing = true;
                 i += 1;
             }
         }
         i += 1;
     }
-    return found;
+    return { at, statusBearing };
 }
 
 /** Split a stage into its program name, keeping a path prefix out of the way. */
@@ -417,8 +434,12 @@ export function planPipeNerf(command: string, options: { enabled?: boolean } = {
     // removing it would change b's context too. Reported separately from
     // `no-pipe`: the command DOES pipe, and a reader comparing the two reasons
     // needs to be able to tell "no pipe" from "a pipe that is not the last word".
-    if (lastControlOperator(command) >= at) {
-        return skipped(command, "last-stage-only");
+    // A `;` or newline after the limiter only separates statements, so the
+    // limiter can still be removed. An `&&` or `||` chains on the stage's exit
+    // status, and removing the stage changes what runs.
+    const control = lastControlOperator(command);
+    if (control.at > at && control.statusBearing) {
+        return skipped(command, "status-bearing-operator");
     }
 
     const invocation = findPipeInvocation(command);
@@ -458,25 +479,34 @@ export function planPipeNerf(command: string, options: { enabled?: boolean } = {
     const before = command.slice(0, invocation.start);
     if (!/\S/.test(before)) return skipped(command, "empty-command", invocation);
 
-    // The rewrite joins `before` with whatever followed the last control
-    // operator, so a trailing `; cmd` keeps its own command and its own limiter
-    // is the one rewritten. Anything after the operator must be whitespace only,
-    // which `findPipeInvocation` already established.
-    const controlEnd = lastControlOperator(command);
-    const prefix = command.slice(0, Math.max(invocation.start, controlEnd + 1));
-    const trimmedPrefix = prefix.replace(/\s+$/, "");
-    // A separator must not be swallowed by the join: `a && | tail -5` is not a
-    // command, and `a; | tail -5` would become `a;` with nothing to run.
-    if (/[;&|]\s*$/.test(trimmedPrefix)) {
+    // The rewrite removes the limiter's OWN segment and keeps everything around
+    // it. `seq 1 50 | tail -3; echo done` must become `seq 1 50; echo done`:
+    // dropping only the stage text would leave a dangling `|`, and dropping
+    // everything after the segment would delete `echo done` along with it.
+    const segmentEnd = lastControlOperator(command.slice(invocation.start)).at;
+    const stageEnd = segmentEnd < 0 ? command.length : invocation.start + segmentEnd;
+    const beforeSegment = command.slice(0, invocation.start).replace(/\s+$/, "");
+    const afterSegment = command.slice(stageEnd);
+    // A separator must not be swallowed: `a && | tail -5` is not a command, and
+    // `a; | tail -5` would become `a;` with nothing to run.
+    if (/[;&|]\s*$/.test(beforeSegment)) {
         return skipped(command, "empty-command", invocation);
     }
-    if (!/\S/.test(trimmedPrefix)) return skipped(command, "empty-command", invocation);
+    if (!/\S/.test(beforeSegment)) return skipped(command, "empty-command", invocation);
+
+    // Rejoin without swallowing or inventing a separator: the text after the
+    // segment starts with its own operator (`; echo done`) or is a newline.
+    const separator = /^[\s]*[;&|]/.test(afterSegment) ? "" : " ";
+    const rewritten =
+        afterSegment.trim().length === 0
+            ? beforeSegment
+            : `${beforeSegment}${separator}${afterSegment.replace(/^\s+/, "")}`;
 
     return {
         action: "rewrite",
         reason: null,
         original: command,
         invocation,
-        rewritten: trimmedPrefix,
+        rewritten: rewritten.trim(),
     };
 }
