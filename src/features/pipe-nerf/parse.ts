@@ -61,6 +61,8 @@ export interface PipeInvocation {
     end: number;
     /** Whether the stage begins with `2>&1`, so stderr was merged into it. */
     mergedStderr: boolean;
+    /** The limiter's own arguments, for reproducing its view. */
+    args: string;
 }
 
 export type SkipReason =
@@ -360,6 +362,7 @@ export function findPipeInvocation(command: string): PipeInvocation | null {
         end: command.length,
         mergedStderr: hasStderrMerge(command.slice(0, at)),
         stageStart,
+        args,
     };
 }
 
@@ -376,6 +379,149 @@ const LIMITER_NAMES: ReadonlySet<string> = new Set([
 /** Whether a stage's program is one this hook knows how to reason about. */
 function isLimiterName(name: string): boolean {
     return LIMITER_NAMES.has(name);
+}
+
+/** What the agent's own pipe would have printed, reconstructed from the capture. */
+export interface LimiterView {
+    /** The text to show in place of the full output. */
+    text: string;
+    /**
+     * Whether `text` is exactly what the shell pipe would have printed. False
+     * when the tool's own budget had already dropped the region the limiter
+     * reads, or when the limiter is a program this module does not reproduce.
+     */
+    faithful: boolean;
+    /** Why it is not faithful, phrased for the note. */
+    caveat: string | null;
+}
+
+function splitLines(text: string): string[] {
+    const lines = text.split("\n");
+    // A trailing newline is a terminator, not an empty final line.
+    if (lines.at(-1) === "") lines.pop();
+    return lines;
+}
+
+/**
+ * Reproduce the agent's pipe against the captured output.
+ *
+ * The command runs untruncated so the tool captures everything, but the RESULT
+ * is still bounded to what the agent asked for. Removing the pipe and returning
+ * the whole capture would hand back 60 lines where the agent wrote `| tail -3`
+ * -- the very context growth the pipe was written to prevent.
+ *
+ * `faithful` is false when the view cannot be reconstructed from what reached
+ * the hook: the tool's own 2000-line / 50KB budget may have dropped the region
+ * the limiter reads (a `head` loses the head, a `grep -c` loses its matches),
+ * and a program like `awk 'END{...}'` is not re-implementable here. In those
+ * cases the note says so and points at the capture rather than presenting a
+ * number that would be quietly wrong.
+ */
+export function applyLimiter(
+    text: string,
+    invocation: PipeInvocation,
+    context: { truncated: boolean; totalLines: number | null }
+): LimiterView {
+    const { kind, limit } = invocation;
+    const lines = splitLines(text);
+    const total = context.totalLines ?? lines.length;
+    // `head`, `grep -c`, and `sed -n` all read from the START of the output, so
+    // they are only reproducible when nothing was dropped from the start.
+    const lostHead = context.truncated;
+
+    switch (kind) {
+        case "tail": {
+            const keep = limit ?? 10; // `tail`'s own default
+            // A tail of a tail is a tail, so this is faithful even when the
+            // capture is a truncated one.
+            return {
+                text: lines.slice(Math.max(0, lines.length - keep)).join("\n"),
+                faithful: true,
+                caveat: null,
+            };
+        }
+        case "head": {
+            if (lostHead) {
+                return {
+                    text,
+                    faithful: false,
+                    caveat: `your pipe asked for the first ${
+                        limit ?? "few"
+                    } lines, which the tool's own inline budget had already dropped`,
+                };
+            }
+            const keep = limit ?? 10;
+            return {
+                text: lines.slice(0, keep).join("\n"),
+                faithful: true,
+                caveat: null,
+            };
+        }
+        case "wc": {
+            // `wc -l` prints one number, and the tool reports the true total
+            // even when it dropped lines, so this is exact either way.
+            const printed = String(total);
+            return { text: printed, faithful: true, caveat: null };
+        }
+        case "grep":
+        case "rg": {
+            if (lostHead) {
+                return {
+                    text,
+                    faithful: false,
+                    caveat:
+                        "your pipe counted matches across the whole output, and the tool's inline budget had already dropped part of it, so the count below is a lower bound",
+                };
+            }
+            const matches = lines.filter((line) =>
+                grepPattern(invocation).test(line)
+            ).length;
+            return { text: String(matches), faithful: true, caveat: null };
+        }
+        case "sed": {
+            if (lostHead || limit === null) {
+                return {
+                    text,
+                    faithful: false,
+                    caveat: lostHead
+                        ? "your pipe selected a line range from output the tool's inline budget had already dropped"
+                        : "your pipe selected a line range that could not be reproduced from the capture",
+                };
+            }
+            return {
+                text: lines.slice(0, limit).join("\n"),
+                faithful: true,
+                caveat: null,
+            };
+        }
+        default: {
+            // `awk` programs are arbitrary; re-running the agent's program over
+            // the capture is not something this module should guess at.
+            return {
+                text,
+                faithful: false,
+                caveat:
+                    "your pipe ran an awk program, which is applied to the command rather than to the result, so the full output is shown here",
+            };
+        }
+    }
+}
+
+/** The pattern a counting grep filters on, or a never-matching pattern. */
+function grepPattern(invocation: PipeInvocation): RegExp {
+    const args = invocation.args ?? "";
+    // Drop the flags, then take the first non-flag token as the pattern.
+    const tokens = args.trim().split(/\s+/).filter(Boolean);
+    const first = tokens.find((token) => !token.startsWith("-"));
+    if (!first) return /(?!)/;
+    const unquoted = first.replace(/^['"]|['"]$/g, "");
+    // `-E` alternation is the common form; treat `\|` as alternation either way.
+    const body = unquoted.replace(/\\\|/g, "|");
+    try {
+        return new RegExp(body);
+    } catch {
+        return /(?!)/;
+    }
 }
 
 function skipped(

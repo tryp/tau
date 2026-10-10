@@ -24,6 +24,16 @@ export interface PipeObservation {
     sourceId: string | null;
     /** How to recover the rest, when there is something to recover. */
     receiptLines: string[];
+    /**
+     * Whether the view below the note is exactly what the removed pipe printed.
+     * False means a region was already dropped, so the view is a lower bound
+     * rather than the answer the agent asked for.
+     */
+    faithful: boolean;
+    /** Why the view is not faithful, phrased for the agent. */
+    caveat: string | null;
+    /** How the agent's own pipe would have bounded what it now sees. */
+    viewDescription: string;
 }
 
 /** Render the removed stage so the note never claims a bound it did not read. */
@@ -50,12 +60,16 @@ function inlineBudget(): string {
 }
 
 /**
- * The explicit, agent-facing note prepended to every modified call's result.
+ * The agent-facing note prepended to every modified call's result.
  *
- * This is the only place the agent learns its command was changed, so it has to
- * say what was removed, what the visible window now is, how much output is
- * recoverable and from where, and which tool to reach for. It is prepended to
- * every modified call, so it stays short.
+ * The contract is: you asked for a bounded view, you still get one, and
+ * nothing you would otherwise have re-run for is gone. So the note says what
+ * was removed, how much is now captured, the err/warn mix (the stat an agent
+ * would otherwise re-run the command to compute), and the exact call that
+ * retrieves any part it cannot see.
+ *
+ * It is prepended to every modified call, so it stays short: the retrieval
+ * instructions are one line each, not a tutorial.
  */
 export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     if (plan.action !== "rewrite" || !plan.invocation) return "";
@@ -63,16 +77,17 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     const removed = boundText(invocation);
 
     const lines: string[] = [
-        `[pipe-nerf] Removed the output-limiting pipe ${JSON.stringify(removed)} from your command before it ran, so pi captured the whole output instead of truncating it in the shell.`,
+        `[pipe-nerf] Removed the output-limiting pipe ${JSON.stringify(removed)} before running, so the whole output is now captured instead of discarded in the shell.`,
         `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
     ];
 
-    if (invocation.kind === "head") {
-        // `head` and the tool's truncation disagree about which end to keep, so
-        // the agent has to be told or it will read a window it did not ask for.
-        lines.push(
-            `You asked for the first ${invocation.limit ?? "few"} lines. pi keeps the END of long output, so the lines you get are the last ones; grep the full output below if you needed the beginning.`
-        );
+    // What the agent sees is what it asked for, so say so explicitly: otherwise
+    // a short result next to "the whole output is captured" reads as if the
+    // capture were still filtered.
+    lines.push(`Showing below: ${observed.viewDescription}.`);
+
+    if (observed.caveat) {
+        lines.push(`Note: ${observed.caveat}.`);
     }
     if (invocation.mergedStderr) {
         // The merged form is where the habit costs the most: stderr was folded
@@ -82,30 +97,47 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
             "Your command merged stderr into stdout before the pipe, which cut the error half of the output. pi captures both streams, so the separation is back."
         );
     }
+    if (invocation.kind === "head") {
+        // `head` and the tool's truncation disagree about which end to keep, so
+        // the agent has to be told or it will read a window it did not ask for.
+        lines.push(
+            "You asked for the beginning of the output. pi keeps the END of long output, so read the capture below if you needed the first lines."
+        );
+    }
 
     const counts = observed.totalLines ?? observed.visibleLines;
     if (counts !== null && counts !== undefined) {
         lines.push(
-            `Captured ${counts} lines (${observed.err} err, ${observed.warn} warn).`
+            `Captured ${counts} lines (${observed.err} err, ${observed.warn} warn). The err/warn counts cover everything captured, not just the part shown.`
         );
     }
 
-    if (observed.fullOutputPath) {
-        lines.push(`Full output: ${observed.fullOutputPath}`);
-    }
     if (observed.sourceId) {
         lines.push(
-            `Full output is indexed in the context sidecar as ${JSON.stringify(observed.sourceId)}; use it instead of re-running the command with a narrower pipe.`
+            `The full output is indexed in the context sidecar as ${JSON.stringify(observed.sourceId)}. Do not re-run the command to read it.`
         );
         lines.push(...observed.receiptLines);
     }
-    if (!observed.fullOutputPath && !observed.sourceId) {
+    if (observed.fullOutputPath && !observed.sourceId) {
         lines.push(
-            `Nothing was dropped (output fits within ${inlineBudget()}), so the result above is the complete output.`
+            `The full output is on disk at ${observed.fullOutputPath}. Do not re-run the command to read it: grep it, or read a range.`
         );
-    } else {
         lines.push(
-            `Output beyond ${inlineBudget()} is not shown above but is kept, so grep it rather than re-running the command.`
+            `- Search it: grep -nE "pattern" ${observed.fullOutputPath}`
+        );
+        lines.push(
+            `- Read a range: sed -n '${Math.max(1, (observed.totalLines ?? 1) - 99)},${observed.totalLines ?? 100}p' ${observed.fullOutputPath}`
+        );
+    }
+    if (!observed.fullOutputPath && !observed.sourceId) {
+        // The capture fits inline, so there is no separate retrieval route -- but
+        // the agent still asked for a BOUNDED view of it. Saying "what is shown
+        // is the complete output" would be false (the view is 3 lines of 60) and
+        // would leave the agent no route to the rest, which is the re-run this
+        // nerf exists to prevent. So say plainly that the capture was inline and
+        // the remainder has to be re-requested.
+        lines.push(
+            `The capture fits within ${inlineBudget()}, so nothing was written to disk and there is no sidecar source. Everything captured is counted above; to read the part not shown above, re-run the same command without a pipe.`
         );
     }
 
@@ -115,9 +147,9 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
 /** Standing guidance contributed to the bash tool's prompt guidelines. */
 export function bashGuidelines(): string[] {
     return [
-        "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: pi already keeps the end of long output inline, writes everything it drops to a file, and indexes large output into the context sidecar. The pipe is what stops that from happening, and it discards the beginning of an output before anything can read it.",
+        "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: the whole output is captured to a file (and to the context sidecar for large or background output) while your result stays bounded to the N lines you asked for. The pipe is what prevents that capture from happening, and it discards the beginning of an output before anything can read it.",
+        "The removal note tells you the captured line count and the err/warn mix over the WHOLE captured output. Read that before re-running anything: it is the stat you would have run the command again to compute.",
         "Filtering is fine and is left alone. `| grep pattern`, `| sed`, and `| awk` change which lines and what text the command produces, so they are NOT removed; they return a different answer, not more of the same one.",
-        "To read more of an output you just produced, do not re-run the command with a narrower pipe. Search it: context_search query:\"...\" source_id:\"...\"; read a range: context_get source_id:\"...\" chunk_id:\"...\"; export it whole: context_export source_id:\"...\".",
-        "Long command output carries an err/warn line count (for example `1,204 lines (12 err, 88 warn)`). Read that count before deciding the run succeeded, and read the full output when the count is non-zero.",
+        "To read more of an output you just produced, never re-run the command with a narrower pipe. If the removal note gave you a source id: context_search query:\"...\" source_id:\"...\", then context_get source_id:\"...\" chunk_id:\"...\", then context_export source_id:\"...\". If it gave you a file path, grep or sed that path.",
     ];
 }

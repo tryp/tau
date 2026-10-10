@@ -24,17 +24,20 @@ import type { TauState } from "../../state.ts";
 import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
 import { bashGuidelines, pipeNote } from "./messages.ts";
-import { planPipeNerf } from "./parse.ts";
+import { applyLimiter, planPipeNerf } from "./parse.ts";
+import type { LimiterView, PipeInvocation } from "./parse.ts";
 import type { PipePlan } from "./parse.ts";
 
 export {
     BUILTIN_MAX_BYTES,
     BUILTIN_MAX_LINES,
+    applyLimiter,
     findPipeInvocation,
     lastPipeOperator,
     planPipeNerf,
 } from "./parse.ts";
 export type {
+    LimiterView,
     PipeInvocation,
     PipePlan,
     PipeOptions,
@@ -104,6 +107,35 @@ function retrievalLines(details: BashResultDetails): string[] {
 }
 
 /**
+ * Describe the view the agent is now looking at, in their own terms.
+ *
+ * The note has to be unambiguous here: "the whole output is captured" next to an
+ * unbounded block of it reads as if the capture were still filtered, and the
+ * agent then either re-runs for the rest or believes it already saw everything.
+ */
+function describeView(invocation: PipeInvocation, view: LimiterView): string {
+    if (!view.faithful) {
+        return `the full captured output (your ${invocation.kind} view could not be reproduced from it)`;
+    }
+    const limit = invocation.limit;
+    switch (invocation.kind) {
+        case "tail":
+            return `the last ${limit ?? 10} lines, as your pipe would have printed`;
+        case "head":
+            return `the first ${limit ?? 10} lines, as your pipe would have printed`;
+        case "wc":
+            return "the line count your pipe would have printed";
+        case "grep":
+        case "rg":
+            return "the match count your pipe would have printed";
+        case "sed":
+            return `the first ${limit ?? "few"} lines your pipe would have selected`;
+        default:
+            return "the bounded view your pipe would have printed";
+    }
+}
+
+/**
  * Register the pipe rewrite and its explicit agent-facing explanation.
  *
  * `state` is tau's feature state. It is optional so the feature stays loadable
@@ -159,7 +191,10 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
     pi.on("tool_result", (event) => {
         const plan = pending.get(event.toolCallId);
-        if (!plan) return;
+        if (!plan || plan.action !== "rewrite" || !plan.invocation) {
+            pending.delete(event.toolCallId);
+            return;
+        }
         pending.delete(event.toolCallId);
 
         const details =
@@ -169,24 +204,44 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 block.type === "text" ? (block.text ?? "") : ""
             )
             .join("\n");
+        // The err/warn mix is computed over the WHOLE captured text, so it is
+        // the stat the agent would otherwise re-run the command to get, even
+        // though the view below is bounded to the lines they asked for.
         const severity = visibleSeverity(text);
+        const truncation = details.truncation;
+        const truncated = truncation?.truncated === true;
+
+        const view = applyLimiter(text, plan.invocation, {
+            truncated,
+            totalLines: truncation?.totalLines ?? null,
+        });
 
         const note = pipeNote(plan, {
             // Core computes `totalLines` before its own truncation, so it counts
             // lines that are not in the inline result. Falling back to the
             // visible count would understate the output on a large result, so it
             // is only a fallback when the tool reported no truncation detail.
-            totalLines: details.truncation?.totalLines ?? null,
+            totalLines: truncation?.totalLines ?? null,
             err: severity.err,
             warn: severity.warn,
             visibleLines: severity.lines,
             fullOutputPath: details.fullOutputPath ?? null,
             sourceId: details.sourceId ?? null,
             receiptLines: retrievalLines(details),
+            faithful: view.faithful,
+            caveat: view.caveat,
+            viewDescription: describeView(plan.invocation, view),
         });
         if (!note) return;
+
+        // The bounded view replaces the raw capture, so the agent's context
+        // stays what they asked for. A faithful view is exactly what their pipe
+        // printed; an unfaithful one is the capture, with the note saying so.
+        const body = view.faithful
+            ? [{ type: "text" as const, text: view.text }]
+            : [...event.content];
         return {
-            content: [{ type: "text" as const, text: note }, ...event.content],
+            content: [{ type: "text" as const, text: note }, ...body],
         };
     });
 

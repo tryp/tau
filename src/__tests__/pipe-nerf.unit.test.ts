@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     BUILTIN_MAX_LINES,
+    applyLimiter,
     bashGuidelines,
     findPipeInvocation,
     lastPipeOperator,
@@ -68,6 +69,9 @@ function observation(partial: Partial<PipeObservation> = {}): PipeObservation {
         fullOutputPath: null,
         sourceId: null,
         receiptLines: [],
+        faithful: true,
+        caveat: null,
+        viewDescription: "the bounded view your pipe would have printed",
         ...partial,
     };
 }
@@ -347,6 +351,105 @@ void describe("pipe-nerf rewrite safety", () => {
     });
 });
 
+void describe("pipe-nerf bounded view", () => {
+    const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
+    const invocationFor = (command: string) => {
+        const plan = planPipeNerf(command);
+        assert.ok(plan.invocation, command);
+        return plan.invocation;
+    };
+
+    void it("gives the agent back exactly what their pipe printed", () => {
+        // The whole point of hoisting: the command runs untruncated so the tool
+        // captures everything, but the agent asked for a bounded view and must
+        // get one. Returning the whole capture here would be the context growth
+        // the pipe existed to prevent.
+        const tail = applyLimiter(capture, invocationFor("ls | tail -3"), {
+            truncated: false,
+            totalLines: 60,
+        });
+        assert.equal(tail.text, "line-58\nline-59\nline-60");
+        assert.equal(tail.faithful, true);
+
+        const head = applyLimiter(capture, invocationFor("ls | head -2"), {
+            truncated: false,
+            totalLines: 60,
+        });
+        assert.equal(head.text, "line-1\nline-2");
+        assert.equal(head.faithful, true);
+    });
+
+    void it("matches what the real shell pipe would have printed", () => {
+        // Property check against bash, not against the implementation: for each
+        // limiter, the reconstructed view equals the pipe's own output.
+        const cases: [string, string][] = [
+            ["seq 1 60 | tail -3", "seq 1 60"],
+            ["seq 1 60 | head -4", "seq 1 60"],
+            ["seq 1 60 | wc -l", "seq 1 60"],
+            ["seq 1 60 | grep -c 1", "seq 1 60"],
+        ];
+        for (const [piped, bare] of cases) {
+            const view = applyLimiter(
+                execFileSync("bash", ["-c", bare], { encoding: "utf8" }).trimEnd(),
+                invocationFor(piped),
+                { truncated: false, totalLines: 60 }
+            );
+            const shell = execFileSync("bash", ["-c", piped], {
+                encoding: "utf8",
+            }).trimEnd();
+            assert.equal(view.text, shell, piped);
+        }
+    });
+
+    void it("still answers a line count when the capture was truncated", () => {
+        // `wc -l` is exact from the tool's own total, even after it dropped
+        // lines, so the agent never has to re-run to learn the size.
+        const view = applyLimiter("last 2000 lines only", invocationFor("ls | wc -l"), {
+            truncated: true,
+            totalLines: 250_000,
+        });
+        assert.equal(view.text, "250000");
+        assert.equal(view.faithful, true);
+    });
+
+    void it("refuses to guess when the region it reads was already dropped", () => {
+        // A `head` over a capture that lost its head, and a `grep -c` over one
+        // that lost its matches, cannot be reconstructed. Reporting a number
+        // anyway would be quietly wrong, so the note carries the caveat.
+        const head = applyLimiter("tail remnant", invocationFor("ls | head -3"), {
+            truncated: true,
+            totalLines: 9000,
+        });
+        assert.equal(head.faithful, false);
+        assert.match(head.caveat ?? "", /already dropped/);
+        assert.equal(head.text, "tail remnant", "falls back to the capture");
+
+        const count = applyLimiter(
+            "remnant",
+            invocationFor("ls | grep -c needle"),
+            { truncated: true, totalLines: 9000 }
+        );
+        assert.equal(count.faithful, false);
+        assert.match(count.caveat ?? "", /lower bound/);
+    });
+
+    void it("does not re-implement an awk program", () => {
+        const view = applyLimiter(capture, invocationFor("ls | awk 'END{print}'"), {
+            truncated: false,
+            totalLines: 60,
+        });
+        assert.equal(view.faithful, false);
+        assert.match(view.caveat ?? "", /awk program/);
+        // The note must name it, so the fallback reads as deliberate.
+        const note = pipeNote(plan("ls | awk 'END{print}'"), observation({
+            faithful: view.faithful,
+            caveat: view.caveat,
+            viewDescription: "the full captured output",
+        }));
+        assert.match(note, /awk program/);
+    });
+});
+
 void describe("pipe-nerf note", () => {
     void it("says what was removed, what ran, and what to do next", () => {
         const note = pipeNote(plan("make -j8 2>&1 | tail -50"), observation());
@@ -380,22 +483,35 @@ void describe("pipe-nerf note", () => {
         );
         assert.match(note, /indexed in the context sidecar as "ctx_bg_abc"/);
         assert.match(note, /context_search query/);
-        assert.match(note, /instead of re-running the command/);
+        assert.match(note, /Do not re-run the command to read it/);
     });
 
     void it("warns that head and the tool disagree about which end to keep", () => {
-        const note = pipeNote(plan("git log | head -10"), observation());
-        assert.match(note, /first 10 lines/);
+        const note = pipeNote(
+            plan("git log | head -10"),
+            observation({
+                viewDescription: "the first 10 lines, as your pipe would have printed",
+            })
+        );
+        assert.match(note, /first 10 lines, as your pipe would have printed/);
         assert.match(note, /keeps the END/);
     });
 
-    void it("says nothing was dropped when the output fit inline", () => {
-        const note = pipeNote(
+    void it("is honest when the capture fit inline and the view is bounded", () => {
+        // `| wc -l` on 4 lines: the view IS the whole output, so the note says
+        // nothing was written to disk. But for a bounded view over an inline
+        // capture it must NOT claim "what is shown is the complete output" --
+        // that is false, and it hides that the rest has to be re-requested.
+        const bounded = pipeNote(
             plan("ls | wc -l"),
             observation({ totalLines: 4, visibleLines: 4 })
         );
-        assert.match(note, /Nothing was dropped/);
-        assert.match(note, /complete output/);
+        assert.match(bounded, /nothing was written to disk/);
+        assert.match(bounded, /Captured 4 lines/);
+        assert.ok(
+            !/complete output/.test(bounded),
+            "an inline capture with a bounded view is not the complete output"
+        );
     });
 
     void it("falls back to the visible count when the tool reports no detail", () => {
@@ -505,7 +621,8 @@ void describe("pipe-nerf registration", () => {
         const note = result.content[0].text;
         assert.match(note, /\[pipe-nerf\]/);
         assert.match(note, /900 lines \(0 err, 1 warn\)/);
-        assert.match(note, /Full output: \/tmp\/out\.log/);
+        assert.match(note, /on disk at \/tmp\/out\.log/);
+        assert.match(note, /grep -nE "pattern" \/tmp\/out\.log/);
         // The original content is preserved after the note.
         assert.equal(result.content[1].text, "FAILED tests/x");
     });
@@ -537,6 +654,72 @@ void describe("pipe-nerf registration", () => {
         const note = result.content[0].text;
         assert.match(note, /indexed in the context sidecar as "ctx_bg_xyz"/);
         assert.match(note, /context_get source_id:"ctx_bg_xyz"/);
+    });
+
+    void it("returns the bounded view, not the whole capture", () => {
+        // The load-bearing property: hoisting the filter out of shell execution
+        // must preserve the bound. Returning the full capture here is the exact
+        // context growth the pipe existed to prevent, and the note alone would
+        // not stop the agent from paying for it.
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+
+        const capture = Array.from(
+            { length: 60 },
+            (_, i) => `line-${i + 1}`
+        ).join("\n");
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "bound",
+            input: { command: "seq 1 60 | tail -3" },
+        });
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "bound",
+            content: [{ type: "text", text: capture }],
+            details: { truncation: { truncated: false, totalLines: 60 } },
+        }) as { content: { type: string; text: string }[] };
+
+        const body = result.content
+            .slice(1)
+            .map((part) => part.text)
+            .join("\n");
+        assert.equal(body, "line-58\nline-59\nline-60");
+        assert.ok(
+            !body.includes("line-1\n"),
+            "the full capture leaked into the result"
+        );
+    });
+
+    void it("falls back to the capture when the view is unfaithful", () => {
+        // A `head` whose head was already dropped cannot be reproduced, so the
+        // capture is returned WITH the caveat rather than a wrong 3 lines.
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+
+        const remnant = "tail remnant only";
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "unfaithful",
+            input: { command: "make 2>&1 | head -3" },
+        });
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "unfaithful",
+            content: [{ type: "text", text: remnant }],
+            details: {
+                truncation: { truncated: true, totalLines: 9000 },
+                fullOutputPath: "/tmp/out.log",
+            },
+        }) as { content: { type: string; text: string }[] };
+
+        const note = result.content[0].text;
+        const body = result.content.slice(1).map((part) => part.text).join("\n");
+        assert.equal(body, remnant, "the capture must be returned as-is");
+        // M28: the caveat has to reach the note, or the agent reads a fallback
+        // as if it were the answer it asked for.
+        assert.match(note, /already dropped/);
+        assert.match(note, /on disk at \/tmp\/out\.log/);
     });
 
     void it("leaves a filter command alone and adds no note", () => {
