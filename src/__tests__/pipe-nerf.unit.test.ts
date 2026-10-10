@@ -433,6 +433,60 @@ void describe("pipe-nerf bounded view", () => {
         assert.match(count.caveat ?? "", /lower bound/);
     });
 
+    void it("refuses to invent a count an upstream stage changed", () => {
+        // `wc -l` counts its INPUT's lines. With no upstream stage the input is
+        // the capture, so the tool's total is exact. With one, the input is that
+        // stage's output and the capture cannot answer it: reporting totalLines
+        // would invent a number.
+        const plain = applyLimiter("a\nb\nc\n", invocationFor("seq 1 100 | wc -l"), {
+            truncated: false,
+            totalLines: 3,
+        });
+        assert.equal(plain.text, "3");
+        assert.equal(plain.faithful, true);
+
+        const filtered = applyLimiter(
+            "1\n2\n3\n4\n6\n7\n8\n9\n10",
+            invocationFor("seq 1 100 | grep -v 5 | wc -l"),
+            { truncated: true, totalLines: 90 }
+        );
+        assert.equal(filtered.faithful, false);
+        assert.match(filtered.caveat ?? "", /earlier stage filtered/);
+        // The capture is returned rather than a number nobody can justify.
+        assert.equal(filtered.text, "1\n2\n3\n4\n6\n7\n8\n9\n10");
+    });
+
+    void it("refuses the same count for a counting grep after a stage", () => {
+        const view = applyLimiter(
+            "match\nother",
+            invocationFor("ps aux | grep -v header | grep -c python"),
+            { truncated: false, totalLines: 2 }
+        );
+        assert.equal(view.faithful, false);
+        assert.match(view.caveat ?? "", /earlier stage filtered/);
+    });
+
+    void it("still reconstructs head and tail after an upstream filter", () => {
+        // head/tail read the first/last lines of whatever reached them, so an
+        // upstream stage does not invalidate them -- the view is of the
+        // filtered capture, which is what the pipeline produced.
+        const tail = applyLimiter(
+            "a\nb\nc\nd\ne",
+            invocationFor("ps aux | grep python | tail -2"),
+            { truncated: false, totalLines: 5 }
+        );
+        assert.equal(tail.text, "d\ne");
+        assert.equal(tail.faithful, true);
+
+        const head = applyLimiter(
+            "a\nb\nc\nd\ne",
+            invocationFor("ps aux | grep python | head -2"),
+            { truncated: false, totalLines: 5 }
+        );
+        assert.equal(head.text, "a\nb");
+        assert.equal(head.faithful, true);
+    });
+
     void it("does not re-implement an awk program", () => {
         const view = applyLimiter(capture, invocationFor("ls | awk 'END{print}'"), {
             truncated: false,

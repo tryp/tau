@@ -63,6 +63,17 @@ export interface PipeInvocation {
     mergedStderr: boolean;
     /** The limiter's own arguments, for reproducing its view. */
     args: string;
+    /**
+     * Whether an upstream pipeline stage precedes the limiter.
+     *
+     * It decides what the limiter can be reconstructed from. `cat f | wc -l`
+     * counts the capture's lines, so the tool's own total answers it exactly.
+     * `seq 1 100 | grep -v 5 | wc -l` counts lines that never match, and the
+     * capture holds whatever survived -- so neither the capture nor the tool's
+     * total can answer it, and the view must be marked unfaithful rather than
+     * reported as a number.
+     */
+    hasUpstreamStage: boolean;
 }
 
 export type SkipReason =
@@ -363,6 +374,10 @@ export function findPipeInvocation(command: string): PipeInvocation | null {
         mergedStderr: hasStderrMerge(command.slice(0, at)),
         stageStart,
         args,
+        // Any top-level `|` before the limiter is an upstream stage. `grep`/`sed`
+        // earlier in the chain is preserved by the rewrite, so it still runs --
+        // it just means the capture is no longer the limiter's direct input.
+        hasUpstreamStage: lastPipeOperator(command.slice(0, at)) >= 0,
     };
 }
 
@@ -441,6 +456,9 @@ export function applyLimiter(
             };
         }
         case "head": {
+            // `head`/`tail` take the first/last lines of whatever reached them, so
+            // an upstream filter does not break the reconstruction -- the view is
+            // of the filtered capture, which is what the pipeline produced.
             if (lostHead) {
                 return {
                     text,
@@ -458,13 +476,36 @@ export function applyLimiter(
             };
         }
         case "wc": {
-            // `wc -l` prints one number, and the tool reports the true total
-            // even when it dropped lines, so this is exact either way.
-            const printed = String(total);
-            return { text: printed, faithful: true, caveat: null };
+            // `wc -l` counts its INPUT's lines. With no upstream stage the input is
+            // the capture, so the tool's own total answers it exactly even after
+            // the tool dropped lines. With an upstream stage (`grep -v`, `head`,
+            // `sed`) the input is that stage's output, which is neither the
+            // capture nor its line count -- so reporting `totalLines` here would
+            // invent a number. `seq 1 100 | grep -v 5 | wc -l` must answer 90 and
+            // the capture cannot say so.
+            if (invocation.hasUpstreamStage) {
+                return {
+                    text,
+                    faithful: false,
+                    caveat:
+                        "your pipe counted lines after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
+                };
+            }
+            return { text: String(total), faithful: true, caveat: null };
         }
         case "grep":
         case "rg": {
+            if (invocation.hasUpstreamStage) {
+                // Same reason as `wc`: the pattern is matched against the
+                // capture, but the agent's pipeline matched it against whatever
+                // the previous stage emitted.
+                return {
+                    text,
+                    faithful: false,
+                    caveat:
+                        "your pipe counted matches after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
+                };
+            }
             if (lostHead) {
                 return {
                     text,
@@ -479,6 +520,14 @@ export function applyLimiter(
             return { text: String(matches), faithful: true, caveat: null };
         }
         case "sed": {
+            if (invocation.hasUpstreamStage) {
+                return {
+                    text,
+                    faithful: false,
+                    caveat:
+                        "your pipe selected a line range after an earlier stage filtered them, which the captured output no longer represents",
+                };
+            }
             if (lostHead || limit === null) {
                 return {
                     text,
