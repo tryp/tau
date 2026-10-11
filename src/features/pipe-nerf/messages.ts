@@ -66,7 +66,7 @@ function preview(command: string): string {
 }
 
 /** pi's inline bounds, in the units the note reads best. */
-function inlineBudget(): string {
+function _inlineBudget(): string {
     return `the last ${BUILTIN_MAX_LINES} lines or ${Math.round(BUILTIN_MAX_BYTES / 1024)}KB`;
 }
 
@@ -125,8 +125,17 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
         // The merged form is where the habit costs the most: stderr was folded
         // into stdout and then cut, so a failure in the head of the output was
         // dropped before anything could read it.
+        //
+        // The rewrite deliberately LEAVES the command's own `2>&1` in place
+        // (pinned by the rewrite tests): pi does not rewrite the command's own
+        // stream semantics, only the trailing limiter. So the streams are still
+        // merged, and the old note's "the separation is back" was false. What is
+        // true is that the merge is no longer CUT -- the whole merged stream is
+        // captured -- and the err/warn counts are reported over all of it.
+        // Saying so also tells the agent what would recover the separation:
+        // dropping the merge themselves, which pi will not silently do for them.
         lines.push(
-            "Your command merged stderr into stdout before the pipe, which cut the error half of the output. pi captures both streams, so the separation is back."
+            "Your command merged stderr into stdout before the pipe, so that merged stream is what was cut -- the error half of the output was discarded. It is no longer cut, and the err/warn mix below covers all of it. The streams are still merged because the command's own `2>&1` was left in place; drop it if you want them reported separately."
         );
     }
     if (invocation.kind === "head") {
@@ -228,6 +237,6 @@ export function bashGuidelines(): string[] {
         "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: the whole output is captured to a file (and to the context sidecar for large or background output) while your result stays bounded to the N lines you asked for. The pipe is what prevents that capture from happening, and it discards the beginning of an output before anything can read it.",
         "The removal note tells you the captured line count and the err/warn mix over the WHOLE captured output. Read that before re-running anything: it is the stat you would have run the command again to compute.",
         "Filtering is fine and is left alone. `| grep pattern`, `| sed`, and `| awk` change which lines and what text the command produces, so they are NOT removed; they return a different answer, not more of the same one.",
-        "To read more of an output you just produced, never re-run the command with a narrower pipe. If the removal note gave you a source id: context_search query:\"...\" source_id:\"...\", then context_get source_id:\"...\" chunk_id:\"...\", then context_export source_id:\"...\". If it gave you a file path, grep or sed that path.",
+        'To read more of an output you just produced, never re-run the command with a narrower pipe. If the removal note gave you a source id: context_search query:"..." source_id:"...", then context_get source_id:"..." chunk_id:"...", then context_export source_id:"...". If it gave you a file path, grep or sed that path.',
     ];
 }

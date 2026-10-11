@@ -29,7 +29,10 @@ import {
     type PipeObservation,
     type PipePlan,
 } from "../features/pipe-nerf/index.ts";
-import { getFeatureDef, isKnownFeature } from "../features/features-registry.ts";
+import {
+    getFeatureDef,
+    isKnownFeature,
+} from "../features/features-registry.ts";
 import { classifyLine, countLines } from "../features/log-classify.ts";
 import type { TauState } from "../state.ts";
 
@@ -146,7 +149,10 @@ void describe("pipe-nerf parser", () => {
             counts.set(fixtureCase.category, category);
         }
 
-        assert.ok(corpus.cases.length > 100, "fixture should sample the corpus");
+        assert.ok(
+            corpus.cases.length > 100,
+            "fixture should sample the corpus"
+        );
         assert.equal(
             [...counts.values()].reduce((sum, c) => sum + c.passed, 0),
             corpus.cases.length,
@@ -210,7 +216,10 @@ void describe("pipe-nerf parser", () => {
         // Regression: the args were sliced with a trimmed offset against the
         // untrimmed stage, so `tail -20` reported a limit of 0 and the note
         // would have claimed "| tail 0".
-        assert.equal(findPipeInvocation("cd /x && make | tail -100")?.limit, 100);
+        assert.equal(
+            findPipeInvocation("cd /x && make | tail -100")?.limit,
+            100
+        );
         assert.equal(findPipeInvocation("make | head -30")?.limit, 30);
     });
 
@@ -229,14 +238,29 @@ void describe("pipe-nerf parser", () => {
         // `;` separates statements: the next one runs whatever the previous
         // returned, so the limiter can be removed.
         assert.equal(plan("echo a; seq 1 50 | tail -3").action, "rewrite");
-        assert.equal(plan("echo a; seq 1 50 | tail -3").rewritten, "echo a; seq 1 50");
-        assert.equal(plan("echo X; make 2>&1 | tail -40").rewritten, "echo X; make 2>&1");
+        assert.equal(
+            plan("echo a; seq 1 50 | tail -3").rewritten,
+            "echo a; seq 1 50"
+        );
+        assert.equal(
+            plan("echo X; make 2>&1 | tail -40").rewritten,
+            "echo X; make 2>&1"
+        );
         assert.equal(plan("a\nb | tail -5").rewritten, "a\nb");
         // `&&` / `||` chain on the stage's status, so the limiter stays.
-        assert.equal(plan("a | tail -5 && b").reason, "status-bearing-operator");
-        assert.equal(plan("a | tail -5 || b").reason, "status-bearing-operator");
+        assert.equal(
+            plan("a | tail -5 && b").reason,
+            "status-bearing-operator"
+        );
+        assert.equal(
+            plan("a | tail -5 || b").reason,
+            "status-bearing-operator"
+        );
         // A `cd ... &&` prologue is BEFORE the pipe, so it is lifted with it.
-        assert.equal(plan("cd /x && make | tail -20").rewritten, "cd /x && make");
+        assert.equal(
+            plan("cd /x && make | tail -20").rewritten,
+            "cd /x && make"
+        );
     });
 
     void it("reports having no pipe separately from a status-bearing one", () => {
@@ -261,8 +285,14 @@ void describe("pipe-nerf parser", () => {
 
 void describe("pipe-nerf rewrite safety", () => {
     void it("hoists every limiter the corpus uses", () => {
-        assert.equal(plan("cd /x && pytest -q | tail -20").rewritten, "cd /x && pytest -q");
-        assert.equal(plan("git log --oneline -3 | head -10").rewritten, "git log --oneline -3");
+        assert.equal(
+            plan("cd /x && pytest -q | tail -20").rewritten,
+            "cd /x && pytest -q"
+        );
+        assert.equal(
+            plan("git log --oneline -3 | head -10").rewritten,
+            "git log --oneline -3"
+        );
         assert.equal(plan("cat f | wc -l").rewritten, "cat f");
         assert.equal(plan("ls | grep -c foo").rewritten, "ls");
         assert.equal(plan("ls | sed -n '1,50p'").rewritten, "ls");
@@ -307,7 +337,10 @@ void describe("pipe-nerf rewrite safety", () => {
             plan("seq 1 100 | tail -5 && echo done").reason,
             "status-bearing-operator"
         );
-        assert.equal(plan("a | tail -5 || b").reason, "status-bearing-operator");
+        assert.equal(
+            plan("a | tail -5 || b").reason,
+            "status-bearing-operator"
+        );
     });
 
     void it("never drops an output line", () => {
@@ -409,22 +442,29 @@ void describe("pipe-nerf stage-0 capture", () => {
             "seq 1 60 | grep -E '1|3' | tail -3",
             "seq 1 40 | grep '[25]' | head -4",
         ]) {
-            const p = planPipeNerf(command, { stageZeroPath: "/tmp/s0-shell.log" });
+            const p = planPipeNerf(command, {
+                stageZeroPath: "/tmp/s0-shell.log",
+            });
             const view = (capture: string) =>
-                applyLimiter(
-                    capture.trimEnd(),
-                    p.invocation!,
-                    { truncated: false, totalLines: capture.trimEnd().split("\n").length }
-                ).text;
-            const shell = execFileSync("bash", ["-c", command], { encoding: "utf8" });
+                applyLimiter(capture.trimEnd(), p.invocation!, {
+                    truncated: false,
+                    totalLines: capture.trimEnd().split("\n").length,
+                }).text;
+            const shell = execFileSync("bash", ["-c", command], {
+                encoding: "utf8",
+            });
             const capture = execFileSync("bash", ["-c", p.rewritten], {
                 encoding: "utf8",
             });
             assert.equal(view(capture), shell.trimEnd(), command);
             // Stage 0 holds strictly more than the filtered capture.
-            const stage0 = execFileSync("bash", ["-c", "cat /tmp/s0-shell.log"], {
-                encoding: "utf8",
-            });
+            const stage0 = execFileSync(
+                "bash",
+                ["-c", "cat /tmp/s0-shell.log"],
+                {
+                    encoding: "utf8",
+                }
+            );
             assert.ok(
                 stage0.trimEnd().split("\n").length >
                     capture.trimEnd().split("\n").length,
@@ -436,7 +476,9 @@ void describe("pipe-nerf stage-0 capture", () => {
     void it("refuses a `|&` operator rather than splicing tee into it", () => {
         // `|&` is a both-streams redirect; injecting a stage there would change
         // the command rather than capture it.
-        const p = planPipeNerf("make 2>&1 |& tail -5", { stageZeroPath: PATH_0 });
+        const p = planPipeNerf("make 2>&1 |& tail -5", {
+            stageZeroPath: PATH_0,
+        });
         assert.ok(!p.rewritten.includes("tee") || p.stageZero === null);
         if (p.stageZero) {
             assert.ok(!p.rewritten.includes("tee /tmp/x |&"), p.rewritten);
@@ -445,7 +487,9 @@ void describe("pipe-nerf stage-0 capture", () => {
 });
 
 void describe("pipe-nerf bounded view", () => {
-    const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
+    const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join(
+        "\n"
+    );
     const invocationFor = (command: string) => {
         const plan = planPipeNerf(command);
         assert.ok(plan.invocation, command);
@@ -483,7 +527,9 @@ void describe("pipe-nerf bounded view", () => {
         ];
         for (const [piped, bare] of cases) {
             const view = applyLimiter(
-                execFileSync("bash", ["-c", bare], { encoding: "utf8" }).trimEnd(),
+                execFileSync("bash", ["-c", bare], {
+                    encoding: "utf8",
+                }).trimEnd(),
                 invocationFor(piped),
                 { truncated: false, totalLines: 60 }
             );
@@ -497,10 +543,14 @@ void describe("pipe-nerf bounded view", () => {
     void it("still answers a line count when the capture was truncated", () => {
         // `wc -l` is exact from the tool's own total, even after it dropped
         // lines, so the agent never has to re-run to learn the size.
-        const view = applyLimiter("last 2000 lines only", invocationFor("ls | wc -l"), {
-            truncated: true,
-            totalLines: 250_000,
-        });
+        const view = applyLimiter(
+            "last 2000 lines only",
+            invocationFor("ls | wc -l"),
+            {
+                truncated: true,
+                totalLines: 250_000,
+            }
+        );
         assert.equal(view.text, "250000");
         assert.equal(view.faithful, true);
     });
@@ -509,10 +559,14 @@ void describe("pipe-nerf bounded view", () => {
         // A `head` over a capture that lost its head, and a `grep -c` over one
         // that lost its matches, cannot be reconstructed. Reporting a number
         // anyway would be quietly wrong, so the note carries the caveat.
-        const head = applyLimiter("tail remnant", invocationFor("ls | head -3"), {
-            truncated: true,
-            totalLines: 9000,
-        });
+        const head = applyLimiter(
+            "tail remnant",
+            invocationFor("ls | head -3"),
+            {
+                truncated: true,
+                totalLines: 9000,
+            }
+        );
         assert.equal(head.faithful, false);
         assert.match(head.caveat ?? "", /already dropped/);
         assert.equal(head.text, "tail remnant", "falls back to the capture");
@@ -531,10 +585,14 @@ void describe("pipe-nerf bounded view", () => {
         // the capture, so the tool's total is exact. With one, the input is that
         // stage's output and the capture cannot answer it: reporting totalLines
         // would invent a number.
-        const plain = applyLimiter("a\nb\nc\n", invocationFor("seq 1 100 | wc -l"), {
-            truncated: false,
-            totalLines: 3,
-        });
+        const plain = applyLimiter(
+            "a\nb\nc\n",
+            invocationFor("seq 1 100 | wc -l"),
+            {
+                truncated: false,
+                totalLines: 3,
+            }
+        );
         assert.equal(plain.text, "3");
         assert.equal(plain.faithful, true);
 
@@ -581,18 +639,25 @@ void describe("pipe-nerf bounded view", () => {
     });
 
     void it("does not re-implement an awk program", () => {
-        const view = applyLimiter(capture, invocationFor("ls | awk 'END{print}'"), {
-            truncated: false,
-            totalLines: 60,
-        });
+        const view = applyLimiter(
+            capture,
+            invocationFor("ls | awk 'END{print}'"),
+            {
+                truncated: false,
+                totalLines: 60,
+            }
+        );
         assert.equal(view.faithful, false);
         assert.match(view.caveat ?? "", /awk program/);
         // The note must name it, so the fallback reads as deliberate.
-        const note = pipeNote(plan("ls | awk 'END{print}'"), observation({
-            faithful: view.faithful,
-            caveat: view.caveat,
-            viewDescription: "the full captured output",
-        }));
+        const note = pipeNote(
+            plan("ls | awk 'END{print}'"),
+            observation({
+                faithful: view.faithful,
+                caveat: view.caveat,
+                viewDescription: "the full captured output",
+            })
+        );
         assert.match(note, /awk program/);
     });
 });
@@ -606,6 +671,19 @@ void describe("pipe-nerf note", () => {
         assert.match(note, /stderr into stdout/);
         assert.match(note, /small enough to return inline/);
         assert.match(note, /do NOT re-run it just to see more lines/);
+    });
+
+    void it("does not claim the stream separation is back when it is not", () => {
+        // The rewrite deliberately leaves the command's own `2>&1` in place, so
+        // the streams are still merged. The old note claimed the separation was
+        // restored, which was false: the agent relied on it and got a merged
+        // stream back. The truthful claim is that the merge is no longer CUT.
+        const note = pipeNote(plan("make -j8 2>&1 | tail -50"), observation());
+        assert.ok(note.includes("no longer cut"), note);
+        assert.ok(!/separation is back/.test(note), note);
+        // And it names the one action that would recover the separation.
+        assert.match(note, /left in place/);
+        assert.match(note, /if you want them reported separately/);
     });
 
     void it("reports the err/warn mix with the line count", () => {
@@ -638,7 +716,8 @@ void describe("pipe-nerf note", () => {
         const note = pipeNote(
             plan("git log | head -10"),
             observation({
-                viewDescription: "the first 10 lines, as your pipe would have printed",
+                viewDescription:
+                    "the first 10 lines, as your pipe would have printed",
             })
         );
         assert.match(note, /first 10 lines, as your pipe would have printed/);
@@ -870,7 +949,9 @@ void describe("pipe-nerf registration", () => {
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never);
 
-        const input: { command: string } = { command: "pytest 2>&1 | tail -50" };
+        const input: { command: string } = {
+            command: "pytest 2>&1 | tail -50",
+        };
         fire(handlers, "tool_call", {
             toolName: "bash_bg",
             toolCallId: "b1",
@@ -953,7 +1034,10 @@ void describe("pipe-nerf registration", () => {
         }) as { content: { type: string; text: string }[] };
 
         const note = result.content[0].text;
-        const body = result.content.slice(1).map((part) => part.text).join("\n");
+        const body = result.content
+            .slice(1)
+            .map((part) => part.text)
+            .join("\n");
         assert.equal(body, remnant, "the capture must be returned as-is");
         // M28: the caveat has to reach the note, or the agent reads a fallback
         // as if it were the answer it asked for.
@@ -974,7 +1058,7 @@ void describe("pipe-nerf registration", () => {
             "[context-sidecar] Large bash output indexed locally",
             "Source: ctx_bg_abc",
             "Chunks: 1; original size: 1011 bytes, 60 lines",
-            "- Search snippets first: context_search query:\"...\" source_id:\"ctx_bg_abc\"",
+            '- Search snippets first: context_search query:"..." source_id:"ctx_bg_abc"',
         ].join("\n");
 
         fire(handlers, "tool_call", {
@@ -995,7 +1079,10 @@ void describe("pipe-nerf registration", () => {
         }) as { content: { text: string }[] };
 
         const note = result.content[0].text;
-        const body = result.content.slice(1).map((part) => part.text).join("\n");
+        const body = result.content
+            .slice(1)
+            .map((part) => part.text)
+            .join("\n");
         // The receipt is untouched, not sliced to its last 3 lines.
         assert.equal(body, receipt);
         // The note speaks about the capture it was GIVEN, and does not invent a
@@ -1217,8 +1304,13 @@ void describe("pipe-nerf corpus coverage", () => {
             const invocation = findPipeInvocation(c.command);
             if (!invocation) return false;
             const stage = c.command.slice(invocation.stageStart).trimStart();
-            const args = stage.slice(stage.match(/^[\w.+~/-]*/)?.[0].length ?? 0);
-            if (invocation.kind === "tail" && /(?:^|\s)-[A-Za-z]*f(?:\s|$)/.test(args)) {
+            const args = stage.slice(
+                stage.match(/^[\w.+~/-]*/)?.[0].length ?? 0
+            );
+            if (
+                invocation.kind === "tail" &&
+                /(?:^|\s)-[A-Za-z]*f(?:\s|$)/.test(args)
+            ) {
                 return false;
             }
             return true;
