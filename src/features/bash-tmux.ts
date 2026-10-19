@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
-import type { BackgroundJob, UiContext } from "../types.ts";
+import type { BackgroundJob, JobStatus, UiContext } from "../types.ts";
 import {
     createJobDonePromise,
     markJobTerminal,
@@ -501,14 +501,35 @@ export function finalizeTmuxCompletion(
     onCompletion: (job: BackgroundJob) => void,
     onTerminal?: () => void
 ): void {
-    markJobTerminal(
-        job,
-        exitCode === 0 || exitCode === null ? "completed" : "failed",
-        exitCode
-    );
+    markJobTerminal(job, tmuxTerminalStatus(job, exitCode), exitCode);
     void trackJobOutputIndex(job, ctx, "bash_bg");
     onCompletion(job);
     onTerminal?.();
+}
+
+/**
+ * Honest terminal status for a tmux job from its OBSERVED end, not from
+ * termination intent. A vanished window (or a 128+n signal exit) after a
+ * termination request is an observed kill; the same observation without a
+ * request keeps the prior mapping (vanished => failed, no fabricated code).
+ * A clean sentinel exit after a request is still completed/failed — the
+ * request is reported in details, never rewritten into the outcome.
+ */
+export function tmuxTerminalStatus(
+    job: BackgroundJob,
+    exitCode: number | undefined
+): JobStatus {
+    if (job.terminationRequestedAt !== undefined) {
+        if (
+            exitCode === undefined ||
+            exitCode === null ||
+            exitCode === 137 ||
+            exitCode === 143
+        ) {
+            return "killed";
+        }
+    }
+    return exitCode === 0 || exitCode === null ? "completed" : "failed";
 }
 
 /**

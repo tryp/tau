@@ -794,8 +794,13 @@ void describe("silenceJobAfterKill", () => {
             toolCallId: "tc-silence-1",
         });
         createJobDonePromise(job);
-        silenceJobAfterKill(job);
-        assert.equal(job.status, "killed");
+        silenceJobAfterKill(job, "manual");
+        // Honesty contract: a termination request is not an observed kill.
+        // Status stays "running" until an observed exit; the request is
+        // recorded separately for honest completion reporting.
+        assert.equal(job.status, "running");
+        assert.ok(job.terminationRequestedAt !== undefined);
+        assert.equal(job.terminationRequestedBy, "manual");
         assert.equal(job.outputConsumed, true);
     });
 });

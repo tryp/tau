@@ -144,7 +144,7 @@ async function showTaskDetail(
             } else if (job.proc) {
                 killProcessGroup(job.proc.pid!, "SIGTERM");
             }
-            silenceJobAfterKill(job);
+            silenceJobAfterKill(job, "manual");
             cancelQueuedBackgroundNotifications(pi, job.id);
             state.wakeupEvaluate?.();
             ctx.ui.notify(`Killed ${job.id}`, "info");
@@ -282,7 +282,7 @@ export function registerBackgroundCommands(
             } else if (job.proc) {
                 killProcessGroup(job.proc.pid!, "SIGTERM");
             }
-            silenceJobAfterKill(job);
+            silenceJobAfterKill(job, "manual");
             cancelQueuedBackgroundNotifications(pi, job.id);
             state.wakeupEvaluate?.();
             ctx.ui.notify(`Killed ${job.id}`, "info");
