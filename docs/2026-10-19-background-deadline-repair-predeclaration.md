@@ -198,3 +198,79 @@ assign an implementation owner, or authorize any experiment.
 Next decision: obtain an acknowledged owning-repository handoff and a separately
 reviewed, explicitly authorized independent outer-guard plan. Until then, pause
 this lane at documentation. No repair-completion or numerical-acceptance claim.
+
+## Disposition — 2026-10-19 (owner decision)
+
+Supersedes the blocked status above. The repository owner directed the repair
+in the authoring session on this date; the decisions and their grounds are
+recorded here without rewriting any prior content.
+
+### Decisions
+
+1. **Finite TERM→KILL escalation is rejected as policy.** Agents set timeouts
+   too short; an automatic kill at the deadline destroys in-flight work and
+   invites duplicate re-runs. The controlling model is deadline-as-wake: at the
+   deadline the agent is woken to inspect progress and decide (extend,
+   `jobs kill`, or ignore). The incident itself supports this: the requested
+   90-second deadline was tighter than the 84.8 s observed D6_50 runtime, and
+   the attach-wait wake plus manual `jobs(kill)` already recovered correctly.
+2. **Escalation is also infeasible on the tmux backend as written.** tmux jobs
+   carry a `pid: -1` sentinel (`src/features/background.ts:3874` at
+   inspection), so PGID signaling cannot reach the workload; the escalation
+   sequence could not be implemented on the primary backend without new
+   containment machinery.
+3. **Incident-time loaded identity is resolved to byte evidence.** A read-only
+   `rsync --checksum` comparison of a throwaway `git archive 56dcebe` tree
+   against the deployed mirror `/home/dev/.pi/agent/local/pi-tau` found zero
+   differences. The deploy was stamped 2026-10-11, predating the 2026-10-19
+   incident, with no redeploy since. Residual honesty note retained: this
+   proves on-disk bytes, not which bytes the incident-time Node process had
+   mapped; it is no longer treated as a blocking gate.
+4. **Implementation ownership is resolved** by this repository's AGENTS.md
+   deploy model: this checkout is the source of truth and changes ship with
+   `make deploy`. The handoff blocker above reflected the authoring session's
+   coordination context, not this repository's.
+5. **A bounded notification-parity repair is authorized**: the tmux `bash_bg`
+   route must honor deadline-wake and reminder requests identically to the
+   direct-spawn route (or refuse before spawn), with deterministic unit tests
+   pinning the behavior. Executed in isolated parallel worktrees. The
+   independent outer-guard, containment-supervision, and append-only
+   evidence-platform lanes are closed as disproportionate for this extension;
+   containment via manual `jobs(kill)` held in the incident (window killed,
+   process scan found no survivors).
+6. **The Sippi numerical lane remains frozen.** This repair does not unfreeze
+   it, does not replay D6_80 or G, and makes no numerical claims.
+
+### Gate disposition
+
+| Gate | Disposition |
+| --- | --- |
+| Independent outer guard | CLOSED — rejected as disproportionate (decision 5) |
+| Owning implementation handoff | RESOLVED — AGENTS.md deploy model; owner directive 2026-10-19 (decision 4) |
+| Runtime identity and containment design | Identity RESOLVED to byte evidence (decision 3); containment RESOLVED as notification parity with honest reporting, no auto-kill (decisions 1, 5) |
+| Implementation | AUTHORIZED — bounded notification-parity repair in progress (decision 5) |
+| Nonnumerical verification | RESOLVED as deterministic unit tests; the live OPS harness and its 2 s / 1 s / 10 s / 15 s / 120 s parameters were never armed and are now moot |
+| Deployment/reload | Governed by the standard AGENTS.md workflow (`make deploy`, verify, `.deployed-commit`) |
+| Numerical use | UNCHANGED — FROZEN (decision 6) |
+
+### Contract item disposition
+
+| Item | Disposition |
+| --- | --- |
+| 1. Distinct policies | ADAPTED — `bash_bg.timeout` becomes a deadline-wake (never kills); `jobs.attach.timeout` stays wait-only; finite-positive validation before spawn |
+| 2. Backend admission | ADAPTED as notification parity — tmux route arms the same wake/reminder as the direct-spawn route or refuses before spawn; tmux mode retained |
+| 3. Prepare, arm, release | Heavy receipt-blocking form REJECTED; trivial form adopted — policies armed before the "Started background job" return, arming failure surfaced |
+| 4. Lifecycle ownership | ADAPTED — linked-reminder persistence reused; orphaned-restore drop fixed; no independent supervisor |
+| 5. Deadline outcome | ADOPTED — termination request recorded separately from observed exit; no terminal status assigned on signal request alone |
+| 6. Reminder lifecycle | ADAPTED — existing reminder machinery reused on both routes; exactly-once durable queue not built |
+| 7. Finite escalation | REJECTED — policy (decision 1) and infeasibility (decision 2) |
+| 8. Persisted evidence contract | SLIMMED — deadline/termination fields in existing job records and notifications; no append-only platform (`status.json`/`events.jsonl` is pi-subagents infrastructure, not pi-tau) |
+| 9. Acceptance matrix | Case list KEPT as deterministic fake-clock unit tests; live OPS parameters CLOSED, never authorized, never run |
+| 10. Review disposition | See gate table above |
+
+Supporting analysis produced during disposition:
+`tmp/deadline-repair/2026-10-19/luna-source-trace.md` (source trace at
+`f869b07`: tmux route supervision inventory, fallback honesty, reminder
+persistence, deployed-byte comparison) and
+`tmp/deadline-repair/2026-10-19/luna-proposal-eval.md` (proposal-by-proposal
+policy evaluation).
