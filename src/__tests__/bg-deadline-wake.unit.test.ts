@@ -14,21 +14,20 @@
  * completed with deadlineFiredAt retained — a deadline wake is not a
  * completion result.
  *
- * Timing: the direct-route cases use mock timers for the deadline and real
- * payloads whose exit is event-driven (no sleeps in the test code itself;
- * the bounded waitFor polls only for async delivery that the production
- * debounce controls). The tmux case uses a real private tmux session, like
- * tmux-background-completion.test.ts, and requires tmux to be installed.
+ * Timing: unit cases use mock timers for deadline and completion-notification
+ * delivery. The real private tmux wake/parity test lives in
+ * tmux-deadline-wake.test.ts, like tmux-background-completion.test.ts.
  */
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
-import { registerBackgroundJobs } from "../features/background.ts";
-import { getTmuxContext } from "../features/bash-tmux.ts";
+import { rmSync, writeFileSync } from "node:fs";
+import {
+    flushCompletionBatch,
+    registerBackgroundJobs,
+} from "../features/background.ts";
 import { tmuxTerminalStatus } from "../features/bash-tmux.ts";
-import { listWindows, sessionNameForGitRoot } from "../tmux.ts";
 import { TauState } from "../state.ts";
 import type { BackgroundJob, JobResultDetails } from "../types.ts";
 
@@ -46,18 +45,6 @@ type Tool = {
         ctx: unknown
     ) => Promise<ToolResult>;
 };
-
-const TEST_RUN_DIR = `/tmp/pi-tau-deadline-wake-test-${process.pid}`;
-
-function killTestSession(): void {
-    try {
-        execSync(
-            `tmux kill-session -t ${sessionNameForGitRoot(TEST_RUN_DIR)} 2>/dev/null`
-        );
-    } catch {
-        /* already gone */
-    }
-}
 
 interface Harness {
     bashBg: Tool;
@@ -112,21 +99,6 @@ function ctxFor(cwd?: string): unknown {
         cwd: cwd ?? process.cwd(),
         ui: { notify() {}, setWidget() {}, setStatus() {} },
     };
-}
-
-/** Bounded real-time poll for async delivery the production debounce owns. */
-async function waitFor(
-    pred: () => boolean,
-    label: string,
-    budgetMs = 5000
-): Promise<void> {
-    const start = Date.now();
-    while (!pred()) {
-        if (Date.now() - start > budgetMs) {
-            assert.fail(`timed out waiting for: ${label}`);
-        }
-        await new Promise((r) => setTimeout(r, 25));
-    }
 }
 
 function killGroup(job: BackgroundJob): void {
@@ -279,13 +251,16 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
     void it("termination request followed by a clean exit reports completed, not killed", async () => {
         const started = await h.bashBg.execute(
             "tc-4",
-            { command: "trap 'exit 0' TERM; sleep 10" },
+            { command: "trap 'exit 0' TERM; while :; do sleep 1; done" },
             undefined,
             undefined,
             ctxFor()
         );
         const jobId = (started.details as JobResultDetails).jobId!;
         const job = h.state.backgroundJobs.get(jobId)!;
+        // Let this case deliver the explicit signal; other tests keep the
+        // process.kill spy to assert that the deadline itself never signals.
+        killSpy?.mock.restore();
         await h.jobs.execute(
             "tc-4k",
             { action: "kill", jobId },
@@ -334,9 +309,14 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
 
     void it("a job completing after its deadline fired reports completed with deadlineFiredAt", async () => {
         mock.timers.enable({ apis: ["setTimeout"] });
+        const completionMarker = `/tmp/pi-tau-deadline-completion-${process.pid}-${Date.now()}`;
+        rmSync(completionMarker, { force: true });
         const started = await h.bashBg.execute(
             "tc-6",
-            { command: "sleep 1", timeout: 1 },
+            {
+                command: `while [ ! -e '${completionMarker}' ]; do sleep 0.01; done`,
+                timeout: 1,
+            },
             undefined,
             undefined,
             ctxFor()
@@ -345,8 +325,10 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         const job = h.state.backgroundJobs.get(jobId)!;
         mock.timers.tick(1_000);
         assert.equal(deadlineMessages().length, 1);
-        mock.timers.reset();
+        assert.equal(job.status, "running", "deadline only wakes the agent");
+        writeFileSync(completionMarker, "done");
         await job.donePromise;
+        rmSync(completionMarker, { force: true });
         assert.equal(
             job.status,
             "completed",
@@ -354,10 +336,10 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         );
         assert.ok(job.deadlineFiredAt !== undefined);
         assert.ok(job.deadlineFiredAt >= (job.deadlineRequestedAt as number));
-        await waitFor(
-            () => h.sent.message.some((m) => m.customType === "job-completion"),
-            "completion notification"
-        );
+        // Output indexing gates notification enqueue. Await that owned work,
+        // then flush the batch directly rather than polling the debounce timer.
+        await job.outputIndexPromise;
+        flushCompletionBatch();
         const completion = h.sent.message.find(
             (m) => m.customType === "job-completion"
         )!;
@@ -370,9 +352,10 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
     });
 
     void it("attach timeout is wait-only: returns without killing or altering the job", async () => {
+        mock.timers.enable({ apis: ["setTimeout", "Date"] });
         const started = await h.bashBg.execute(
             "tc-7",
-            { command: "sleep 5" },
+            { command: "trap '' TERM; sleep 30" },
             undefined,
             undefined,
             ctxFor()
@@ -380,13 +363,21 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         const jobId = (started.details as JobResultDetails).jobId!;
         const job = h.state.backgroundJobs.get(jobId)!;
         const before = job.startTime;
-        const attachResult = await h.jobs.execute(
+        let progressResolve!: () => void;
+        const firstProgress = new Promise<void>((resolve) => {
+            progressResolve = resolve;
+        });
+        const attachPromise = h.jobs.execute(
             "tc-7a",
             { action: "attach", jobId, timeout: 1, wait: true },
             undefined,
-            () => {},
+            progressResolve,
             ctxFor()
         );
+        // Let attach reach its polling wait, then advance its fake clock.
+        await firstProgress;
+        mock.timers.tick(1_000);
+        const attachResult = await attachPromise;
         assert.match(attachResult.content[0].text, /running/);
         assert.equal(
             job.status,
@@ -415,98 +406,6 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
             ctxFor()
         );
         assert.match(started.content[0].text, /Reminder: cb-\d+ \(in 30s\)/);
-    });
-});
-
-void describe("bash_bg tmux route notification parity", () => {
-    let h: Harness;
-
-    beforeEach(() => {
-        killTestSession();
-        mkdirSync(TEST_RUN_DIR, { recursive: true });
-        execSync("git init -q", { cwd: TEST_RUN_DIR });
-        h = makeHarness(true);
-    });
-
-    afterEach(() => {
-        for (const job of h.state.backgroundJobs.values()) {
-            const tmuxCtx = getTmuxContext(job);
-            if (tmuxCtx) {
-                try {
-                    execSync(
-                        `tmux kill-window -t ${tmuxCtx.windowId} 2>/dev/null`
-                    );
-                } catch {
-                    /* already gone */
-                }
-            }
-        }
-        killTestSession();
-        try {
-            rmSync(TEST_RUN_DIR, { recursive: true, force: true });
-        } catch {
-            /* best effort */
-        }
-    });
-
-    void it("arms deadline wake and reminder; the wake does not touch the tmux window", async () => {
-        const started = await h.bashBg.execute(
-            "tc-t1",
-            {
-                command: "sleep 5",
-                timeout: 1,
-                remindDelay: "30s",
-                cwd: TEST_RUN_DIR,
-            },
-            undefined,
-            undefined,
-            ctxFor(TEST_RUN_DIR)
-        );
-        const text = started.content[0].text;
-        assert.match(
-            text,
-            /Deadline \(wake, not kill\): 1s/,
-            "deadline armed on the tmux route"
-        );
-        assert.match(
-            text,
-            /Reminder: cb-\d+ \(in 30s\)/,
-            "reminder armed on the tmux route"
-        );
-        const jobId = (started.details as JobResultDetails).jobId!;
-        const job = h.state.backgroundJobs.get(jobId)!;
-        const tmuxCtx = getTmuxContext(job);
-        assert.ok(tmuxCtx, "job is tmux-backed");
-
-        await waitFor(
-            () => h.sent.message.some((m) => m.customType === "bg-deadline"),
-            "tmux-route deadline wake"
-        );
-        const wake = h.sent.message.find(
-            (m) => m.customType === "bg-deadline"
-        )!;
-        assert.match(wake.content!, new RegExp(jobId));
-        assert.match(wake.content!, /NOT terminated/);
-
-        const windows = listWindows(sessionNameForGitRoot(TEST_RUN_DIR));
-        assert.ok(
-            windows.some((w) => w.id === tmuxCtx.windowId),
-            "deadline wake must not kill the tmux window"
-        );
-
-        await h.jobs.execute(
-            "tc-t1k",
-            { action: "kill", jobId },
-            undefined,
-            undefined,
-            ctxFor()
-        );
-        await job.donePromise;
-        assert.equal(
-            job.status,
-            "killed",
-            "manual kill + observed window death records killed"
-        );
     });
 });
 

@@ -10,7 +10,7 @@
  * job has been re-registered by the time the timer fires.
  */
 
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { registerCallbacks } from "../features/callbacks.ts";
 import { TauState } from "../state.ts";
@@ -66,7 +66,23 @@ function linkedCallbackFixture(
     };
 }
 
-const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+let cleanupCurrentHarness: (() => Promise<unknown>) | undefined;
+
+beforeEach(() => mock.timers.enable({ apis: ["setTimeout", "Date"] }));
+afterEach(async () => {
+    await cleanupCurrentHarness?.();
+    cleanupCurrentHarness = undefined;
+    mock.timers.reset();
+    mock.restoreAll();
+});
+
+async function advanceTimers(ms: number): Promise<void> {
+    mock.timers.tick(ms);
+    // Ready-callback delivery is queued on a zero-delay timer after the linked
+    // reminder fires; flush that boundary too without wall-clock waiting.
+    mock.timers.tick(0);
+    await Promise.resolve();
+}
 
 /**
  * Harness with a STATEFUL session entry list: appendEntry (persistState)
@@ -122,7 +138,7 @@ function createRestoreHarness(seedEntries: SessionEntry[] = []) {
         },
     };
 
-    return {
+    const harness = {
         pi,
         entries,
         sentUserMessages,
@@ -136,6 +152,8 @@ function createRestoreHarness(seedEntries: SessionEntry[] = []) {
             return await handler(event, ctx);
         },
     };
+    cleanupCurrentHarness = () => harness.invoke("session_shutdown");
+    return harness;
 }
 
 function deliveredText(h: ReturnType<typeof createRestoreHarness>): string {
@@ -163,7 +181,7 @@ void describe("restoring linked reminders with the job present", () => {
         ]);
         registerCallbacks(h.pi, state);
         await h.invoke("session_start");
-        await tick(150);
+        await advanceTimers(150);
 
         assert.equal(h.sentUserMessages.length, 1);
         const message = deliveredText(h);
@@ -195,8 +213,8 @@ void describe("restoring linked reminders whose job is not tracked", () => {
         await h.invoke("session_start");
 
         // The reminder must survive restore: the old behavior deleted it
-        // here, delivering nothing. Wait past the due time.
-        await tick(150);
+        // here, delivering nothing. Advance past the due time without sleeping.
+        await advanceTimers(150);
 
         assert.equal(h.sentUserMessages.length, 1);
         const message = deliveredText(h);
@@ -227,7 +245,7 @@ void describe("restoring linked reminders whose job is not tracked", () => {
         ]);
         registerCallbacks(h.pi, state);
         await h.invoke("session_start");
-        await tick(30);
+        await advanceTimers(30);
 
         assert.equal(h.sentUserMessages.length, 1);
         assert.match(deliveredText(h), /no longer tracked in this session/);
@@ -250,7 +268,7 @@ void describe("restoring linked reminders whose job is not tracked", () => {
         // Simulate a background-feature re-discovery landing after the
         // callbacks restore: the job becomes tracked before the timer fires.
         state.backgroundJobs.set(job.id, job);
-        await tick(150);
+        await advanceTimers(150);
 
         assert.equal(h.sentUserMessages.length, 1);
         const message = deliveredText(h);
@@ -283,7 +301,7 @@ void describe("restoring linked reminders whose job is not tracked", () => {
             );
         const resultText = result.content.map((c) => c.text).join("\n");
         assert.match(resultText, /cb-restore-o4/);
-        await tick(200);
+        await advanceTimers(200);
 
         assert.equal(
             h.sentUserMessages.length,
@@ -308,7 +326,7 @@ void describe("reminder delivery across restore cycles", () => {
         ]);
         registerCallbacks(h.pi, state);
         await h.invoke("session_start");
-        await tick(150);
+        await advanceTimers(150);
         assert.equal(h.sentUserMessages.length, 1);
 
         // Simulated process restart: shutdown persists remaining state
@@ -316,7 +334,7 @@ void describe("reminder delivery across restore cycles", () => {
         await h.invoke("session_shutdown");
         registerCallbacks(h.pi, state);
         await h.invoke("session_start");
-        await tick(150);
+        await advanceTimers(150);
 
         assert.equal(
             h.sentUserMessages.length,
@@ -345,7 +363,7 @@ void describe("reminder delivery across restore cycles", () => {
         // and the map is cleared, but shutdown's persistState has appended
         // a fresh callbacks-state entry to the session.
         await h.invoke("session_shutdown");
-        await tick(120);
+        await advanceTimers(120);
         assert.equal(
             h.sentUserMessages.length,
             0,
@@ -362,7 +380,7 @@ void describe("reminder delivery across restore cycles", () => {
         // New process: restore again with the job still tracked.
         registerCallbacks(h.pi, state);
         await h.invoke("session_start");
-        await tick(200);
+        await advanceTimers(200);
 
         assert.equal(h.sentUserMessages.length, 1);
         assert.doesNotMatch(deliveredText(h), /no longer tracked/);

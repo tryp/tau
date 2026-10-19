@@ -381,7 +381,7 @@ void describe("timeout-nerf agent messaging", () => {
             assert.equal(args.command, plan.rewritten, command);
             assert.equal(args.cwd, plan.cwd ?? undefined, command);
 
-            // A wake-up must arrive before the kill deadline, or it is useless.
+            // A wake-up must arrive before the decision deadline, or it is useless.
             const remind = Number.parseInt(args.remindDelay, 10);
             assert.ok(
                 remind < args.timeout,

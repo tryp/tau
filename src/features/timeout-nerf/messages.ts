@@ -61,8 +61,8 @@ export function nerfNote(plan: NerfPlan): string {
     const bgArgs: Record<string, unknown> = { command: plan.rewritten };
     if (plan.cwd !== null) bgArgs.cwd = plan.cwd;
     if (seconds !== null) bgArgs.timeout = seconds;
-    // Wake before the kill deadline rather than at a fixed 5m, which for a
-    // short bound would arrive only after the job had already been killed.
+    // Wake before the decision deadline rather than at a fixed 5m, which for
+    // a short bound would arrive only after the agent should have checked in.
     const remindSeconds =
         seconds === null
             ? 300
@@ -83,6 +83,6 @@ export function bashGuidelines(): string[] {
     return [
         "Do not wrap commands in the shell `timeout` utility. A leading shell `timeout` wrapper is removed before execution, because it pre-empts pi's own handling: it can kill a command before pi's budget detaches it, or kill it after. Use the tools below instead.",
         "For a hard kill bound, set the bash tool's `timeout` parameter. An explicit `timeout` parameter keeps kill semantics.",
-        "For a long run you will check on later, use `bash_bg` with `timeout` (kill deadline) and `remindDelay` (wakes you when it elapses), then read the captured log with `jobs` or `job_decide`. Prefer this over a foreground command whose output would be lost when it is detached.",
+        "For a long run you will check on later, use `bash_bg` with `timeout` (a decision deadline that wakes you to check progress; it never kills automatically) and `remindDelay` (a linked reminder), then read the captured log with `jobs` or `job_decide`. Prefer this over a foreground command whose output would be lost when it is detached.",
     ];
 }

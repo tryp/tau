@@ -2807,10 +2807,10 @@ export function registerBackgroundJobs(
             "Use the jobs tool to check status and read output. " +
             "Completed output is automatically indexed in the context sidecar SQLite database when available " +
             "and is searchable via context_search, context_list, and context_get. " +
-            "Optionally set a kill deadline (timeout), schedule an inline reminder (remindDelay), or both.",
+            "Optionally set a decision deadline (timeout; wakes you to check progress and decide, never kills automatically), schedule an inline reminder (remindDelay), or both.",
         promptSnippet:
             "Run bash command in background immediately" +
-            " (supports kill deadline and inline reminder)",
+            " (supports a decision deadline that wakes you, not a kill, and an inline reminder)",
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
@@ -2879,6 +2879,7 @@ export function registerBackgroundJobs(
 
             // ── Tmux path ─────────────────────────────────────────────
             if (state.tmuxAvailable) {
+                let cancelDeadlineWake: (() => void) | undefined;
                 const job = spawnBackgroundTmux(
                     params.command,
                     execCwd,
@@ -2912,8 +2913,11 @@ export function registerBackgroundJobs(
                         ),
                     // Finalize through the shared completion machinery
                     // (notifyCompletion + tmux window cleanup).
-                    (job) =>
-                        handleTmuxCompletion(job, state, pi, ctx, shouldNotify),
+                    (job) => {
+                        cancelDeadlineWake?.();
+                        cancelDeadlineWake = undefined;
+                        handleTmuxCompletion(job, state, pi, ctx, shouldNotify);
+                    },
                     // Refresh the background-jobs widget once the job is
                     // finalized (completion/cleanup), not just at spawn.
                     () => updateWidget(state, ctx)
@@ -2927,7 +2931,11 @@ export function registerBackgroundJobs(
                 // linked nonterminating callback.
                 let deadlineWarning = "";
                 if (typeof params.timeout === "number" && params.timeout > 0) {
-                    armDeadlineWake(job, pi, params.timeout);
+                    cancelDeadlineWake = armDeadlineWake(
+                        job,
+                        pi,
+                        params.timeout
+                    );
                 }
                 let reminder:
                     | { reminderId?: string; armed: boolean }
@@ -3006,7 +3014,7 @@ export function registerBackgroundJobs(
                 }
             );
 
-            // ── Kill deadline wake (decision point, never a kill) ──────────────────────────────────
+            // ── Decision-deadline wake (decision point, never a kill) ─────────────────────────────
             let cancelDeadlineWake: (() => void) | undefined;
             if (typeof params.timeout === "number" && params.timeout > 0) {
                 cancelDeadlineWake = armDeadlineWake(job, pi, params.timeout);
