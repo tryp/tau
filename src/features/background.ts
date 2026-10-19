@@ -81,6 +81,7 @@ import type { TauState } from "../state.ts";
 import {
     cancelCallbacksForJob,
     hasLinkedCallbacksForJob,
+    parseDurationToMs,
     scheduleJobReminder,
 } from "./callbacks.ts";
 import type {
@@ -88,6 +89,7 @@ import type {
     JobOutputIndex,
     JobResultDetails,
     RunningProcess,
+    TerminationRequester,
     UiContext,
     PipeStageZeroCapture,
 } from "../types.ts";
@@ -192,8 +194,15 @@ function spawnBashProcess(
  * proc.on("close") from sending a spurious job-completion message
  * that re-enters the agent loop.
  */
-export function silenceJobAfterKill(job: BackgroundJob): void {
-    markJobTerminal(job, "killed");
+export function silenceJobAfterKill(
+    job: BackgroundJob,
+    by: TerminationRequester
+): void {
+    // Record the termination REQUEST only. Terminal status is set from the
+    // observed exit (close event / tmux completion poll); marking killed here
+    // would record signal intent as outcome and hide SIGTERM-ignoring
+    // survivors behind a false terminal record.
+    requestJobTermination(job, by);
     job.outputConsumed = true;
 }
 
@@ -321,6 +330,167 @@ function sendQueuedMessage(
     );
 }
 
+// ─── Requested policies: deadline wake + linked reminder ───────────
+
+/**
+ * Validate requested bash_bg policies before anything is spawned.
+ *
+ * Admission happens before job creation so an invalid request can never
+ * leave a running payload whose supervision was refused.
+ *
+ * @throws Error with an agent-actionable message when a value is invalid.
+ */
+export function validateRequestedPolicies(params: {
+    timeout?: unknown;
+    remindDelay?: unknown;
+}): void {
+    if (params.timeout !== undefined) {
+        const t = params.timeout;
+        if (typeof t !== "number" || !Number.isFinite(t) || t <= 0) {
+            // unknown-typed input: stringify safely, never via [object Object]
+            const shown =
+                typeof t === "number"
+                    ? String(t)
+                    : typeof t === "string"
+                      ? JSON.stringify(t)
+                      : typeof t;
+            throw new Error(
+                `Invalid timeout: ${shown}. Must be a finite positive number of seconds.`
+            );
+        }
+    }
+    if (params.remindDelay !== undefined) {
+        if (typeof params.remindDelay !== "string") {
+            const shown =
+                typeof params.remindDelay === "string"
+                    ? JSON.stringify(params.remindDelay)
+                    : typeof params.remindDelay;
+            throw new Error(
+                `Invalid remindDelay: ${shown}. Use a positive duration like "30s", "5m", "2h".`
+            );
+        }
+        const delayMs = parseDurationToMs(params.remindDelay);
+        if (delayMs === null || delayMs <= 0) {
+            throw new Error(
+                `Invalid remindDelay: ${params.remindDelay}. Use a positive duration like "30s", "5m", "2h".`
+            );
+        }
+    }
+}
+
+/**
+ * Arm the bash_bg deadline wake. The deadline is a decision point, not a
+ * kill: when it fires the agent is woken once to inspect progress and decide
+ * (extend, jobs kill, ignore). The job is never terminated by the deadline,
+ * on any backend — arming this helper on both the tmux and direct-spawn
+ * routes is the notification-parity repair.
+ *
+ * Returns a cancel function; the wake also self-cancels if the job reached a
+ * terminal state before the timer fires.
+ */
+export function armDeadlineWake(
+    job: BackgroundJob,
+    pi: ExtensionAPI,
+    timeoutSeconds: number
+): () => void {
+    job.deadlineRequestedAt = Date.now();
+    const timer = setTimeout(() => {
+        // Completion raced the deadline: the wake must not fire after a
+        // terminal state was observed.
+        if (job.status !== "running") return;
+        job.deadlineFiredAt = Date.now();
+        const age = formatDuration(Date.now() - job.startTime);
+        const progress = jobDecisionEvidence(job);
+        sendQueuedMessage(
+            pi,
+            {
+                customType: "bg-deadline",
+                content:
+                    `⏰ Background job ${job.id} exceeded its ${timeoutSeconds}s deadline (age ${age}) and is still running.\n` +
+                    (progress ? `${progress}\n` : "") +
+                    `Command: ${job.command}\n` +
+                    `Output: ${job.logPath}\n\n` +
+                    `The job was NOT terminated. Decide: inspect with jobs attach or jobs output, ` +
+                    `terminate with jobs kill, or ignore to let it finish.`,
+                display: true,
+                details: {
+                    jobId: job.id,
+                    logPath: job.logPath,
+                    command: job.command,
+                },
+            },
+            {
+                deliverAs: "followUp",
+                triggerTurn: true,
+                // Reuses the existing "timeout" kind so completion paths that
+                // already cancel queued timeout notifications for a job
+                // (notifyCompletion, handleTmuxCompletion, attach) also cancel
+                // an undelivered deadline wake.
+                queueKey: backgroundNotificationKey(job.id, "timeout"),
+            }
+        );
+    }, timeoutSeconds * 1_000);
+    timer.unref();
+    return () => clearTimeout(timer);
+}
+
+/**
+ * Arm a linked reminder on any backend. Assumes validateRequestedPolicies
+ * already accepted the delay; a null here is an arming failure, which the
+ * caller must surface in the tool result instead of silently dropping the
+ * requested reminder.
+ */
+export function armJobReminder(
+    job: BackgroundJob,
+    remindDelay: string,
+    remindMessage?: string
+): { reminderId?: string; armed: boolean } {
+    const msg = remindMessage ?? `check on: ${job.command.slice(0, 80)}`;
+    const rid = scheduleJobReminder(job.id, remindDelay, msg);
+    if (rid) {
+        return { reminderId: rid, armed: true };
+    }
+    return { armed: false };
+}
+
+/**
+ * Record that termination was requested for a job. Request and observation
+ * are separate facts: the job's terminal status still comes only from an
+ * observed exit (close event / tmux completion poll), which is what keeps a
+ * SIGTERM-ignoring workload from being recorded as killed while alive.
+ */
+export function requestJobTermination(
+    job: BackgroundJob,
+    by: TerminationRequester
+): void {
+    if (job.terminationRequestedAt === undefined) {
+        job.terminationRequestedAt = Date.now();
+        job.terminationRequestedBy = by;
+    }
+}
+
+/**
+ * Shared formatting for the armed-policy lines in the bash_bg started
+ * result, so both backends advertise exactly what was armed.
+ */
+export function formatArmedPolicies(
+    params: { timeout?: number; remindDelay?: string },
+    reminder?: { reminderId?: string; armed: boolean }
+): string {
+    let extra = "";
+    if (typeof params.timeout === "number" && params.timeout > 0) {
+        extra += `\nDeadline (wake, not kill): ${params.timeout}s`;
+    }
+    if (params.remindDelay !== undefined) {
+        if (reminder?.armed && reminder.reminderId) {
+            extra += `\nReminder: ${reminder.reminderId} (in ${params.remindDelay})`;
+        } else {
+            extra += `\nWarning: reminder could not be armed (requested: ${params.remindDelay})`;
+        }
+    }
+    return extra;
+}
+
 // ─── Stall watchdog ─────────────────────────────────────────────────
 
 export interface StallWatchdogOptions {
@@ -382,7 +552,7 @@ export function startStallWatchdog(
                     pi,
                     {
                         customType: "bg-stall",
-                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Terminated.${suffix}`,
+                        content: `⚠️ Background job ${jobId} exceeded ${MAX_LOG_BYTES / (1024 * 1024)} MiB output. Termination requested (SIGTERM).${suffix}`,
                         display: true,
                         details: { jobId, logPath, command },
                     },
@@ -941,6 +1111,20 @@ export function jobDetails(
         ...(job.pid > 0 ? { pid: job.pid } : {}),
         startTime: job.startTime,
         ...(job.endTime !== undefined ? { endTime: job.endTime } : {}),
+        // Supervision facts, reported separately from the outcome: a requested
+        // deadline/termination is never conflated with the observed result.
+        ...(job.deadlineRequestedAt !== undefined
+            ? { deadlineRequestedAt: job.deadlineRequestedAt }
+            : {}),
+        ...(job.deadlineFiredAt !== undefined
+            ? { deadlineFiredAt: job.deadlineFiredAt }
+            : {}),
+        ...(job.terminationRequestedAt !== undefined
+            ? { terminationRequestedAt: job.terminationRequestedAt }
+            : {}),
+        ...(job.terminationRequestedBy !== undefined
+            ? { terminationRequestedBy: job.terminationRequestedBy }
+            : {}),
         // Full duration once terminal; elapsed-so-far while still running.
         durationMs: (job.endTime ?? Date.now()) - job.startTime,
         sourceId: job.sourceId,
@@ -1480,6 +1664,16 @@ function deliverCompletionNotification(
         const logEvidence = completionEvidenceById.get(job.id);
         const exitLine =
             job.exitCode !== undefined ? `, exit ${job.exitCode}` : "";
+        // Supervision facts ride along, never replacing the outcome: a
+        // requested termination or a fired deadline wake stays visible on a
+        // completed/failed job instead of being rewritten into it.
+        const supervisionLine =
+            (job.terminationRequestedAt !== undefined
+                ? `, termination requested (${job.terminationRequestedBy ?? "unknown"})`
+                : "") +
+            (job.deadlineFiredAt !== undefined
+                ? ", deadline fired (wake only)"
+                : "");
 
         // Best-effort GPU snapshot at completion time
         const gpuLine = readGpuSnapshot();
@@ -1490,7 +1684,7 @@ function deliverCompletionNotification(
             {
                 customType: "job-completion",
                 content:
-                    `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}\n` +
+                    `${emoji} ${job.id} ${job.status} (${duration})${suffix}${exitLine}${supervisionLine}\n` +
                     `${logEvidence?.text ? `Output evidence: ${logEvidence.text}\n` : ""}` +
                     `Command: ${job.command}\nOutput: ${job.logPath}${
                         job.sidecarIndexStatus === "failed"
@@ -1503,6 +1697,18 @@ function deliverCompletionNotification(
                     status: job.status,
                     exitCode: job.exitCode,
                     duration,
+                    ...(job.deadlineRequestedAt !== undefined
+                        ? { deadlineRequestedAt: job.deadlineRequestedAt }
+                        : {}),
+                    ...(job.deadlineFiredAt !== undefined
+                        ? { deadlineFiredAt: job.deadlineFiredAt }
+                        : {}),
+                    ...(job.terminationRequestedAt !== undefined
+                        ? { terminationRequestedAt: job.terminationRequestedAt }
+                        : {}),
+                    ...(job.terminationRequestedBy !== undefined
+                        ? { terminationRequestedBy: job.terminationRequestedBy }
+                        : {}),
                     ...(logEvidence?.counts
                         ? { severityCounts: logEvidence.counts }
                         : {}),
@@ -1536,6 +1742,14 @@ function deliverCompletionNotification(
         (j) =>
             `  ${j.emoji} ${j.job.id} ${j.job.status} (${j.duration})${
                 j.job.exitCode !== undefined ? `, exit ${j.job.exitCode}` : ""
+            }${
+                j.job.terminationRequestedAt !== undefined
+                    ? `, termination requested (${j.job.terminationRequestedBy ?? "unknown"})`
+                    : ""
+            }${
+                j.job.deadlineFiredAt !== undefined
+                    ? ", deadline fired (wake only)"
+                    : ""
             }${
                 j.job.sidecarIndexStatus === "failed"
                     ? `, sidecar indexing failed (${j.job.sidecarIndexErrorCategory ?? "unknown"})`
@@ -1882,7 +2096,7 @@ export function registerBackgroundJob(
         state,
         () => {
             if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
-            silenceJobAfterKill(job);
+            silenceJobAfterKill(job, "stall");
             cancelQueuedBackgroundNotifications(pi, job.id);
             state.wakeupEvaluate?.();
         },
@@ -2600,7 +2814,7 @@ export function registerBackgroundJobs(
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
-            "Use timeout to set a kill deadline: the job is terminated if it runs longer than N seconds.",
+            "Use timeout to set a decision deadline: when it fires you are woken to check progress and decide (extend, jobs kill, ignore). The job is not terminated automatically.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "The result details include jobId, status, line metadata, and logPath; terminal output may also include sidecar sourceId/chunkIds.",
@@ -2629,8 +2843,8 @@ export function registerBackgroundJobs(
             timeout: Type.Optional(
                 Type.Number({
                     description:
-                        "Kill deadline in seconds. If the job runs longer than this, it is terminated. " +
-                        "Use when a command must finish within a time bound.",
+                        "Deadline in seconds. When the job runs longer than this you are woken to inspect progress and decide: " +
+                        "extend it, terminate it with jobs kill, or ignore. The job is NOT killed automatically.",
                 })
             ),
             remindDelay: Type.Optional(
@@ -2657,6 +2871,9 @@ export function registerBackgroundJobs(
             ctx
         ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             const shouldNotify = params.notify !== false;
+            // Admission before spawn: an invalid timeout/remindDelay must
+            // fail the tool call without creating any job or payload.
+            validateRequestedPolicies(params);
             const execCwd = resolveExecutionCwd(params.cwd, ctx.cwd);
             validateWorkingDirectory(execCwd);
 
@@ -2677,19 +2894,20 @@ export function registerBackgroundJobs(
                             pi,
                             state,
                             () => {
-                                killTmuxJob(
+                                const oversizeJob =
                                     state.backgroundJobs.get(jobId) ??
-                                        ({
-                                            id: jobId,
-                                            command,
-                                            pid: -1,
-                                            startTime: Date.now(),
-                                            status: "running",
-                                            logPath,
-                                            toolCallId,
-                                            isBackgrounded: true,
-                                        } satisfies BackgroundJob)
-                                );
+                                    ({
+                                        id: jobId,
+                                        command,
+                                        pid: -1,
+                                        startTime: Date.now(),
+                                        status: "running",
+                                        logPath,
+                                        toolCallId,
+                                        isBackgrounded: true,
+                                    } satisfies BackgroundJob);
+                                requestJobTermination(oversizeJob, "stall");
+                                killTmuxJob(oversizeJob);
                             }
                         ),
                     // Finalize through the shared completion machinery
@@ -2703,11 +2921,34 @@ export function registerBackgroundJobs(
 
                 updateWidget(state, ctx);
 
+                // Requested policies are armed identically on both backends
+                // (notification parity): the deadline wakes the agent to
+                // decide, it never terminates the job; the reminder is the
+                // linked nonterminating callback.
+                let deadlineWarning = "";
+                if (typeof params.timeout === "number" && params.timeout > 0) {
+                    armDeadlineWake(job, pi, params.timeout);
+                }
+                let reminder:
+                    | { reminderId?: string; armed: boolean }
+                    | undefined;
+                if (params.remindDelay !== undefined) {
+                    reminder = armJobReminder(
+                        job,
+                        params.remindDelay,
+                        params.remindMessage
+                    );
+                    if (!reminder.armed) {
+                        deadlineWarning =
+                            "\nWarning: reminder could not be armed";
+                    }
+                }
+
                 return {
                     content: [
                         {
                             type: "text" as const,
-                            text: `Started background job ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${params.command}\nOutput: ${job.logPath}\n\n${backgroundCompletionNotice(shouldNotify ? "guaranteed" : "none")}`,
+                            text: `Started background job ${job.id}${formatBackgroundEvidence(job)}\nCommand: ${params.command}\nOutput: ${job.logPath}${formatArmedPolicies(params, reminder)}${deadlineWarning}\n\n${backgroundCompletionNotice(shouldNotify ? "guaranteed" : "none")}`,
                         },
                     ],
                     details: jobDetails(job),
@@ -2759,42 +3000,50 @@ export function registerBackgroundJobs(
                 state,
                 () => {
                     if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
-                    silenceJobAfterKill(job);
+                    silenceJobAfterKill(job, "stall");
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     state.wakeupEvaluate?.();
                 }
             );
 
-            // ── Kill deadline timeout ──────────────────────────────────
-            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            // ── Kill deadline wake (decision point, never a kill) ──────────────────────────────────
+            let cancelDeadlineWake: (() => void) | undefined;
             if (typeof params.timeout === "number" && params.timeout > 0) {
-                killTimer = setTimeout(() => {
-                    if (proc.pid && job.status === "running") {
-                        killProcessGroup(proc.pid, "SIGTERM");
-                        markJobTerminal(job, "killed");
-                        // Don't silence — let notifyCompletion send the notification
-                    }
-                }, params.timeout * 1_000);
-                killTimer.unref();
+                cancelDeadlineWake = armDeadlineWake(job, pi, params.timeout);
             }
 
             // ── Inline reminder ───────────────────────────────────────
-            let reminderId: string | undefined;
-            if (params.remindDelay) {
-                const msg =
-                    params.remindMessage ??
-                    `check on: ${params.command.slice(0, 80)}`;
-                const rid = scheduleJobReminder(jobId, params.remindDelay, msg);
-                if (rid) reminderId = rid;
+            let reminder: { reminderId?: string; armed: boolean } | undefined;
+            if (params.remindDelay !== undefined) {
+                reminder = armJobReminder(
+                    job,
+                    params.remindDelay,
+                    params.remindMessage
+                );
             }
 
             proc.on("close", (code) => {
                 cancelStall();
-                if (killTimer) clearTimeout(killTimer);
-                killTimer = undefined;
+                cancelDeadlineWake?.();
+                cancelDeadlineWake = undefined;
+                // Terminal status comes only from the observed exit. A prior
+                // termination request plus a signal death (null code, or the
+                // shell's 128+n encodings for SIGTERM/SIGKILL) is an observed
+                // kill; any other exit — including a clean exit after a
+                // termination request — is completed/failed, with the request
+                // still visible in details. A deadline wake is not recorded
+                // here at all: it never contributed to the outcome.
+                const signalDeath =
+                    code === null || code === 137 || code === 143;
+                const terminationWasRequested =
+                    job.terminationRequestedAt !== undefined;
                 markJobTerminal(
                     job,
-                    code === 0 || code === null ? "completed" : "failed",
+                    terminationWasRequested && signalDeath
+                        ? "killed"
+                        : code === 0 || code === null
+                          ? "completed"
+                          : "failed",
                     code ?? 0
                 );
                 void trackJobOutputIndex(job, ctx);
@@ -2809,8 +3058,8 @@ export function registerBackgroundJobs(
 
             proc.on("error", () => {
                 cancelStall();
-                if (killTimer) clearTimeout(killTimer);
-                killTimer = undefined;
+                cancelDeadlineWake?.();
+                cancelDeadlineWake = undefined;
                 markJobTerminal(job, "failed");
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
@@ -2824,14 +3073,8 @@ export function registerBackgroundJobs(
 
             updateWidget(state, ctx);
 
-            // Build summary line for reminders / timeout
-            let extra = "";
-            if (killTimer) {
-                extra += `\nKill deadline: ${params.timeout}s`;
-            }
-            if (reminderId) {
-                extra += `\nReminder: ${reminderId} (in ${params.remindDelay})`;
-            }
+            // Build summary line for the armed policies (wake + reminder).
+            const extra = formatArmedPolicies(params, reminder);
 
             return {
                 content: [
@@ -3140,7 +3383,7 @@ export function registerBackgroundJobs(
                     } else {
                         throw new Error(`Job is not running: ${job.id}`);
                     }
-                    silenceJobAfterKill(job);
+                    silenceJobAfterKill(job, "manual");
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     clearPendingDecision(state, job);
                     state.wakeupEvaluate?.();
@@ -3434,7 +3677,7 @@ export function registerBackgroundJobs(
                     } else if (job.proc && job.status === "running") {
                         killProcessGroup(job.proc.pid!, "SIGTERM");
                     }
-                    silenceJobAfterKill(job);
+                    silenceJobAfterKill(job, "manual");
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     state.pendingDecisionJobId = undefined;
                     state.wakeupEvaluate?.();
@@ -3838,7 +4081,7 @@ async function executeTmuxForeground(
             if (state.currentlyRunningToolCallId === toolCallId) {
                 state.currentlyRunningToolCallId = null;
             }
-            silenceJobAfterKill(job);
+            silenceJobAfterKill(job, "manual");
             state.backgroundJobs.delete(jobId);
             updateWidget(state, ctx);
             const tail = readOutputTailSync(logPath, STALL_TAIL_BYTES);
@@ -3865,7 +4108,7 @@ async function executeTmuxForeground(
             if (state.currentlyRunningToolCallId === toolCallId) {
                 state.currentlyRunningToolCallId = null;
             }
-            silenceJobAfterKill(job);
+            silenceJobAfterKill(job, "stall");
             killTmuxJob(job);
             // Drop the foreground entry like the direct-spawn stall kill and
             // the `killed` arm do: leaving a terminal job in the map made the

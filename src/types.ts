@@ -59,6 +59,13 @@ export interface SidecarIndexStats {
     schemaSkipped: number;
 }
 
+/**
+ * Who asked for a job's termination. Deadline expiry never appears here:
+ * deadlines wake the agent to decide, they do not terminate. Only explicit
+ * termination requesters (manual kills, stall watchdog) are recorded.
+ */
+export type TerminationRequester = "manual" | "stall";
+
 /** Machine-readable metadata returned by background job tools. */
 export interface JobResultDetails {
     jobId?: string;
@@ -101,6 +108,17 @@ export interface JobResultDetails {
     partial?: boolean;
     /** Number of lines omitted by a head/tail or grep view, when known. */
     omittedLines?: number;
+    /** Epoch ms when a bash_bg deadline was requested; unset when none was. */
+    deadlineRequestedAt?: number;
+    /**
+     * Epoch ms when the deadline wake fired. Retained on later completion so a
+     * deadline wake is never reported as a completion result.
+     */
+    deadlineFiredAt?: number;
+    /** Epoch ms when termination (SIGTERM) was requested; unset when none was. */
+    terminationRequestedAt?: number;
+    /** Who requested termination: a manual kill or the stall watchdog. */
+    terminationRequestedBy?: TerminationRequester;
     /** Best-effort cumulative severity counts for the job output log. */
     severityCounts?: { err: number; warn: number; total: number };
     /** Severity/line counts appended since this job's previous output read. */
@@ -163,6 +181,18 @@ export interface BackgroundJob {
     /** Indexed output identifiers, populated after terminal completion. */
     sourceId?: string;
     chunkIds?: string[];
+    /** Epoch ms when a bash_bg deadline was requested; unset when none was. */
+    deadlineRequestedAt?: number;
+    /**
+     * Epoch ms when the deadline wake fired. Retained through terminal
+     * completion: a deadline wake is a supervision event, never a completion
+     * result, so a job finishing after its wake still reports completed.
+     */
+    deadlineFiredAt?: number;
+    /** Epoch ms when termination (SIGTERM) was requested; unset when none was. */
+    terminationRequestedAt?: number;
+    /** Who requested termination. Deadlines never do — they only wake. */
+    terminationRequestedBy?: TerminationRequester;
     /** Resolves when terminal output indexing finishes. */
     outputIndexPromise?: Promise<JobOutputIndex | undefined>;
     /** Outcome of optional terminal-output indexing. */
