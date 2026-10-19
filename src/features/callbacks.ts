@@ -60,6 +60,13 @@ export interface ScheduledCallback {
     linkedJobId?: string;
     /** Optional group label for bulk cancel operations. */
     group?: string;
+    /** Set at session restore when the linked job is not tracked in the new
+     *  process. The in-memory job map does not survive reloads, so absence
+     *  is not evidence the job ended: tmux-backed jobs keep running while
+     *  the map is rebuilt. Such a reminder is retained and fires once with
+     *  an explicit orphan note instead of being silently dropped.
+     *  In-memory only; never persisted. */
+    orphanedJob?: boolean;
 }
 
 // ─── Duration parsing ───────────────────────────────────────────────
@@ -541,16 +548,36 @@ function fireCallback(id: string): void {
     const cb = callbacks.get(id);
     if (!cb || cb.fired) return;
 
-    // If linked to a background job, skip delivery if the job is no longer
-    // running. The job may have completed between when the timer was set and
-    // when it fired, making this callback stale.
-    // If the job is still running, mark it so the completion notification
-    // is delivered when it eventually finishes (the linked callback has now
-    // been consumed, so flushCompletionBatch would otherwise suppress it).
+    // If linked to a background job, delivery depends on what the job map
+    // knows:
+    // - Job still running: deliver, and mark the job so the completion
+    //   notification is delivered when it eventually finishes (the linked
+    //   callback has now been consumed, so flushCompletionBatch would
+    //   otherwise suppress it).
+    // - Job tracked but not running: it completed between when the timer was
+    //   set and when it fired — the reminder is stale, cancel it silently.
+    // - Job untracked AND marked orphanedJob by a session restore: the
+    //   in-memory job map does not survive reloads, so absence is not
+    //   evidence the job ended (tmux-backed jobs keep running while the map
+    //   is rebuilt). Deliver once with an explicit orphan note rather than
+    //   silently dropping the reminder the requesting agent asked for.
+    // - Job untracked WITHOUT the orphan mark: it was tracked in this
+    //   process and has since been removed (completed and cleaned up, or
+    //   cancelled) — stale, cancel silently (pre-existing behavior).
     if (cb.linkedJobId && _tauState) {
         const job = _tauState.backgroundJobs.get(cb.linkedJobId);
-        if (!job || job.status !== "running") {
-            // Job is gone or done — cancel this callback silently
+        if (job && job.status === "running") {
+            // Job is still running — ensure completion notification fires later
+            job.wantsCompletionNotification = true;
+        } else if (!job && cb.orphanedJob) {
+            cb.message =
+                `[linked job ${cb.linkedJobId} is no longer tracked in this ` +
+                `session — it may have completed or been lost across reload; ` +
+                `verify with jobs output/attach before re-running]\n` +
+                cb.message;
+        } else {
+            // Job is done (tracked) or was removed earlier in this process —
+            // cancel this callback silently
             if (cb.timer) {
                 clearTimeout(cb.timer);
                 cb.timer = undefined;
@@ -559,8 +586,6 @@ function fireCallback(id: string): void {
             persistState();
             return;
         }
-        // Job is still running — ensure completion notification fires later
-        job.wantsCompletionNotification = true;
     }
 
     // Collect other pending non-linked callbacks for the message annotation,
@@ -805,6 +830,23 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
                             ...cb,
                             fired: false,
                         };
+                        // The in-memory job map does not survive reloads, so
+                        // "job not tracked" at restore time is not evidence
+                        // the job ended: tmux-backed jobs keep running while
+                        // the map is rebuilt. Mark such reminders as orphaned
+                        // BEFORE scheduling — an already-due reminder would
+                        // otherwise fire into fireCallback's absent-job path
+                        // and be silently cancelled. Orphaned reminders are
+                        // retained and fire once with an explicit orphan
+                        // note; fireCallback re-classifies as a normal
+                        // reminder if the job has been re-registered by the
+                        // time the timer fires.
+                        if (
+                            restored.linkedJobId &&
+                            !_tauState?.backgroundJobs.has(restored.linkedJobId)
+                        ) {
+                            restored.orphanedJob = true;
+                        }
                         scheduleCallback(restored);
                     }
                 }
@@ -815,28 +857,13 @@ export function registerCallbacks(pi: ExtensionAPI, state: TauState): void {
             }
         }
 
-        // Clean up restored callbacks whose linked jobs no longer exist
-        // (orphaned from a previous process that tracked the job).
-        let orphanCount = 0;
-        const tauState = _tauState;
-        if (tauState) {
-            for (const [id, cb] of callbacks) {
-                if (
-                    cb.linkedJobId &&
-                    !tauState.backgroundJobs.has(cb.linkedJobId)
-                ) {
-                    if (cb.timer) {
-                        clearTimeout(cb.timer);
-                        cb.timer = undefined;
-                    }
-                    callbacks.delete(id);
-                    orphanCount++;
-                }
-            }
-        }
-        if (orphanCount > 0) {
-            persistState();
-        }
+        // Note: restored callbacks whose linked jobs are not tracked in this
+        // process are NOT dropped here. The job map is rebuilt from scratch
+        // after a reload, so absence proves nothing about the job; dropping
+        // silently lost the wake-up the requesting agent asked for (a tmux
+        // bash_bg job can keep running through the reload). Restored linked
+        // reminders whose job is absent are marked orphanedJob above, before
+        // scheduling, and fire once with an explicit orphan note.
 
         // Start watching for external callbacks
         startExternalWatcher(_sessionId);
