@@ -40,6 +40,7 @@ void describe("handoff /handoff command — with conversation", () => {
                 editor: async () => "edited prompt",
             },
             sessionManager: {
+                getSessionId: () => "handoff-test-session",
                 getBranch: () => [
                     {
                         type: "message",

@@ -28,6 +28,7 @@ void describe("summarize /summarize command", () => {
                     notifications.push({ message, level }),
             },
             sessionManager: {
+                getSessionId: () => "test-session",
                 getBranch: () => [],
             },
         } as never;
@@ -48,6 +49,7 @@ void describe("summarize /summarize command", () => {
                     notifications.push({ message, level }),
             },
             sessionManager: {
+                getSessionId: () => "test-session",
                 getBranch: () => [
                     {
                         type: "message",

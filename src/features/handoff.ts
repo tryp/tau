@@ -34,6 +34,13 @@ import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import type { TauState } from "../state.ts";
+import { opencodeSessionOptions } from "./opencode-session.ts";
+
+type HandoffLoaderFactory = (
+    tui: ConstructorParameters<typeof BorderedLoader>[0],
+    theme: ConstructorParameters<typeof BorderedLoader>[1],
+    message: string
+) => BorderedLoader;
 
 const SYSTEM_PROMPT = `You are a context transfer assistant. Given a conversation history and the user's goal for a new thread, generate a focused prompt that:
 
@@ -240,7 +247,9 @@ async function performHandoff(
     >[1],
     args: HandoffArgs,
     accessedPaths: string[],
-    cwd: string
+    cwd: string,
+    completeRequest: typeof complete,
+    createLoader: HandoffLoaderFactory
 ): Promise<void> {
     if (!ctx.hasUI) {
         ctx.ui.notify("handoff requires interactive mode", "error");
@@ -259,6 +268,9 @@ async function performHandoff(
         );
         return;
     }
+
+    // Capture the source session before any UI interaction can change sessions.
+    const sessionId = ctx.sessionManager.getSessionId();
 
     // Determine target directory
     let targetDir = args.targetDir;
@@ -305,7 +317,7 @@ async function performHandoff(
 
     const result = await ctx.ui.custom<string | null>(
         (tui, theme, _kb, done) => {
-            const loader = new BorderedLoader(
+            const loader = createLoader(
                 tui,
                 theme,
                 `Generating handoff prompt...`
@@ -335,17 +347,23 @@ async function performHandoff(
                     timestamp: Date.now(),
                 };
 
-                const response = await complete(
+                const request = opencodeSessionOptions(
                     ctx.model as Model<Api>,
+                    sessionId,
+                    auth.headers
+                );
+                const { model: requestModel, ...trackingOptions } = request;
+                const response = await completeRequest(
+                    requestModel,
                     {
                         systemPrompt: SYSTEM_PROMPT,
                         messages: [userMessage],
                     },
                     {
                         apiKey: auth.apiKey,
-                        headers: auth.headers,
+                        ...trackingOptions,
                         signal: loader.signal,
-                    }
+                    } as Parameters<typeof completeRequest>[2]
                 );
 
                 if (response.stopReason === "aborted") {
@@ -434,14 +452,27 @@ async function performHandoff(
 
 // ── Registration ─────────────────────────────────────────────────────
 
-export function registerHandoff(pi: ExtensionAPI, state: TauState): void {
+export function registerHandoff(
+    pi: ExtensionAPI,
+    state: TauState,
+    completeRequest: typeof complete = complete,
+    createLoader: HandoffLoaderFactory = (tui, theme, message) =>
+        new BorderedLoader(tui, theme, message)
+): void {
     pi.registerCommand("handoff", {
         description:
             "Transfer context to a new focused session. " +
             "Usage: /handoff <goal> [--dir <path>] [--tab|--tmux|--clip|--print]",
         handler: async (args, ctx) => {
             const parsed = parseHandoffArgs(args, false);
-            await performHandoff(ctx, parsed, state.accessedFilePaths, ctx.cwd);
+            await performHandoff(
+                ctx,
+                parsed,
+                state.accessedFilePaths,
+                ctx.cwd,
+                completeRequest,
+                createLoader
+            );
         },
     });
 
@@ -451,7 +482,14 @@ export function registerHandoff(pi: ExtensionAPI, state: TauState): void {
             "Usage: /handover <goal> [path] [--tab|--tmux|--clip|--print]",
         handler: async (args, ctx) => {
             const parsed = parseHandoffArgs(args, true);
-            await performHandoff(ctx, parsed, state.accessedFilePaths, ctx.cwd);
+            await performHandoff(
+                ctx,
+                parsed,
+                state.accessedFilePaths,
+                ctx.cwd,
+                completeRequest,
+                createLoader
+            );
         },
     });
 }

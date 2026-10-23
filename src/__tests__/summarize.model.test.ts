@@ -28,6 +28,7 @@ void describe("summarize /summarize command — model errors", () => {
                     notifications.push({ message, level }),
             },
             sessionManager: {
+                getSessionId: () => "test-session",
                 getBranch: () => [
                     {
                         type: "message",

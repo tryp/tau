@@ -15,6 +15,7 @@ import {
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
+import { opencodeSessionOptions } from "./opencode-session.ts";
 
 export type ContentBlock = {
     type?: string;
@@ -165,7 +166,14 @@ const showSummaryUi = async (summary: string, ctx: ExtensionCommandContext) => {
     });
 };
 
-export function registerSummarize(pi: ExtensionAPI, state: TauState): void {
+export function registerSummarize(
+    pi: ExtensionAPI,
+    state: TauState,
+    dependencies: {
+        complete: typeof complete;
+        getModel: typeof getModel;
+    } = { complete, getModel }
+): void {
     pi.registerCommand("summarize", {
         description: "Summarize the current conversation in a custom UI",
         handler: async (_args, ctx) => {
@@ -177,6 +185,7 @@ export function registerSummarize(pi: ExtensionAPI, state: TauState): void {
                 return;
             }
 
+            const sessionId = ctx.sessionManager.getSessionId();
             const branch = ctx.sessionManager.getBranch();
             const conversationText = buildConversationText(branch);
 
@@ -191,7 +200,7 @@ export function registerSummarize(pi: ExtensionAPI, state: TauState): void {
                 ctx.ui.notify("Preparing summary...", "info");
             }
 
-            const model = getModel("openai", "gpt-5.2");
+            const model = dependencies.getModel("openai", "gpt-5.2");
             if (!model && ctx.hasUI) {
                 ctx.ui.notify("Model openai/gpt-5.2 not found", "warning");
             }
@@ -223,14 +232,16 @@ export function registerSummarize(pi: ExtensionAPI, state: TauState): void {
                 },
             ];
 
-            const response = await complete(
-                model,
+            const request = opencodeSessionOptions(model, sessionId, auth.headers);
+            const { model: requestModel, ...trackingOptions } = request;
+            const response = await dependencies.complete(
+                requestModel,
                 { messages: summaryMessages },
                 {
                     apiKey: auth.apiKey,
-                    headers: auth.headers,
+                    ...trackingOptions,
                     reasoningEffort: "high",
-                }
+                } as Parameters<typeof dependencies.complete>[2]
             );
 
             const summary = response.content

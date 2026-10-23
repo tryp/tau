@@ -61,6 +61,7 @@ void describe("handoff /handoff command", () => {
                     notifications.push({ message, level }),
             },
             sessionManager: {
+                getSessionId: () => "test-session",
                 getBranch: () => [],
             },
         } as never;
