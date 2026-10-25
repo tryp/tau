@@ -312,19 +312,22 @@ function sendQueuedMessage(
     pi: ExtensionAPI,
     message: Parameters<ExtensionAPI["sendMessage"]>[0],
     options: QueuedMessageOptions
-): void {
+): boolean {
     // Same stale-ctx guard as cancelQueuedBackgroundNotification: delivery
     // happens from debounce timers and completion promise chains that can
-    // outlive the extension context that captured pi.
-    staleSafe(() =>
-        (
-            pi as ExtensionAPI & {
-                sendMessage: (
-                    message: Parameters<ExtensionAPI["sendMessage"]>[0],
-                    options: QueuedMessageOptions
-                ) => void;
-            }
-        ).sendMessage(message, options)
+    // outlive the extension context that captured pi. Callers that retain
+    // cancellation metadata must know whether the host accepted the message.
+    return (
+        staleSafe(() =>
+            (
+                pi as ExtensionAPI & {
+                    sendMessage: (
+                        message: Parameters<ExtensionAPI["sendMessage"]>[0],
+                        options: QueuedMessageOptions
+                    ) => void;
+                }
+            ).sendMessage(message, options)
+        ) !== "stale"
     );
 }
 
@@ -1501,6 +1504,14 @@ function recordCompletionTelemetry(
         }
     ).appendEntry;
     try {
+        if (pendingStaleCompletionSendCount > 0 && appendEntry) {
+            appendEntry("background-completion-telemetry", {
+                event: "stale-context-skipped",
+                count: pendingStaleCompletionSendCount,
+                at: Date.now(),
+            });
+            pendingStaleCompletionSendCount = 0;
+        }
         appendEntry?.("background-completion-telemetry", {
             event,
             at: Date.now(),
@@ -1513,6 +1524,7 @@ function recordCompletionTelemetry(
 }
 let completionAgentBusy = false;
 let completionLifecycleToken = 0;
+let pendingStaleCompletionSendCount = 0;
 let settledCompletionFlushTimer: NodeJS.Timeout | undefined;
 // Prevent duplicate notifications when both error and close handlers fire.
 // A Set (rather than WeakSet) lets cancellation restore a completion that was
@@ -1683,6 +1695,25 @@ function readGpuSnapshot(): string | null {
     }
 }
 
+function completeCompletionDeliveryHandoff(
+    delivery: PendingCompletionDelivery,
+    sent: boolean
+): void {
+    if (!sent) {
+        pendingStaleCompletionSendCount++;
+        return;
+    }
+
+    const { pi, state } = delivery;
+    pruneQueuedCompletionDeliveryMetadata(state);
+    queuedCompletionDeliveries.set(delivery.queueKey, delivery);
+    recordCompletionTelemetry(pi, "queued", {
+        queueKey: delivery.queueKey,
+        jobIds: delivery.jobs.map(({ job }) => job.id),
+    });
+    for (const { job } of delivery.jobs) pendingCompletionJobs.delete(job.id);
+}
+
 function deliverCompletionNotification(
     delivery: PendingCompletionDelivery
 ): void {
@@ -1694,17 +1725,6 @@ function deliverCompletionNotification(
     }
 
     const { pi, state } = delivery;
-    pruneQueuedCompletionDeliveryMetadata(state);
-    // Retain the host queue key after handoff. Acknowledgment may still cancel
-    // the message while it is queued behind an active agent turn.
-    queuedCompletionDeliveries.set(delivery.queueKey, delivery);
-    recordCompletionTelemetry(pi, "queued", {
-        queueKey: delivery.queueKey,
-        jobIds: delivery.jobs.map(({ job }) => job.id),
-    });
-    for (const { job } of delivery.jobs) {
-        pendingCompletionJobs.delete(job.id);
-    }
     const outstandingCount = countOutstandingJobs(state);
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
@@ -1739,7 +1759,7 @@ function deliverCompletionNotification(
         const gpuLine = readGpuSnapshot();
         const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
-        sendQueuedMessage(
+        const sent = sendQueuedMessage(
             pi,
             {
                 customType: "job-completion",
@@ -1788,6 +1808,7 @@ function deliverCompletionNotification(
                 queueKey: delivery.queueKey,
             }
         );
+        completeCompletionDeliveryHandoff(delivery, sent);
         return;
     }
 
@@ -1831,7 +1852,7 @@ function deliverCompletionNotification(
     const gpuLine = readGpuSnapshot();
     const resourceInfo = gpuLine ? `\nGPU: ${gpuLine}` : "";
 
-    sendQueuedMessage(
+    const sent = sendQueuedMessage(
         pi,
         {
             customType: "job-completion",
@@ -1867,6 +1888,7 @@ function deliverCompletionNotification(
             queueKey: delivery.queueKey,
         }
     );
+    completeCompletionDeliveryHandoff(delivery, sent);
 }
 
 function flushPendingCompletionDeliveries(): void {

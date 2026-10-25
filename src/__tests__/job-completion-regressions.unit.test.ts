@@ -43,7 +43,7 @@ function makeJob(
 
 function registerTestTools(
     state: TauState,
-    options: { holdFollowUps?: boolean } = {}
+    options: { holdFollowUps?: boolean; staleSend?: boolean } = {}
 ): {
     jobs: TestTool;
     jobDecide: TestTool;
@@ -53,6 +53,7 @@ function registerTestTools(
     queuedMessages: { message: unknown; options: { queueKey?: string } }[];
     processQueuedMessages: () => void;
     appendedEntries: { customType: string; data: Record<string, unknown> }[];
+    cancelledQueueKeys: string[];
     invoke: (event: string) => Promise<void>;
 } {
     let jobs: TestTool | undefined;
@@ -68,6 +69,7 @@ function registerTestTools(
         customType: string;
         data: Record<string, unknown>;
     }[] = [];
+    const cancelledQueueKeys: string[] = [];
     const pi = {
         on(event: string, handler: () => unknown) {
             handlers.set(event, handler);
@@ -84,6 +86,11 @@ function registerTestTools(
             message: unknown,
             messageOptions: { deliverAs?: string; queueKey?: string }
         ) {
+            if (options.staleSend) {
+                throw new Error(
+                    "This extension ctx is stale after session replacement or reload"
+                );
+            }
             sentMessageOptions.push(messageOptions);
             if (
                 options.holdFollowUps &&
@@ -98,6 +105,7 @@ function registerTestTools(
             appendedEntries.push({ customType, data });
         },
         cancelQueuedMessage(queueKey: string) {
+            cancelledQueueKeys.push(queueKey);
             const index = queuedMessages.findIndex(
                 (item) => item.options.queueKey === queueKey
             );
@@ -123,6 +131,7 @@ function registerTestTools(
             );
         },
         appendedEntries,
+        cancelledQueueKeys,
         invoke: async (event: string) => {
             await handlers.get(event)?.();
         },
@@ -140,6 +149,147 @@ function notificationContext() {
 void describe("job completion regression coverage", () => {
     afterEach(() => {
         clearAllCompletionBatches();
+    });
+
+    void it("does not retain or count a stale-host completion as queued", () => {
+        const state = new TauState();
+        const { pi, appendedEntries, cancelledQueueKeys } = registerTestTools(
+            state,
+            { staleSend: true }
+        );
+        const job = makeJob({
+            id: "job-stale-send-context",
+            status: "failed",
+            exitCode: 1,
+        });
+        state.backgroundJobs.set(job.id, job);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+
+        assert.deepEqual(appendedEntries, []);
+        state.cancelCompletionBatchForJob?.(job.id);
+        assert.deepEqual(
+            cancelledQueueKeys.filter((key) =>
+                key.startsWith("tau:bg:completion:")
+            ),
+            []
+        );
+
+        const nextState = new TauState();
+        const healthy = registerTestTools(nextState);
+        const nextJob = makeJob({
+            id: "job-after-stale-send",
+            status: "failed",
+            exitCode: 1,
+        });
+        nextState.backgroundJobs.set(nextJob.id, nextJob);
+        notifyCompletion(
+            nextJob,
+            nextState,
+            healthy.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        assert.deepEqual(
+            healthy.appendedEntries
+                .filter(
+                    (entry) =>
+                        entry.customType === "background-completion-telemetry"
+                )
+                .map((entry) => ({
+                    event: entry.data.event,
+                    count: entry.data.count,
+                })),
+            [
+                { event: "stale-context-skipped", count: 1 },
+                { event: "queued", count: undefined },
+            ]
+        );
+    });
+
+    void it("prunes completion metadata by session without losing other sessions' keys", () => {
+        const firstState = new TauState();
+        const first = registerTestTools(firstState, { holdFollowUps: true });
+        const oldJob = makeJob({
+            id: "job-pruned-old",
+            status: "failed",
+            exitCode: 1,
+        });
+        firstState.backgroundJobs.set(oldJob.id, oldJob);
+        notifyCompletion(
+            oldJob,
+            firstState,
+            first.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+
+        firstState.recentTerminalJobs = Array.from(
+            { length: 100 },
+            (_, index) =>
+                makeJob({
+                    id: `job-recent-${index}`,
+                    status: "failed",
+                    exitCode: 1,
+                })
+        );
+        const pruneTrigger = firstState.recentTerminalJobs[0];
+        assert.ok(pruneTrigger);
+        firstState.backgroundJobs.set(pruneTrigger.id, pruneTrigger);
+        notifyCompletion(
+            pruneTrigger,
+            firstState,
+            first.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        firstState.cancelCompletionBatchForJob?.(oldJob.id);
+        assert.deepEqual(
+            first.cancelledQueueKeys.filter((key) =>
+                key.startsWith("tau:bg:completion:")
+            ),
+            []
+        );
+
+        const secondState = new TauState();
+        const second = registerTestTools(secondState, { holdFollowUps: true });
+        const secondJob = makeJob({
+            id: "job-other-session-live",
+            status: "failed",
+            exitCode: 1,
+        });
+        secondState.backgroundJobs.set(secondJob.id, secondJob);
+        notifyCompletion(
+            secondJob,
+            secondState,
+            second.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+
+        // Another prune in the first session must leave the second session's
+        // cancellation metadata intact.
+        const nextTrigger = makeJob({
+            id: "job-prune-again",
+            status: "failed",
+            exitCode: 1,
+        });
+        firstState.backgroundJobs.set(nextTrigger.id, nextTrigger);
+        notifyCompletion(
+            nextTrigger,
+            firstState,
+            first.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        secondState.cancelCompletionBatchForJob?.(secondJob.id);
+        assert.equal(
+            second.cancelledQueueKeys.filter((key) =>
+                key.startsWith("tau:bg:completion:")
+            ).length,
+            1
+        );
+        assert.equal(second.queuedMessages.length, 0);
     });
 
     void it("suppresses a queued completion after attach consumes output", async () => {
