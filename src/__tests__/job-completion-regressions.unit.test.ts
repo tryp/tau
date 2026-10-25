@@ -1,5 +1,8 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     clearAllCompletionBatches,
     flushCompletionBatch,
@@ -38,41 +41,88 @@ function makeJob(
     };
 }
 
-function registerTestTools(state: TauState): {
+function registerTestTools(
+    state: TauState,
+    options: { holdFollowUps?: boolean } = {}
+): {
     jobs: TestTool;
+    jobDecide: TestTool;
     pi: { sendMessage(message: unknown): void };
     sentMessages: unknown[];
     sentMessageOptions: unknown[];
+    queuedMessages: { message: unknown; options: { queueKey?: string } }[];
+    processQueuedMessages: () => void;
+    appendedEntries: { customType: string; data: Record<string, unknown> }[];
     invoke: (event: string) => Promise<void>;
 } {
     let jobs: TestTool | undefined;
+    let jobDecide: TestTool | undefined;
     const handlers = new Map<string, () => unknown>();
     const sentMessages: unknown[] = [];
     const sentMessageOptions: unknown[] = [];
+    const queuedMessages: {
+        message: unknown;
+        options: { queueKey?: string };
+    }[] = [];
+    const appendedEntries: {
+        customType: string;
+        data: Record<string, unknown>;
+    }[] = [];
     const pi = {
         on(event: string, handler: () => unknown) {
             handlers.set(event, handler);
         },
         registerTool(tool: { name: string; execute: unknown }) {
             if (tool.name === "jobs") jobs = tool as TestTool;
+            if (tool.name === "job_decide") jobDecide = tool as TestTool;
         },
         registerCommand() {},
         registerMessageRenderer() {},
         registerToolPromptGuidelines() {},
         createBashTool: () => ({ execute: async () => ({ content: [] }) }),
-        sendMessage(message: unknown, options: unknown) {
-            sentMessages.push(message);
-            sentMessageOptions.push(options);
+        sendMessage(
+            message: unknown,
+            messageOptions: { deliverAs?: string; queueKey?: string }
+        ) {
+            sentMessageOptions.push(messageOptions);
+            if (
+                options.holdFollowUps &&
+                messageOptions.deliverAs === "followUp"
+            ) {
+                queuedMessages.push({ message, options: messageOptions });
+            } else {
+                sentMessages.push(message);
+            }
+        },
+        appendEntry(customType: string, data: Record<string, unknown>) {
+            appendedEntries.push({ customType, data });
+        },
+        cancelQueuedMessage(queueKey: string) {
+            const index = queuedMessages.findIndex(
+                (item) => item.options.queueKey === queueKey
+            );
+            if (index === -1) return false;
+            queuedMessages.splice(index, 1);
+            return true;
         },
     } as never;
 
     registerBackgroundJobs(pi, state);
     assert.ok(jobs, "jobs tool must be registered");
+    assert.ok(jobDecide, "job_decide tool must be registered");
     return {
         jobs,
+        jobDecide,
         pi,
         sentMessages,
         sentMessageOptions,
+        queuedMessages,
+        processQueuedMessages: () => {
+            sentMessages.push(
+                ...queuedMessages.splice(0).map((item) => item.message)
+            );
+        },
+        appendedEntries,
         invoke: async (event: string) => {
             await handlers.get(event)?.();
         },
@@ -249,8 +299,12 @@ void describe("job completion regression coverage", () => {
         assert.deepEqual(sentMessageOptions[0], {
             deliverAs: "followUp",
             triggerTurn: true,
-            queueKey: "tau:bg:job-settlement-boundary:completion",
+            queueKey: (sentMessageOptions[0] as { queueKey: string }).queueKey,
         });
+        assert.match(
+            (sentMessageOptions[0] as { queueKey: string }).queueKey,
+            /^tau:bg:completion:[0-9a-f-]{36}:\d+$/
+        );
     });
 
     void it("does not flush a settled batch into a newer agent run", async () => {
@@ -295,6 +349,291 @@ void describe("job completion regression coverage", () => {
         await invoke("session_shutdown");
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(sentMessages.length, 0);
+    });
+
+    void it("cancels a queued success after jobs output and records queue telemetry", async () => {
+        const state = new TauState();
+        const { jobs, pi, queuedMessages, sentMessages, appendedEntries } =
+            registerTestTools(state, {
+                holdFollowUps: true,
+            });
+        const dir = mkdtempSync(join(tmpdir(), "tau-completion-queue-"));
+        const job = makeJob({
+            id: "job-queued-known-success",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "known success output\n");
+        state.backgroundJobs.set(job.id, job);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 1, "completion must remain queued");
+
+        try {
+            await jobs.execute(
+                "tc-output-known",
+                { action: "output", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(job.outputConsumed, true);
+            assert.equal(
+                queuedMessages.length,
+                0,
+                "acknowledgment cancels queued completion"
+            );
+            assert.equal(
+                sentMessages.length,
+                0,
+                "known result must not be processed later"
+            );
+            assert.deepEqual(
+                appendedEntries
+                    .filter(
+                        (entry) =>
+                            entry.customType ===
+                            "background-completion-telemetry"
+                    )
+                    .map((entry) => entry.data.event),
+                ["queued", "cancelled"]
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("cancels a queued completion when job_decide check acknowledges output", async () => {
+        const state = new TauState();
+        const { jobDecide, pi, queuedMessages, sentMessages } =
+            registerTestTools(state, {
+                holdFollowUps: true,
+            });
+        const dir = mkdtempSync(join(tmpdir(), "tau-completion-check-"));
+        const job = makeJob({
+            id: "job-decide-check-known",
+            status: "failed",
+            exitCode: 4,
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "checked failure output\n");
+        state.backgroundJobs.set(job.id, job);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        try {
+            await jobDecide.execute(
+                "tc-check-known",
+                { jobId: job.id, decision: "check" },
+                null,
+                null,
+                null
+            );
+            assert.equal(job.outputConsumed, true);
+            assert.equal(queuedMessages.length, 0);
+            assert.equal(sentMessages.length, 0);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("cancels a queued completion when terminal attach consumes output", async () => {
+        const state = new TauState();
+        const { jobs, pi, queuedMessages } = registerTestTools(state, {
+            holdFollowUps: true,
+        });
+        const dir = mkdtempSync(join(tmpdir(), "tau-completion-attach-"));
+        const job = makeJob({
+            id: "job-attach-known",
+            status: "failed",
+            exitCode: 5,
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "attached failure output\n");
+        state.backgroundJobs.set(job.id, job);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        try {
+            await jobs.execute(
+                "tc-attach-known",
+                { action: "attach", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(job.outputConsumed, true);
+            assert.equal(queuedMessages.length, 0);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("rebuilds a cancelled batch with only unseen sibling completions", async () => {
+        const state = new TauState();
+        const {
+            jobs,
+            pi,
+            queuedMessages,
+            sentMessages,
+            processQueuedMessages,
+        } = registerTestTools(state, { holdFollowUps: true });
+        const dir = mkdtempSync(join(tmpdir(), "tau-completion-batch-"));
+        const known = makeJob({
+            id: "job-batch-known",
+            status: "failed",
+            exitCode: 2,
+            logPath: join(dir, "known.log"),
+        });
+        const unseen = makeJob({
+            id: "job-batch-unseen",
+            status: "failed",
+            exitCode: 3,
+            logPath: join(dir, "unseen.log"),
+        });
+        writeFileSync(known.logPath, "known output\n");
+        writeFileSync(unseen.logPath, "unseen output\n");
+        state.backgroundJobs.set(known.id, known);
+        state.backgroundJobs.set(unseen.id, unseen);
+        notifyCompletion(known, state, pi as never, notificationContext());
+        notifyCompletion(unseen, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 1);
+        const originalQueueKey = queuedMessages[0]?.options.queueKey;
+
+        try {
+            await jobs.execute(
+                "tc-output-known",
+                { action: "output", jobId: known.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(
+                queuedMessages.length,
+                1,
+                "unseen sibling is re-queued"
+            );
+            assert.notEqual(
+                queuedMessages[0]?.options.queueKey,
+                originalQueueKey
+            );
+            processQueuedMessages();
+            const message = sentMessages[0] as { content: string };
+            assert.ok(message.content.includes(unseen.id));
+            assert.ok(!message.content.includes(known.id));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("keeps independent queue keys through agent_start and cancels only the acknowledged job", async () => {
+        const state = new TauState();
+        const { jobs, pi, queuedMessages, invoke } = registerTestTools(state, {
+            holdFollowUps: true,
+        });
+        const dir = mkdtempSync(join(tmpdir(), "tau-completion-independent-"));
+        const first = makeJob({
+            id: "job-queue-first",
+            status: "failed",
+            exitCode: 1,
+            logPath: join(dir, "first.log"),
+        });
+        const second = makeJob({
+            id: "job-queue-second",
+            status: "failed",
+            exitCode: 2,
+            logPath: join(dir, "second.log"),
+        });
+        writeFileSync(first.logPath, "first failure\n");
+        writeFileSync(second.logPath, "second failure\n");
+        state.backgroundJobs.set(first.id, first);
+        state.backgroundJobs.set(second.id, second);
+        notifyCompletion(first, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        notifyCompletion(second, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 2);
+        const secondQueueKey = queuedMessages[1]?.options.queueKey;
+
+        try {
+            await invoke("agent_start");
+            await jobs.execute(
+                "tc-output-first",
+                { action: "output", jobId: first.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(queuedMessages.length, 1);
+            assert.equal(queuedMessages[0]?.options.queueKey, secondQueueKey);
+            assert.equal(
+                queuedMessages[0]?.message &&
+                    (
+                        queuedMessages[0].message as { content: string }
+                    ).content.includes(second.id),
+                true
+            );
+            await invoke("agent_settled");
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("does not re-emit batch siblings after cancellation loses the delivery race", async () => {
+        const state = new TauState();
+        const {
+            pi,
+            queuedMessages,
+            processQueuedMessages,
+            sentMessages,
+            appendedEntries,
+            invoke,
+        } = registerTestTools(state, { holdFollowUps: true });
+        const acknowledged = makeJob({
+            id: "job-delivered-before-ack",
+            status: "failed",
+            exitCode: 1,
+        });
+        const sibling = makeJob({
+            id: "job-delivered-sibling",
+            status: "failed",
+            exitCode: 2,
+        });
+        notifyCompletion(
+            acknowledged,
+            state,
+            pi as never,
+            notificationContext()
+        );
+        notifyCompletion(sibling, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        processQueuedMessages();
+        await invoke("agent_start");
+        state.cancelCompletionBatchForJob?.(acknowledged.id);
+        assert.equal(queuedMessages.length, 0);
+        assert.equal(
+            sentMessages.length,
+            1,
+            "delivered batch is never re-emitted"
+        );
+        assert.ok(
+            (sentMessages[0] as { content: string }).content.includes(
+                sibling.id
+            )
+        );
+        assert.deepEqual(
+            appendedEntries
+                .filter(
+                    (entry) =>
+                        entry.customType === "background-completion-telemetry"
+                )
+                .map((entry) => entry.data.event),
+            ["queued", "cancel-miss"]
+        );
+        await invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     void it("does not deliver duplicate notifications for one terminal job", async () => {

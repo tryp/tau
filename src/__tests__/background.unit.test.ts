@@ -706,7 +706,7 @@ void describe("TUI kill — outputConsumed", () => {
 // ─── TUI attach — cancels superseded queued notifications ────────────
 
 void describe("TUI attach — cancels superseded queued notifications", () => {
-    void it("posts bg-attach and cancels timeout/stall/completion keys", async () => {
+    void it("posts bg-attach and cancels timeout/stall warnings", async () => {
         const state = new TauState();
         const logDir = mkdtempSync(join(tmpdir(), "tau-attach-test-"));
         const logPath = join(logDir, "job.log");
@@ -775,7 +775,6 @@ void describe("TUI attach — cancels superseded queued notifications", () => {
         assert.equal(sent[0].customType, "bg-attach");
         assert.equal(sent[0].details?.jobId, "job-99999-5");
         assert.deepEqual([...cancelledKeys].sort(), [
-            "tau:bg:job-99999-5:completion",
             "tau:bg:job-99999-5:stall",
             "tau:bg:job-99999-5:timeout",
         ]);

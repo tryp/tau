@@ -10,6 +10,7 @@ import {
     type ChildProcess,
     type SpawnOptions,
 } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
     closeSync,
     existsSync,
@@ -299,9 +300,6 @@ export function cancelQueuedBackgroundNotifications(
 ): void {
     cancelQueuedBackgroundNotification(pi, jobId, "timeout");
     cancelQueuedBackgroundNotification(pi, jobId, "stall");
-    // Completion batches intentionally have no per-job key. This cancellation
-    // is effective only for single-job completion messages.
-    cancelQueuedBackgroundNotification(pi, jobId, "completion");
 }
 
 type QueuedMessageOptions = {
@@ -1454,9 +1452,65 @@ type PendingCompletionDelivery = {
     jobs: CompletionBatchItem[];
     pi: ExtensionAPI;
     state: TauState;
+    queueKey: string;
 };
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
+const queuedCompletionDeliveries = new Map<string, PendingCompletionDelivery>();
+const completionDeliveryInstance = randomUUID();
+let completionDeliverySequence = 0;
+
+function nextCompletionQueueKey(): string {
+    return `tau:bg:completion:${completionDeliveryInstance}:${++completionDeliverySequence}`;
+}
+
+function pruneQueuedCompletionDeliveryMetadata(state: TauState): void {
+    // Keep metadata only for jobs still addressable in the active/recent job
+    // registry. recentTerminalJobs is capped, so retained delivery metadata is
+    // bounded without mutating the host queue or dropping live job keys.
+    if (state.recentTerminalJobs.length < MAX_RECENT_TERMINAL) return;
+    const addressable = new Set([
+        ...state.backgroundJobs.values(),
+        ...state.recentTerminalJobs,
+    ]);
+    for (const [queueKey, delivery] of queuedCompletionDeliveries) {
+        if (delivery.state !== state) continue;
+        // Keep every item in a live keyed batch: removing an older sibling
+        // would silently lose its notification when another member is acked.
+        if (!delivery.jobs.some(({ job }) => addressable.has(job))) {
+            queuedCompletionDeliveries.delete(queueKey);
+            recordCompletionTelemetry(delivery.pi, "metadata-pruned", {
+                queueKey,
+                jobIds: delivery.jobs.map(({ job }) => job.id),
+            });
+        }
+    }
+}
+
+function recordCompletionTelemetry(
+    pi: ExtensionAPI,
+    event: string,
+    fields: { queueKey?: string; jobIds?: string[] } = {}
+): void {
+    const appendEntry = (
+        pi as ExtensionAPI & {
+            appendEntry?: (
+                customType: string,
+                data: Record<string, unknown>
+            ) => void;
+        }
+    ).appendEntry;
+    try {
+        appendEntry?.("background-completion-telemetry", {
+            event,
+            at: Date.now(),
+            ...(fields.queueKey ? { queueKey: fields.queueKey } : {}),
+            ...(fields.jobIds ? { jobIds: fields.jobIds } : {}),
+        });
+    } catch {
+        // Telemetry must never interfere with completion delivery or cancellation.
+    }
+}
 let completionAgentBusy = false;
 let completionLifecycleToken = 0;
 let settledCompletionFlushTimer: NodeJS.Timeout | undefined;
@@ -1640,8 +1694,14 @@ function deliverCompletionNotification(
     }
 
     const { pi, state } = delivery;
-    // The message is now being handed to pi; cancellation after this point
-    // must not restore it as an autonomous wake.
+    pruneQueuedCompletionDeliveryMetadata(state);
+    // Retain the host queue key after handoff. Acknowledgment may still cancel
+    // the message while it is queued behind an active agent turn.
+    queuedCompletionDeliveries.set(delivery.queueKey, delivery);
+    recordCompletionTelemetry(pi, "queued", {
+        queueKey: delivery.queueKey,
+        jobIds: delivery.jobs.map(({ job }) => job.id),
+    });
     for (const { job } of delivery.jobs) {
         pendingCompletionJobs.delete(job.id);
     }
@@ -1725,7 +1785,7 @@ function deliverCompletionNotification(
             {
                 deliverAs: "followUp",
                 triggerTurn: true,
-                queueKey: backgroundNotificationKey(job.id, "completion"),
+                queueKey: delivery.queueKey,
             }
         );
         return;
@@ -1804,6 +1864,7 @@ function deliverCompletionNotification(
         {
             deliverAs: "followUp",
             triggerTurn: true,
+            queueKey: delivery.queueKey,
         }
     );
 }
@@ -1834,7 +1895,12 @@ function queueCompletionDelivery(
         for (const { job } of jobsToDeliver)
             deliveringCompletionJobIds.delete(job.id);
     }
-    pendingCompletionDeliveries.push({ jobs: jobsToDeliver, pi, state });
+    pendingCompletionDeliveries.push({
+        jobs: jobsToDeliver,
+        pi,
+        state,
+        queueKey: nextCompletionQueueKey(),
+    });
     flushPendingCompletionDeliveries();
 }
 
@@ -1844,6 +1910,41 @@ function queueCompletionDelivery(
  * notifications for jobs the agent has already acknowledged.
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
+    // Completion messages already handed to pi remain cancellable while queued.
+    // A false result is the delivery boundary: do not re-emit siblings because
+    // the original batch may already have reached the agent.
+    for (const [queueKey, delivery] of queuedCompletionDeliveries) {
+        if (!delivery.jobs.some((item) => item.job.id === jobId)) continue;
+        const cancel = (
+            delivery.pi as ExtensionAPI & {
+                cancelQueuedMessage?: (key: string) => boolean;
+            }
+        ).cancelQueuedMessage;
+        const cancelled = staleSafe(() => cancel?.(queueKey));
+        queuedCompletionDeliveries.delete(queueKey);
+        recordCompletionTelemetry(
+            delivery.pi,
+            cancelled === true ? "cancelled" : "cancel-miss",
+            { queueKey, jobIds: [jobId] }
+        );
+        if (cancelled !== true) continue;
+
+        delivery.jobs = delivery.jobs.filter((item) => item.job.id !== jobId);
+        if (completionNeedsDelivery(delivery.jobs)) {
+            recordCompletionTelemetry(delivery.pi, "rebuilt", {
+                queueKey,
+                jobIds: delivery.jobs.map(({ job }) => job.id),
+            });
+            queueCompletionDelivery(delivery.jobs, delivery.pi, delivery.state);
+        } else {
+            const wakeStates = new Set<TauState>();
+            for (const { job } of delivery.jobs) {
+                restoreCompletionForWake(job, wakeStates, delivery.state);
+            }
+            for (const wakeState of wakeStates) wakeState.wakeupEvaluate?.();
+        }
+    }
+
     // The indexing promise may not have queued the job yet. Invalidate that
     // callback and restore the terminal result unless delivery is already in
     // progress (where this cancellation is only clearing linked callbacks).
@@ -1921,6 +2022,28 @@ export function clearJobFromCompletionBatch(jobId: string): void {
 export function clearAllCompletionBatches(): void {
     completionBatchGeneration++;
     const wakeStates = new Set<TauState>();
+    for (const [queueKey, delivery] of queuedCompletionDeliveries) {
+        const cancel = (
+            delivery.pi as ExtensionAPI & {
+                cancelQueuedMessage?: (key: string) => boolean;
+            }
+        ).cancelQueuedMessage;
+        const cancelled = staleSafe(() => cancel?.(queueKey));
+        recordCompletionTelemetry(
+            delivery.pi,
+            cancelled === true ? "cancelled-all" : "cancel-miss-all",
+            {
+                queueKey,
+                jobIds: delivery.jobs.map(({ job }) => job.id),
+            }
+        );
+        if (cancelled === true) {
+            for (const { job } of delivery.jobs) {
+                restoreCompletionForWake(job, wakeStates, delivery.state);
+            }
+        }
+    }
+    queuedCompletionDeliveries.clear();
     for (const [jobId, job] of pendingCompletionJobs) {
         if (deliveringCompletionJobIds.has(jobId)) continue;
         completionNotifiedJobs.delete(job);
@@ -1947,6 +2070,7 @@ export function clearAllCompletionBatches(): void {
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
     pendingCompletionDeliveries.length = 0;
+    queuedCompletionDeliveries.clear();
 }
 
 /** Send a structured completion notification to the agent. */
@@ -3227,6 +3351,7 @@ export function registerBackgroundJobs(
                         // suppress completion notification and cancel reminds.
                         if (job.status !== "running") {
                             job.outputConsumed = true;
+                            state.cancelCompletionBatchForJob?.(job.id);
                             cancelCallbacksForJob(job.id);
                             cancelQueuedBackgroundNotifications(pi, job.id);
                             state.wakeupEvaluate?.();
@@ -3427,6 +3552,7 @@ export function registerBackgroundJobs(
                             outputReadFailed(job, output)
                         );
                         job.outputConsumed = true;
+                        state.cancelCompletionBatchForJob?.(job.id);
                         cancelQueuedBackgroundNotifications(pi, job.id);
                         state.wakeupEvaluate?.();
                         return {
@@ -3550,7 +3676,10 @@ export function registerBackgroundJobs(
                         outputReadFailed(job, output)
                     );
                     const source = await sourceDetailsForJob(job);
-                    if (job.status !== "running") job.outputConsumed = true;
+                    if (job.status !== "running") {
+                        job.outputConsumed = true;
+                        state.cancelCompletionBatchForJob?.(job.id);
+                    }
                     cancelQueuedBackgroundNotifications(pi, job.id);
                     state.wakeupEvaluate?.();
 
@@ -3731,6 +3860,7 @@ export function registerBackgroundJobs(
                     // suppress completion notification and cancel reminds.
                     if (job.status !== "running") {
                         job.outputConsumed = true;
+                        state.cancelCompletionBatchForJob?.(job.id);
                         cancelCallbacksForJob(job.id);
                         state.wakeupEvaluate?.();
                     }
