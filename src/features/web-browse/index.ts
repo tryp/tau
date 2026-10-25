@@ -1881,7 +1881,7 @@ export function registerWebBrowse(pi: ExtensionAPI, state: TauState): void {
 
 // ── Shared content extraction ───────────────────────────────────────
 
-async function extractPageContent(
+export async function extractPageContent(
     page: PlaywrightPage,
     params: {
         format: "text" | "markdown" | "structure";
@@ -1917,9 +1917,7 @@ async function extractPageContent(
 
     switch (params.format) {
         case "markdown": {
-            const md: string = await page.evaluate(() =>
-                window.__domToMarkdown()
-            );
+            const md: string = await page.evaluate(domToMarkdown);
             return {
                 content: [
                     {
@@ -1962,9 +1960,7 @@ async function extractPageContent(
                 }
             }
 
-            const data: unknown = await page.evaluate(() =>
-                window.__domToStructure()
-            );
+            const data: unknown = await page.evaluate(domToStructure);
             return {
                 content: [
                     {
@@ -2035,19 +2031,15 @@ async function extractPageContent(
     }
 }
 
-async function extractFinalContent(
+export async function extractFinalContent(
     page: PlaywrightPage,
     returnFormat: "text" | "markdown" | "structure"
 ): Promise<string> {
     switch (returnFormat) {
         case "markdown":
-            await ensureConverters(page);
-            return await page.evaluate((): string => window.__domToMarkdown());
+            return await page.evaluate(domToMarkdown);
         case "structure": {
-            await ensureConverters(page);
-            const data: unknown = await page.evaluate(() =>
-                window.__domToStructure()
-            );
+            const data: unknown = await page.evaluate(domToStructure);
             return JSON.stringify(data, null, 2);
         }
         default:
