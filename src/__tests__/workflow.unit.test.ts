@@ -465,3 +465,81 @@ void describe("workflow listWorkflows", () => {
         assert.deepEqual(workflows, []);
     });
 });
+
+// ─── getPiInvocation model-arg tests ─────────────────────────────────
+// A workflow agent's per-call `model` (agent(prompt, { model })) reaches the
+// child as a `--model` flag inside `args`. Whatever branch of getPiInvocation
+// resolves the entry point, the flag must survive verbatim — this is the only
+// seam that could silently eat a parallel batch's model overrides.
+
+const MODEL_ARGS = [
+    "-p",
+    "--mode",
+    "json",
+    "--no-session",
+    "--model",
+    "openai-codex/gpt-6-luna",
+    "@/tmp/prompt.md",
+];
+
+void describe("workflow getPiInvocation preserves model args", () => {
+    void it("keeps --model when re-invoking the running entry script", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const invocation = getPiInvocation(
+            MODEL_ARGS,
+            {
+                argv1: "/home/dev/.pi/agent/local/pi-tau/index.ts",
+                execPath: "/usr/bin/node",
+                platform: "linux",
+            },
+            () => true
+        );
+        assert.equal(invocation.command, "/usr/bin/node");
+        assert.ok(invocation.args.includes("--model"));
+        assert.equal(
+            invocation.args[invocation.args.indexOf("--model") + 1],
+            "openai-codex/gpt-6-luna"
+        );
+        assert.deepEqual(invocation.args.slice(1), MODEL_ARGS);
+    });
+
+    void it("keeps --model on the generic runtime branch", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const invocation = getPiInvocation(MODEL_ARGS, {
+            argv1: undefined,
+            execPath: "/usr/bin/node",
+            platform: "linux",
+        });
+        assert.equal(invocation.command, "pi");
+        assert.deepEqual(invocation.args, MODEL_ARGS);
+    });
+
+    void it("keeps --model when execPath is not a generic runtime", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const invocation = getPiInvocation(MODEL_ARGS, {
+            argv1: undefined,
+            execPath: "/opt/pi/bin/pi-runtime",
+            platform: "linux",
+        });
+        assert.equal(invocation.command, "/opt/pi/bin/pi-runtime");
+        assert.deepEqual(invocation.args, MODEL_ARGS);
+    });
+
+    void it("omits --model entirely when no model is set, so the child uses its default", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const args = [
+            "-p",
+            "--mode",
+            "json",
+            "--no-session",
+            "@/tmp/prompt.md",
+        ];
+        const invocation = getPiInvocation(args, {
+            argv1: undefined,
+            execPath: "/usr/bin/node",
+            platform: "linux",
+        });
+        assert.deepEqual(invocation.args, args);
+        assert.ok(!invocation.args.includes("--model"));
+    });
+});
