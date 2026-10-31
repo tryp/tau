@@ -13,6 +13,7 @@
 RUNTIME_DIR ?= $(HOME)/.pi/agent/local/pi-tau
 SMOKE_SCRIPT ?= /home/dev/src/pi-session-analysis/scripts/predeploy_smoke.py
 SMOKE_TIMEOUT ?= 90
+PI_SESSION_ANALYSIS_DIR ?= /home/dev/src/pi-session-analysis
 
 # Files that are intentionally runtime-only and never deployed:
 #   .deployed-commit  — deploy stamp (source commit + timestamp + notice)
@@ -26,7 +27,7 @@ RSYNC_EXCLUDES := \
 	--exclude '.deployed-commit' \
 	--exclude 'README.md'
 
-.PHONY: deploy runtime-deps verify smoke-test deployed-commit
+.PHONY: deploy runtime-deps verify smoke-test deployed-commit record-deploy-ledger
 
 deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
 	@test -z "$$(git status --porcelain)" || { echo "ERROR: commit source changes before deploying" >&2; git status --short >&2; exit 1; }
@@ -45,6 +46,16 @@ deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
 		> "$(RUNTIME_DIR)/.deployed-commit"
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
+	@$(MAKE) --no-print-directory record-deploy-ledger
+
+record-deploy-ledger:
+	@if [ "$${SKIP_DEPLOY_LEDGER:-0}" = 1 ]; then \
+		echo "Skipping deploy ledger recording (SKIP_DEPLOY_LEDGER=1)."; \
+	elif [ ! -x "$(PI_SESSION_ANALYSIS_DIR)/scripts/record-deploy" ]; then \
+		echo "Skipping deploy ledger recording: pi-session-analysis recorder not found at $(PI_SESSION_ANALYSIS_DIR)/scripts/record-deploy."; \
+	elif ! "$(PI_SESSION_ANALYSIS_DIR)/scripts/record-deploy"; then \
+		echo "WARNING: deploy succeeded, but deploy ledger recording failed." >&2; \
+	fi
 
 runtime-deps:  ## Install locked production dependencies into the deployed copy
 	@test -f "$(RUNTIME_DIR)/package.json" || { echo "ERROR: deployed package.json missing" >&2; exit 1; }
