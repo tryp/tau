@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
@@ -426,9 +427,10 @@ void describe("indexJobOutputInSidecar", () => {
         // This matters because bash_bg is the high-value case: 54% of background
         // jobs end in a limiter, and a job's log is the only record it has.
         createDb(tmpDir);
-        const full = Array.from({ length: 60 }, (_, i) => `bg-line-${i + 1}`).join(
-            "\n"
-        );
+        const full = Array.from(
+            { length: 60 },
+            (_, i) => `bg-line-${i + 1}`
+        ).join("\n");
         const job = testJob({
             id: "job-bg-hoisted",
             command: planPipeNerf("make test 2>&1 | tail -3").rewritten,
@@ -436,7 +438,10 @@ void describe("indexJobOutputInSidecar", () => {
         });
 
         // The rewrite must strip the pipe so the job writes an unfiltered log.
-        assert.equal(planPipeNerf("make test 2>&1 | tail -3").rewritten, "make test 2>&1");
+        assert.equal(
+            planPipeNerf("make test 2>&1 | tail -3").rewritten,
+            "make test 2>&1"
+        );
 
         const outcome = await indexJobOutputWithOutcome(
             job,
@@ -470,7 +475,10 @@ void describe("indexJobOutputInSidecar", () => {
             { useExternalApi: false }
         );
         assert.equal(outcome.status, "indexed");
-        assert.equal(await readJobOutputFromSidecar("job-bg-small"), "one\ntwo\nthree");
+        assert.equal(
+            await readJobOutputFromSidecar("job-bg-small"),
+            "one\ntwo\nthree"
+        );
     });
 
     void it("classifies an unavailable sidecar without failing the job", async () => {
@@ -537,12 +545,11 @@ void describe("indexJobOutputInSidecar", () => {
             logPath: join(tmpDir, "missing-output.log"),
         });
         const outcome = await indexJobOutputWithOutcome(job, {});
-        assert.deepEqual(outcome, {
-            status: "failed",
-            eligible: false,
-            reason: "read_failed",
-            errorCategory: "io",
-        });
+        assert.equal(outcome.status, "failed");
+        assert.equal(outcome.eligible, false);
+        assert.equal(outcome.reason, "read_failed");
+        assert.equal(outcome.errorCategory, "io");
+        assert.match(outcome.errorMessage ?? "", /missing-output\.log/);
         assert.deepEqual(getSidecarIndexStats(), {
             attempts: 1,
             eligible: 0,
@@ -847,9 +854,10 @@ void describe("indexJobOutputInSidecar", () => {
         // exactly where the default would skip the index and the rest of the
         // output would exist nowhere.
         createDb(tmpDir);
-        const output = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join(
-            "\n"
-        );
+        const output = Array.from(
+            { length: 60 },
+            (_, i) => `line-${i + 1}`
+        ).join("\n");
         assert.ok(output.split("\n").length <= INLINE_CONTEXT_MAX_LINES);
         const job = testJob({
             id: "job-forced-small",
@@ -867,22 +875,133 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(plain.truncated, false);
 
         // With force: indexed, receipt returned, full output recoverable.
-        const forced = await prepareInlineOutput(job, { cwd: tmpDir }, output, "bash", {
-            force: true,
-        });
+        const forced = await prepareInlineOutput(
+            job,
+            { cwd: tmpDir },
+            output,
+            "bash",
+            {
+                force: true,
+            }
+        );
         assert.ok(forced.source, "a forced index must produce a source");
         assert.equal(forced.truncated, true);
         assert.match(forced.text, /\[context-sidecar\]/);
         assert.equal(await readJobOutputFromSidecar(job.id), output);
     });
 
+    void it("waits for a concurrent writer and records the retry wait", async () => {
+        const db = createDb(tmpDir);
+        db.close();
+        const configured = new DatabaseSync(join(tmpDir, "context.db"), {
+            enableForeignKeyConstraints: true,
+            timeout: 5_000,
+        });
+        assert.equal(
+            (
+                configured.prepare("PRAGMA busy_timeout").get() as {
+                    timeout: number;
+                }
+            ).timeout,
+            5_000
+        );
+        configured.close();
+        const dbPath = join(tmpDir, "context.db");
+        const holder = spawn(
+            process.execPath,
+            [
+                "-e",
+                `const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); process.stdout.write('LOCKED'); setTimeout(() => { db.exec('COMMIT'); db.close(); }, 250);`,
+                dbPath,
+            ],
+            { stdio: ["ignore", "pipe", "inherit"] }
+        );
+        await new Promise<void>((resolve, reject) => {
+            let output = "";
+            holder.stdout.on("data", (chunk: Buffer) => {
+                output += chunk.toString();
+                if (output.includes("LOCKED")) resolve();
+            });
+            holder.once("error", reject);
+            holder.once("exit", (code) => {
+                if (code !== 0) reject(new Error(`lock holder exited ${code}`));
+            });
+        });
+        const job = testJob({
+            id: "job-lock-wait",
+            logPath: writeLog("waited output"),
+        });
+        const telemetry: { type: string; data: unknown }[] = [];
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            { appendEntry: (type, data) => telemetry.push({ type, data }) },
+            "bash",
+            { useExternalApi: false }
+        );
+        assert.equal(outcome.status, "indexed");
+        assert.equal(outcome.retryCount, 0);
+        assert.ok((outcome.waitMs ?? 0) >= 150, `waitMs=${outcome.waitMs}`);
+        assert.equal(telemetry[0]?.type, "sidecar-index-wait");
+        assert.ok(telemetry[0]?.data);
+        await new Promise<void>((resolve, reject) => {
+            holder.once("exit", (code) =>
+                code === 0 ? resolve() : reject(new Error(`exit ${code}`))
+            );
+        });
+    });
+
+    void it("preserves sqlite errors and emits one warning per session/category", async () => {
+        const db = createDb(tmpDir);
+        db.exec(
+            `CREATE TRIGGER reject_chunk BEFORE INSERT ON context_chunks BEGIN SELECT RAISE(ABORT, 'fixture sqlite failure'); END;`
+        );
+        db.close();
+        const job = testJob({
+            id: "job-sqlite-error",
+            logPath: writeLog("fixture output"),
+        });
+        const entries: unknown[] = [];
+        const context = {
+            sessionManager: { getSessionId: () => "warning-session-fixture" },
+            appendEntry: (_type: string, value: unknown) => entries.push(value),
+        };
+        const errors: string[] = [];
+        const originalError = console.error;
+        console.error = (...args: unknown[]) => errors.push(args.join(" "));
+        try {
+            const first = await indexJobOutputWithOutcome(
+                job,
+                context,
+                "bash",
+                {
+                    useExternalApi: false,
+                }
+            );
+            const second = await indexJobOutputWithOutcome(
+                { ...job, id: "job-sqlite-error-2" },
+                context,
+                "bash",
+                { useExternalApi: false }
+            );
+            assert.equal(first.status, "failed");
+            assert.match(first.errorMessage ?? "", /fixture sqlite failure/);
+            assert.ok(first.errorCode);
+            assert.equal(second.status, "failed");
+            assert.equal(errors.length, 1);
+            assert.equal(entries.length, 2);
+        } finally {
+            console.error = originalError;
+        }
+    });
+
     void it("keeps inline text when a forced index cannot be created", async () => {
         // A forced index must never make the result worse: if the sidecar is
         // unavailable, the output is returned as-is rather than replaced by a
         // receipt that points nowhere.
-        const output = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join(
-            "\n"
-        );
+        const output = Array.from(
+            { length: 60 },
+            (_, i) => `line-${i + 1}`
+        ).join("\n");
         const job = testJob({
             id: "job-forced-no-db",
             logPath: writeLog(output),

@@ -45,6 +45,10 @@ export interface SidecarIndexOutcome {
         | "read_failed"
         | "index_failed";
     errorCategory?: "io" | "schema" | "unavailable" | "unknown";
+    errorMessage?: string;
+    errorCode?: string | number;
+    retryCount?: number;
+    waitMs?: number;
 }
 
 /** Cumulative sidecar indexing counters for diagnostics and analysis. */

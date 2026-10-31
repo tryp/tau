@@ -37,6 +37,7 @@ const SIDECAR_SEARCH_TOOL_NAMES = ["bash", ...SIDECAR_TOOL_NAMES] as const;
 /** Context for the indexing call — cwd + session identity. */
 export interface SidecarContext {
     cwd?: string;
+    appendEntry?: (customType: string, data: unknown) => void;
     sessionManager?: {
         // pi-core's ExtensionContext returns string | undefined; indexers
         // normalize via ?? null, so accept both.
@@ -58,6 +59,8 @@ export interface SidecarSourceMatch extends JobOutputIndex {
     createdAt: number;
     inputSummary: string;
 }
+
+const warnedIndexFailures = new Set<string>();
 
 let sidecarIndexStats: SidecarIndexStats = {
     attempts: 0,
@@ -128,6 +131,7 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
     try {
         const db = new DatabaseSync(dbPath, {
             enableForeignKeyConstraints: true,
+            timeout: 5_000,
         });
         try {
             // Select IDs to delete so we can log the count
@@ -161,16 +165,13 @@ export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
                 ).run(...batch);
             }
 
-            // VACUUM to reclaim free pages (fast at startup — no concurrent
-            // readers). For DBs with thousands of old entries this may take
-            // ~100-500ms; acceptable at startup where overall init time is
-            // dominated by model loading, not DB maintenance.
-            db.prepare("VACUUM").run();
+            // Reclaim free pages incrementally without rewriting the full DB.
+            db.prepare("PRAGMA incremental_vacuum(1000)").run();
 
             // Minimal logging — visible in pi startup output
             console.error(
                 `[tau] purged ${toDelete.length} sidecar entries older than ${ageDays} days, ` +
-                    `VACUUM reclaimed freed space`
+                    `incremental vacuum ran`
             );
         } finally {
             db.close();
@@ -225,6 +226,7 @@ export function findJobSourceDetailsInSidecar(
     try {
         const db = new DatabaseSync(dbPath, {
             enableForeignKeyConstraints: true,
+            timeout: 5_000,
         });
         try {
             const tableCheck = db
@@ -267,6 +269,7 @@ export function searchSidecarSources(
     try {
         const db = new DatabaseSync(dbPath, {
             enableForeignKeyConstraints: true,
+            timeout: 5_000,
         });
         try {
             const tableCheck = db
@@ -328,6 +331,7 @@ export async function readJobOutputDetailsFromSidecar(
     try {
         const db = new DatabaseSync(dbPath, {
             enableForeignKeyConstraints: true,
+            timeout: 5_000,
         });
         try {
             const tableCheck = db
@@ -611,7 +615,12 @@ export async function prepareInlineOutput(
         );
         if (indexOutcome.source) {
             return {
-                text: formatSidecarReceipt(toolName, indexOutcome.source, bytes, totalLines),
+                text: formatSidecarReceipt(
+                    toolName,
+                    indexOutcome.source,
+                    bytes,
+                    totalLines
+                ),
                 truncated: true,
                 partial: true,
                 totalLines,
@@ -778,6 +787,7 @@ async function indexViaDirectDb(
 
     const db = new DatabaseSync(dbPath, {
         enableForeignKeyConstraints: true,
+        timeout: 5_000,
     });
 
     try {
@@ -886,6 +896,15 @@ async function indexViaDirectDb(
     }
 }
 
+function getSqliteErrorCode(error: unknown): string | number | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const sqliteError = error as { code?: unknown; errcode?: unknown };
+    const code = sqliteError.code ?? sqliteError.errcode;
+    return typeof code === "string" || typeof code === "number"
+        ? code
+        : undefined;
+}
+
 /**
  * Index a completed job's output and classify the result for diagnostics.
  *
@@ -910,12 +929,17 @@ export async function indexJobOutputWithOutcome(
     let text: string;
     try {
         text = await readFile(job.logPath, "utf-8");
-    } catch {
+    } catch (error) {
+        const errorMessage =
+            error instanceof Error ? error.message : String(error);
+        const errorCode = getSqliteErrorCode(error);
         const outcome: SidecarIndexOutcome = {
             status: "failed",
             eligible: false,
             reason: "read_failed",
             errorCategory: "io",
+            errorMessage,
+            ...(errorCode !== undefined ? { errorCode } : {}),
         };
         sidecarIndexStats.failed += 1;
         return outcome;
@@ -952,39 +976,66 @@ export async function indexJobOutputWithOutcome(
         return outcome;
     }
 
-    try {
-        // Try pi-context's public external-indexing API first.
-        const apiSourceId =
-            options.useExternalApi === false
-                ? undefined
-                : await tryIndexViaExternalApi(
-                      text,
-                      job,
-                      ctx,
-                      toolName,
-                      dbPath
-                  );
-        const sourceId =
-            apiSourceId ??
-            (await indexViaDirectDb(
-                text,
-                job,
-                ctx,
-                toolName,
-                dbPath,
-                severityCounts
-            ));
-        if (!sourceId) {
-            const outcome: SidecarIndexOutcome = {
-                status: "skipped",
-                eligible: true,
-                reason: "schema_unavailable",
-                errorCategory: "schema",
-            };
-            sidecarIndexStats.skipped += 1;
-            sidecarIndexStats.schemaSkipped += 1;
-            return outcome;
+    const startedAt = Date.now();
+    let retryCount = 0;
+    let sourceId: string | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= 3; attempt += 1) {
+        try {
+            // Try pi-context's public external-indexing API first.
+            const apiSourceId =
+                options.useExternalApi === false
+                    ? undefined
+                    : await tryIndexViaExternalApi(
+                          text,
+                          job,
+                          ctx,
+                          toolName,
+                          dbPath
+                      );
+            sourceId =
+                apiSourceId ??
+                (await indexViaDirectDb(
+                    text,
+                    job,
+                    ctx,
+                    toolName,
+                    dbPath,
+                    severityCounts
+                ));
+            lastError = undefined;
+            break;
+        } catch (error) {
+            lastError = error;
+            const message =
+                error instanceof Error ? error.message : String(error);
+            const code = getSqliteErrorCode(error);
+            const busy =
+                code === "SQLITE_BUSY" ||
+                /busy|database is locked/i.test(message);
+            if (!busy || attempt === 3) break;
+            retryCount += 1;
+            // Short bounded exponential delay in addition to SQLite's busy_timeout.
+            await new Promise((resolve) =>
+                setTimeout(resolve, 50 * 2 ** attempt)
+            );
         }
+    }
+    const waitMs = Date.now() - startedAt;
+    if (!lastError && !sourceId) {
+        const outcome: SidecarIndexOutcome = {
+            status: "skipped",
+            eligible: true,
+            reason: "schema_unavailable",
+            errorCategory: "schema",
+            retryCount,
+            waitMs,
+        };
+        sidecarIndexStats.skipped += 1;
+        sidecarIndexStats.schemaSkipped += 1;
+        return outcome;
+    }
+    if (!lastError && sourceId) {
         const indexedSource = findJobSourceDetailsInSidecar(job.id) ?? {
             sourceId,
             chunkIds: [],
@@ -997,31 +1048,74 @@ export async function indexJobOutputWithOutcome(
             status: "indexed",
             eligible: true,
             source,
+            retryCount,
+            waitMs,
         };
         sidecarIndexStats.indexed += 1;
-        return outcome;
-    } catch (error) {
-        const message =
-            error instanceof Error
-                ? error.message.toLowerCase()
-                : String(error).toLowerCase();
-        const errorCategory: SidecarIndexOutcome["errorCategory"] =
-            /no such table|no such column|malformed schema|fts5|constraint failed/.test(
-                message
-            )
-                ? "schema"
-                : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(message)
-                  ? "io"
-                  : "unknown";
-        const outcome: SidecarIndexOutcome = {
-            status: "failed",
-            eligible: true,
-            reason: "index_failed",
-            errorCategory,
-        };
-        sidecarIndexStats.failed += 1;
+        if (retryCount > 0 || waitMs >= 100) {
+            try {
+                ctx.appendEntry?.("sidecar-index-wait", {
+                    jobId: job.id,
+                    retryCount,
+                    waitMs,
+                });
+            } catch {
+                // Lock-wait instrumentation must not turn a successful index into a failure.
+            }
+        }
         return outcome;
     }
+
+    const errorMessage =
+        lastError instanceof Error ? lastError.message : String(lastError);
+    const errorCode = getSqliteErrorCode(lastError);
+    const normalizedMessage = errorMessage.toLowerCase();
+    const errorCategory: SidecarIndexOutcome["errorCategory"] =
+        /no such table|no such column|malformed schema|fts5|constraint failed/.test(
+            normalizedMessage
+        )
+            ? "schema"
+            : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(
+                    normalizedMessage
+                )
+              ? "io"
+              : "unknown";
+    const outcome: SidecarIndexOutcome = {
+        status: "failed",
+        eligible: true,
+        reason: "index_failed",
+        errorCategory,
+        errorMessage,
+        ...(errorCode !== undefined ? { errorCode } : {}),
+        retryCount,
+        waitMs,
+    };
+    sidecarIndexStats.failed += 1;
+    try {
+        ctx.appendEntry?.("sidecar-index-failure", {
+            jobId: job.id,
+            category: errorCategory,
+            errorMessage,
+            errorCode,
+            retryCount,
+            waitMs,
+        });
+    } catch {
+        // Diagnostic persistence must not affect the completed job.
+    }
+    const sessionKey =
+        ctx.sessionManager?.getSessionFile?.() ??
+        ctx.sessionManager?.getSessionId?.() ??
+        "unknown-session";
+    const warningKey = `${sessionKey}:${errorCategory}`;
+    if (!warnedIndexFailures.has(warningKey)) {
+        warnedIndexFailures.add(warningKey);
+        console.error(
+            `[tau] sidecar index failed (${errorCategory}): ${errorMessage}; ` +
+                `retries=${retryCount}, wait=${waitMs}ms`
+        );
+    }
+    return outcome;
 }
 
 /** Backward-compatible source-only indexing API. */
