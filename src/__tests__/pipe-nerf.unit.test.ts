@@ -176,6 +176,14 @@ void describe("pipe-nerf parser", () => {
         assert.equal(findPipeInvocation("ls | wc -l")?.limit, null);
     });
 
+    void it("reports a limiter in a trailing comment without calling it no-pipe", () => {
+        const command = "printf output\n# | tail -5";
+        const result = plan(command);
+        assert.equal(result.action, "skip");
+        assert.equal(result.reason, "limiter-in-comment");
+        assert.equal(result.rewritten, command);
+    });
+
     void it("classifies a limiter in an earlier segment separately from no-pipe", () => {
         const command = "ls -la /tmp | head -5; du -sh /tmp";
         assert.equal(plan(command).action, "skip");

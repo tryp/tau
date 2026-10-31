@@ -98,6 +98,8 @@ export interface PipeOptions {
 export type SkipReason =
     /** The trailing stage does not bound output (no limiter present). */
     | "no-pipe"
+    /** A recognized limiter is in a trailing comment and cannot be rewritten. */
+    | "limiter-in-comment"
     /** A `tail -f` follows its input rather than bounding it. */
     | "not-a-limiter"
     /**
@@ -803,7 +805,7 @@ export function planPipeNerf(
 
     // A limiter inside a trailing comment is prose, not a bound.
     if (TRAILING_COMMENT_RE.test(command))
-        return skipped(command, "no-pipe", invocation);
+        return skipped(command, "limiter-in-comment", invocation);
 
     // Trim ONCE and slice that same string; see `findPipeInvocation`.
     const stage = command
