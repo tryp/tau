@@ -45,7 +45,14 @@
  */
 
 /** A filter stage that bounds how much output reaches the tool. */
-export type LimiterKind = "tail" | "head" | "wc" | "grep" | "rg" | "sed" | "awk";
+export type LimiterKind =
+    | "tail"
+    | "head"
+    | "wc"
+    | "grep"
+    | "rg"
+    | "sed"
+    | "awk";
 
 /** A resolved trailing limiter stage inside a bash command string. */
 export interface PipeInvocation {
@@ -103,7 +110,11 @@ export type SkipReason =
     /** Nothing runs before the limiter, so removing it leaves no command. */
     | "empty-command"
     | "disabled"
-    | "line-break";
+    | "line-break"
+    /** A limiter pipe was found in a non-final semicolon/newline segment. */
+    | `pipe-outside-scope:segment-${number}`
+    /** A shell here-document makes the remaining command text data, not code. */
+    | "heredoc";
 
 export interface PipePlan {
     action: "rewrite" | "skip";
@@ -184,7 +195,7 @@ export function lastPipeOperator(command: string): number {
             i += 1;
             continue;
         }
-        if (ch === "'" || ch === '"') {
+        if (ch === "'" || ch === '"' || ch === "`") {
             quote = ch;
         } else if (ch === "\\" && i + 1 < n) {
             i += 2;
@@ -220,14 +231,18 @@ function controlOperatorIn(text: string): number {
     for (let i = 0; i < text.length; i++) {
         const ch = text[i];
         if (quote) {
-            if (ch === "\\" && quote === '"' && i + 1 < text.length) {
+            if (
+                ch === "\\" &&
+                (quote === '"' || quote === "`") &&
+                i + 1 < text.length
+            ) {
                 i += 1;
                 continue;
             }
             if (ch === quote) quote = "";
             continue;
         }
-        if (ch === "'" || ch === '"') {
+        if (ch === "'" || ch === '"' || ch === "`") {
             quote = ch;
         } else if (ch === "\\" && i + 1 < text.length) {
             i += 1;
@@ -257,7 +272,7 @@ function controlOperatorIn(text: string): number {
 export function firstPipeOperator(command: string): number {
     let quote = "";
     let depth = 0;
-    let found = -1;
+    const found = -1;
     let i = 0;
     const n = command.length;
     while (i < n) {
@@ -273,7 +288,7 @@ export function firstPipeOperator(command: string): number {
             i += 1;
             continue;
         }
-        if (ch === "'" || ch === '"') {
+        if (ch === "'" || ch === '"' || ch === "`") {
             quote = ch;
         } else if (ch === "\\" && i + 1 < n) {
             i += 2;
@@ -304,7 +319,27 @@ export function firstPipeOperator(command: string): number {
  * "not-the-last-stage" guard does -- it refused 116,786 corpus calls that the
  * `;` form makes safe.
  */
-function lastControlOperator(command: string): { at: number; statusBearing: boolean } {
+function segmentNumberAt(command: string, end: number): number {
+    let segment = 1;
+    let start = 0;
+    while (start < end) {
+        const relative = controlOperatorIn(command.slice(start, end));
+        if (relative < 0) break;
+        const at = start + relative;
+        if (command[at] === ";" || command[at] === "\n") segment += 1;
+        start =
+            at +
+            (command.startsWith("&&", at) || command.startsWith("||", at)
+                ? 2
+                : 1);
+    }
+    return segment;
+}
+
+function lastControlOperator(command: string): {
+    at: number;
+    statusBearing: boolean;
+} {
     let quote = "";
     let depth = 0;
     let at = -1;
@@ -324,7 +359,7 @@ function lastControlOperator(command: string): { at: number; statusBearing: bool
             i += 1;
             continue;
         }
-        if (ch === "'" || ch === '"') {
+        if (ch === "'" || ch === '"' || ch === "`") {
             quote = ch;
         } else if (ch === "\\" && i + 1 < n) {
             i += 2;
@@ -412,7 +447,11 @@ export function findPipeInvocation(command: string): PipeInvocation | null {
 
     const stageStart = at + 1;
     // bash's `|&` pipes both streams; the `&` is an operator flag, not a program.
-    const stage = command.slice(stageStart).trimStart().replace(/^&/, "").trimStart();
+    const stage = command
+        .slice(stageStart)
+        .trimStart()
+        .replace(/^&/, "")
+        .trimStart();
     const name = programName(stage);
     if (name === null) return null;
 
@@ -559,8 +598,7 @@ export function applyLimiter(
                 return {
                     text,
                     faithful: false,
-                    caveat:
-                        "your pipe counted lines after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
+                    caveat: "your pipe counted lines after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
                 };
             }
             return { text: String(total), faithful: true, caveat: null };
@@ -574,16 +612,14 @@ export function applyLimiter(
                 return {
                     text,
                     faithful: false,
-                    caveat:
-                        "your pipe counted matches after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
+                    caveat: "your pipe counted matches after an earlier stage filtered them, which the captured output no longer represents; the count is not shown",
                 };
             }
             if (lostHead) {
                 return {
                     text,
                     faithful: false,
-                    caveat:
-                        "your pipe counted matches across the whole output, and the tool's inline budget had already dropped part of it, so the count below is a lower bound",
+                    caveat: "your pipe counted matches across the whole output, and the tool's inline budget had already dropped part of it, so the count below is a lower bound",
                 };
             }
             const matches = lines.filter((line) =>
@@ -596,8 +632,7 @@ export function applyLimiter(
                 return {
                     text,
                     faithful: false,
-                    caveat:
-                        "your pipe selected a line range after an earlier stage filtered them, which the captured output no longer represents",
+                    caveat: "your pipe selected a line range after an earlier stage filtered them, which the captured output no longer represents",
                 };
             }
             if (lostHead || limit === null) {
@@ -621,8 +656,7 @@ export function applyLimiter(
             return {
                 text,
                 faithful: false,
-                caveat:
-                    "your pipe ran an awk program, which is applied to the command rather than to the result, so the full output is shown here",
+                caveat: "your pipe ran an awk program, which is applied to the command rather than to the result, so the full output is shown here",
             };
         }
     }
@@ -693,10 +727,51 @@ function stageBindsOutput(kind: LimiterKind, args: string): boolean {
  * has to be what determines what the tool ends up showing, and its output has
  * to be the command's last word.
  */
+function hasHeredocOperator(command: string): boolean {
+    let quote = "";
+    let escaped = false;
+    for (let i = 0; i < command.length - 1; i += 1) {
+        const ch = command[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch === "\\" && quote !== "'") {
+            escaped = true;
+            continue;
+        }
+        if (quote) {
+            if (ch === quote) quote = "";
+            continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "<" && command[i + 1] === "<" && command[i + 2] !== "<") {
+            // Any heredoc operator at top level disqualifies the command, and the
+            // delimiter's spelling is deliberately NOT inspected. Enumerating
+            // forms missed real ones: `<<\EOF` is a heredoc whose delimiter is
+            // backslash-escaped (the escape suppresses expansion, so it is the
+            // form a careful writer reaches for), and `<<$'EOF'` uses ANSI-C
+            // quoting. `<<\EOF` was being preserved only incidentally -- its
+            // body's pipe happened to sit outside the last segment -- so the
+            // same command without a trailing statement was rewritable. A
+            // false positive costs one skipped rewrite; a false negative
+            // splices a tee into text destined for a file and can lose the
+            // write entirely. `$((x << 2))` is the one false positive this
+            // trades for, and skipping it is harmless.
+            return true;
+        }
+    }
+    return false;
+}
+
 export function planPipeNerf(
     command: string,
     options: PipeOptions = {}
 ): PipePlan {
+    if (hasHeredocOperator(command)) return skipped(command, "heredoc");
     const at = lastPipeOperator(command);
     if (at < 0) return skipped(command, "no-pipe");
 
@@ -712,17 +787,30 @@ export function planPipeNerf(
     if (control.at > at && control.statusBearing) {
         return skipped(command, "status-bearing-operator");
     }
+    // A limiter before the final `;`/newline does not determine the command's
+    // last output. Never rewrite an earlier statement just because it has the
+    // command's last pipe.
+    if (control.at > at && !control.statusBearing) {
+        const segment = segmentNumberAt(command, at);
+        return skipped(command, `pipe-outside-scope:segment-${segment}`);
+    }
 
     const invocation = findPipeInvocation(command);
     if (!invocation) return skipped(command, "no-pipe");
 
-    if (options.enabled === false) return skipped(command, "disabled", invocation);
+    if (options.enabled === false)
+        return skipped(command, "disabled", invocation);
 
     // A limiter inside a trailing comment is prose, not a bound.
-    if (TRAILING_COMMENT_RE.test(command)) return skipped(command, "no-pipe", invocation);
+    if (TRAILING_COMMENT_RE.test(command))
+        return skipped(command, "no-pipe", invocation);
 
     // Trim ONCE and slice that same string; see `findPipeInvocation`.
-    const stage = command.slice(invocation.stageStart).trimStart().replace(/^&/, "").trimStart();
+    const stage = command
+        .slice(invocation.stageStart)
+        .trimStart()
+        .replace(/^&/, "")
+        .trimStart();
     const args = boundedArgs(stage, (programName(stage) ?? "").length);
 
     // `findPipeInvocation` already gated on `stageBindsOutput`, so reaching here
@@ -734,7 +822,10 @@ export function planPipeNerf(
     // `| tail -f` / `| head -n -5` follow the input rather than bounding it, so
     // removing them would hand the tool a command that never returns. `-f` on
     // `tail` is the whole point of that flag.
-    if (invocation.kind === "tail" && /(?:^|\s)-[A-Za-z]*f(?:\s|$)/.test(args)) {
+    if (
+        invocation.kind === "tail" &&
+        /(?:^|\s)-[A-Za-z]*f(?:\s|$)/.test(args)
+    ) {
         return skipped(command, "not-a-limiter", invocation);
     }
 
@@ -748,22 +839,27 @@ export function planPipeNerf(
     // it is a syntax error either way, and `| tail -5` on its own is not a
     // command the agent wrote on purpose.
     const before = command.slice(0, invocation.start);
-    if (!/\S/.test(before)) return skipped(command, "empty-command", invocation);
+    if (!/\S/.test(before))
+        return skipped(command, "empty-command", invocation);
 
     // The rewrite removes the limiter's OWN segment and keeps everything around
     // it. `seq 1 50 | tail -3; echo done` must become `seq 1 50; echo done`:
     // dropping only the stage text would leave a dangling `|`, and dropping
     // everything after the segment would delete `echo done` along with it.
     const segmentEnd = lastControlOperator(command.slice(invocation.start)).at;
-    const stageEnd = segmentEnd < 0 ? command.length : invocation.start + segmentEnd;
-    const beforeSegment = command.slice(0, invocation.start).replace(/\s+$/, "");
+    const stageEnd =
+        segmentEnd < 0 ? command.length : invocation.start + segmentEnd;
+    const beforeSegment = command
+        .slice(0, invocation.start)
+        .replace(/\s+$/, "");
     const afterSegment = command.slice(stageEnd);
     // A separator must not be swallowed: `a && | tail -5` is not a command, and
     // `a; | tail -5` would become `a;` with nothing to run.
     if (/[;&|]\s*$/.test(beforeSegment)) {
         return skipped(command, "empty-command", invocation);
     }
-    if (!/\S/.test(beforeSegment)) return skipped(command, "empty-command", invocation);
+    if (!/\S/.test(beforeSegment))
+        return skipped(command, "empty-command", invocation);
 
     // Rejoin without swallowing or inventing a separator: the text after the
     // segment starts with its own operator (`; echo done`) or is a newline.
@@ -790,7 +886,11 @@ export function planPipeNerf(
             const command0 = rewritten.slice(0, operatorAt).trim();
             // Storage is auxiliary: if the path cannot be used, run the command
             // unchanged rather than fail the call the agent asked for.
-            stageZero = { path: options.stageZeroPath, command: command0, operatorAt };
+            stageZero = {
+                path: options.stageZeroPath,
+                command: command0,
+                operatorAt,
+            };
         }
     }
     // The seam is normalized to one space either side. `rewritten` can carry the

@@ -23,6 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../../state.ts";
 import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
+import { formatSidecarReceipt } from "../sidecar.ts";
 import { bashGuidelines, pipeNote } from "./messages.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -92,9 +93,11 @@ interface BashResultDetails {
 }
 
 /** Count lines of a result's visible text, for the note's err/warn line. */
-function visibleSeverity(
-    text: string
-): { err: number; warn: number; lines: number } {
+function visibleSeverity(text: string): {
+    err: number;
+    warn: number;
+    lines: number;
+} {
     const counts = countLines(text);
     return { err: counts.err, warn: counts.warn, lines: counts.total };
 }
@@ -250,13 +253,18 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             (event as { details?: BashResultDetails }).details ?? {};
         // Teed to by the rewrite when the command still filtered.
         const stageZero =
-            (details as { pipeStageZero?: { path: string; command: string; sourceId: string | null } })
-                .pipeStageZero ?? null;
+            (
+                details as {
+                    pipeStageZero?: {
+                        path: string;
+                        command: string;
+                        sourceId: string | null;
+                    };
+                }
+            ).pipeStageZero ?? null;
         const truncation = details.truncation;
         const text = event.content
-            .map((block) =>
-                block.type === "text" ? (block.text ?? "") : ""
-            )
+            .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
             .join("\n");
 
         // Indexed output arrives as a RECEIPT, not as the output. Bounding a
@@ -273,6 +281,28 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                   truncated: truncation?.truncated === true,
                   totalLines: truncation?.totalLines ?? null,
               });
+        const viewLines =
+            view.text.length === 0 ? 0 : view.text.split("\n").length;
+        const viewExceedsInlineBudget =
+            Buffer.byteLength(view.text, "utf8") > 50 * 1024 ||
+            viewLines > 2_000;
+        const showReceipt =
+            isReceipt ||
+            (view.faithful &&
+                viewExceedsInlineBudget &&
+                Boolean(details.sourceId));
+        const receiptText =
+            showReceipt && !isReceipt
+                ? formatSidecarReceipt(
+                      "bash",
+                      {
+                          sourceId: details.sourceId!,
+                          chunkIds: details.chunkIds ?? [],
+                      },
+                      Buffer.byteLength(text, "utf8"),
+                      truncation?.totalLines ?? text.split("\n").length
+                  )
+                : text;
 
         // The err/warn mix is computed over the WHOLE captured text, so it is the
         // stat the agent would otherwise re-run the command to get, even though
@@ -290,7 +320,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             totalLines: truncation?.totalLines ?? null,
             err: severity.err,
             warn: severity.warn,
-            visibleLines: isReceipt ? null : severity.lines,
+            visibleLines: showReceipt ? null : severity.lines,
             fullOutputPath: details.fullOutputPath ?? null,
             sourceId: details.sourceId ?? null,
             receiptLines: retrievalLines(details),
@@ -299,7 +329,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             viewDescription: describeView(
                 plan.invocation,
                 view,
-                isReceipt ? "receipt" : undefined
+                showReceipt ? "receipt" : undefined
             ),
             pipeStageZero: stageZero,
         });
@@ -309,7 +339,12 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
         // stays what they asked for. A faithful view is exactly what their pipe
         // printed; an unfaithful one is the capture, with the note saying so.
         const body = view.faithful
-            ? [{ type: "text" as const, text: view.text }]
+            ? [
+                  {
+                      type: "text" as const,
+                      text: showReceipt ? receiptText : view.text,
+                  },
+              ]
             : [...event.content];
         return {
             content: [{ type: "text" as const, text: note }, ...body],

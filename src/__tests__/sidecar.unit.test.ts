@@ -874,7 +874,8 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(plain.source, undefined);
         assert.equal(plain.truncated, false);
 
-        // With force: indexed, receipt returned, full output recoverable.
+        // With force: index the full output but return the content for pipe-nerf
+        // to bound after indexing; a receipt would suppress the requested view.
         const forced = await prepareInlineOutput(
             job,
             { cwd: tmpDir },
@@ -885,8 +886,9 @@ void describe("indexJobOutputInSidecar", () => {
             }
         );
         assert.ok(forced.source, "a forced index must produce a source");
-        assert.equal(forced.truncated, true);
-        assert.match(forced.text, /\[context-sidecar\]/);
+        assert.equal(forced.truncated, false);
+        assert.equal(forced.text, output);
+        assert.doesNotMatch(forced.text, /\[context-sidecar\]/);
         assert.equal(await readJobOutputFromSidecar(job.id), output);
     });
 

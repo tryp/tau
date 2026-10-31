@@ -176,6 +176,93 @@ void describe("pipe-nerf parser", () => {
         assert.equal(findPipeInvocation("ls | wc -l")?.limit, null);
     });
 
+    void it("classifies a limiter in an earlier segment separately from no-pipe", () => {
+        const command = "ls -la /tmp | head -5; du -sh /tmp";
+        assert.equal(plan(command).action, "skip");
+        assert.equal(plan(command).reason, "pipe-outside-scope:segment-1");
+        assert.equal(
+            plan("ls -la /tmp | head -5; du -sh /tmp; git status --short")
+                .reason,
+            "pipe-outside-scope:segment-1"
+        );
+        assert.equal(
+            plan("ls -la /tmp; du -sh /tmp | tail -5").action,
+            "rewrite"
+        );
+        assert.equal(plan("ls -la /tmp | tail -5").action, "rewrite");
+        assert.equal(
+            plan("python -m module --help | head -40").action,
+            "rewrite"
+        );
+    });
+
+    void it("skips heredoc bodies in all common delimiter forms without changing bytes", () => {
+        for (const command of [
+            "cat <<'EOF'\nhello | tail -2\nEOF",
+            "cat <<EOF\nhello | tail -2\nEOF",
+            "cat <<-EOF\n\thello | tail -2\n\tEOF",
+            // Backslash-escaped and ANSI-C delimiters are heredocs too; the
+            // first was preserved only because a trailing statement pushed its
+            // body's pipe out of the last segment, so the same command without
+            // that statement was rewritable. Both must skip on the operator.
+            "cat <<\\EOF\nhello | tail -2\nEOF",
+            "cat <<$'EOF'\nhello | tail -2\nEOF",
+        ]) {
+            const result = plan(command);
+            assert.equal(result.action, "skip", command);
+            assert.equal(result.reason, "heredoc", command);
+            assert.equal(
+                result.rewritten,
+                command,
+                "the command must remain byte-identical"
+            );
+        }
+    });
+
+    void it("does not rewrite pipes inside quotes, backticks, or process substitution", () => {
+        for (const command of [
+            "printf '%s\\n' 'literal | head -5'",
+            'printf "%s\\n" "literal | tail -2"',
+            "printf '%s\\n' `echo literal | head -3`",
+            "cat <(printf 'literal | tail -4')",
+        ]) {
+            assert.equal(plan(command).action, "skip", command);
+            assert.equal(plan(command).rewritten, command, command);
+        }
+        assert.equal(
+            plan("printf '%s\\n' 'literal <<EOF' | head -1").action,
+            "rewrite",
+            "a heredoc-looking string is not a heredoc operator"
+        );
+    });
+
+    void it("executes the exact preserved heredoc source and does not trust a rewritten preview", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-heredoc-"));
+        const target = join(dir, "probe.mts");
+        const body = [
+            'import { planPipeNerf } from "/home/dev/.pi/extensions/pipe-nerf/parse.ts";',
+            "const probes = [",
+            '  ["for-loop-with-procsub", `cd /x && git log --oneline -1 2>/dev/null; git status --short 2>/dev/null | tee /tmp/injected.log | head -5; echo "=== diff"; for f in a.ts b.ts; do git diff -- "$f" | sed -n \'1,5p\' | tail -3; done`],',
+            '  ["plain-help", `python3 -m json.tool --help`],',
+            "];",
+            'const quoted = "first | second";',
+            "const singleQuoted = 'x | tail -1';",
+            "",
+        ].join("\n");
+        const command = `cat > ${target} <<'EOF'\n${body}EOF\necho wrote`;
+        const result = plan(command);
+        assert.equal(result.action, "skip");
+        assert.equal(result.reason, "heredoc");
+        assert.equal(result.rewritten, command);
+        assert.equal(effective(command), command);
+        execFileSync("bash", ["-c", effective(command)]);
+        assert.equal(readFileSync(target, "utf8"), body);
+        const note = pipeNote(result, observation());
+        assert.equal(note, "");
+        assert.ok(!note.includes("Effective command"));
+        rmSync(dir, { recursive: true, force: true });
+    });
+
     void it("resolves a path-prefixed stage", () => {
         assert.equal(plan("ls | /usr/bin/tail -20").action, "rewrite");
         assert.equal(plan("ls | /bin/head -5").rewritten, "ls");
@@ -190,6 +277,18 @@ void describe("pipe-nerf parser", () => {
         );
         // `||` is a control operator, not a pipe.
         assert.equal(plan("ls || tail -5").reason, "no-pipe");
+        const countInvocation = findPipeInvocation(
+            "git ls-tree --name-only main src/features/ | grep -c ."
+        );
+        assert.ok(countInvocation);
+        assert.equal(
+            applyLimiter(
+                Array.from({ length: 50 }, (_, i) => `entry-${i}`).join("\n"),
+                countInvocation,
+                { truncated: false, totalLines: 50 }
+            ).text,
+            "50"
+        );
     });
 
     void it("does not treat a pipe inside a substitution as the command's pipe", () => {
@@ -269,11 +368,22 @@ void describe("pipe-nerf parser", () => {
     });
 
     void it("keeps the same control flow when a limiter follows a `;`", () => {
-        // The `;` form is rewritten, so the rewrite must reach the same
-        // statements: every line the original printed is still printed.
+        // Only a limiter in the last segment controls the command's final
+        // output. Earlier-segment limiters must not be removed when later
+        // statements print unrelated output.
         for (const command of [
             "false | tail -5; echo done",
             "true | head -2; echo done",
+        ]) {
+            assert.equal(plan(command).action, "skip", command);
+            assert.equal(
+                plan(command).reason,
+                "pipe-outside-scope:segment-1",
+                command
+            );
+            assert.equal(plan(command).rewritten, command);
+        }
+        for (const command of [
             "echo a; seq 1 50 | tail -3",
             "echo X; seq 1 20 2>&1 | tail -4",
         ]) {
@@ -663,6 +773,34 @@ void describe("pipe-nerf bounded view", () => {
 });
 
 void describe("pipe-nerf note", () => {
+    void it("keeps a faithful note to one line and avoids contradictory recovery claims", () => {
+        const faithful = pipeNote(
+            plan("cat output.txt | head -5"),
+            observation({
+                fullOutputPath: "/tmp/output.txt",
+                sourceId: "ctx_123",
+            })
+        );
+        assert.ok(faithful.split("\n").length <= 1, faithful);
+
+        const receipt = pipeNote(
+            plan("cat output.txt | head -5"),
+            observation({
+                viewDescription:
+                    "a summary of the captured output, with its totals",
+            })
+        );
+        const receiptBranch = receipt.includes("Showing below: a summary");
+        const noCaptureBranch = receipt.includes(
+            "nothing was written to disk or indexed"
+        );
+        assert.equal(
+            Number(receiptBranch) + Number(noCaptureBranch),
+            1,
+            receipt
+        );
+    });
+
     void it("says what was removed, what ran, and what to do next", () => {
         const note = pipeNote(plan("make -j8 2>&1 | tail -50"), observation());
         assert.match(note, /\[pipe-nerf\]/);
@@ -707,9 +845,9 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(note, /indexed in the context sidecar as "ctx_bg_abc"/);
-        assert.match(note, /context_search query/);
-        assert.match(note, /Do not re-run the command to read it/);
+        assert.match(note, /source ctx_bg_abc/);
+        assert.match(note, /full output: indexed/);
+        assert.equal(note.split("\n").length, 1);
     });
 
     void it("warns that head and the tool disagree about which end to keep", () => {
@@ -746,12 +884,14 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(captured, /pre-filter output/);
-        assert.match(captured, /ctx_bg_stage0/);
-        assert.match(captured, /re-running a DIFFERENT filter is a search/);
-        assert.match(captured, /grep -nE "pattern" .*pi-pipe-stage0/);
-        // Both sources are named: the filtered result and the pre-filter capture.
-        assert.match(captured, /ctx_bg_post/);
+        assert.match(captured, /pre-filter: \/home\/dev\/tmp\/pi-pipe-stage0/);
+        assert.match(captured, /source ctx_bg_stage0/);
+        assert.match(
+            captured,
+            /re-filter with context_search query:"pattern" source_id:"ctx_bg_stage0"/
+        );
+        assert.match(captured, /source ctx_bg_post/);
+        assert.equal(captured.split("\n").length, 1);
     });
 
     void it("falls back to the path when the pre-filter capture is not indexed", () => {
@@ -789,10 +929,9 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(note, /context_search query/);
-        assert.match(note, /on disk at \/tmp\/pi-bg-job\.log/);
-        assert.match(note, /re-filter or post-process it there/);
-        assert.match(note, /grep -nE "your-pattern" \/tmp\/pi-bg-job\.log/);
+        assert.match(note, /full output: \/tmp\/pi-bg-job\.log/);
+        assert.match(note, /source ctx_bg_abc/);
+        assert.equal(note.split("\n").length, 1);
     });
 
     void it("is honest when the capture fit inline and the view is bounded", () => {
@@ -918,11 +1057,17 @@ void describe("pipe-nerf registration", () => {
         assert.equal(guidelines.length, 1);
         assert.equal(guidelines[0].tool, "bash");
 
+        const input: { command: string } = {
+            command: "pytest -q 2>&1 | tail -20",
+        };
+        const actualCommand = plan(input.command).rewritten;
         fire(handlers, "tool_call", {
             toolName: "bash",
             toolCallId: "t1",
-            input: { command: "pytest -q 2>&1 | tail -20" },
+            input,
         });
+        assert.equal(input.command, actualCommand);
+        assert.equal(input.command, "pytest -q 2>&1");
 
         const result = fire(handlers, "tool_result", {
             toolName: "bash",
@@ -936,6 +1081,11 @@ void describe("pipe-nerf registration", () => {
 
         assert.equal(entries.filter((e) => e.type === "pipe-nerf").length, 1);
         const note = result.content[0].text;
+        assert.ok(
+            note.includes(
+                `Effective command: ${JSON.stringify(actualCommand)}.`
+            )
+        );
         assert.match(note, /\[pipe-nerf\]/);
         assert.match(note, /900 lines \(0 err, 1 warn\)/);
         assert.match(note, /on disk at \/tmp\/out\.log/);
@@ -974,6 +1124,39 @@ void describe("pipe-nerf registration", () => {
         const note = result.content[0].text;
         assert.match(note, /indexed in the context sidecar as "ctx_bg_xyz"/);
         assert.match(note, /context_get source_id:"ctx_bg_xyz"/);
+    });
+
+    void it("returns the requested small head content after a forced index, not a receipt", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        const capture = Array.from(
+            { length: 60 },
+            (_, i) => `line-${i + 1}`
+        ).join("\n");
+        const input: { command: string } = { command: "seq 1 60 | head -5" };
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "small-head",
+            input,
+        });
+        assert.equal(input.command, "seq 1 60");
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "small-head",
+            content: [{ type: "text", text: capture }],
+            details: {
+                truncation: { truncated: false, totalLines: 60 },
+                sourceId: "ctx_small_head",
+                chunkIds: ["ctx_small_head_0001"],
+                fullOutputPath: "/tmp/small-head.log",
+            },
+        }) as { content: { type: string; text: string }[] };
+        assert.match(result.content[0].text, /showing the first 5 lines/);
+        assert.equal(
+            result.content[1].text,
+            "line-1\nline-2\nline-3\nline-4\nline-5"
+        );
+        assert.doesNotMatch(result.content[1].text, /context-sidecar/);
     });
 
     void it("returns the bounded view, not the whole capture", () => {

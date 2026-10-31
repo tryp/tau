@@ -615,14 +615,11 @@ export async function prepareInlineOutput(
         );
         if (indexOutcome.source) {
             return {
-                text: formatSidecarReceipt(
-                    toolName,
-                    indexOutcome.source,
-                    bytes,
-                    totalLines
-                ),
-                truncated: true,
-                partial: true,
+                // Leave the content available to the pipe-nerf tool_result hook,
+                // which applies the requested head/tail/count view after capture.
+                // Replacing it with a receipt here loses that view entirely.
+                text: output || "(no output)",
+                truncated: false,
                 totalLines,
                 byteCount: bytes,
                 empty,
@@ -649,6 +646,19 @@ export async function prepareInlineOutput(
     );
     const source = indexOutcome.source;
     if (source) {
+        if (options.force) {
+            // pipe-nerf still needs the complete capture to reconstruct the exact
+            // requested window; it bounds this text in its tool_result hook.
+            return {
+                text: output || "(no output)",
+                truncated: false,
+                totalLines: lines,
+                byteCount: bytes,
+                empty,
+                source,
+                indexOutcome,
+            };
+        }
         return {
             text: formatSidecarReceipt(toolName, source, bytes, lines),
             truncated: true,

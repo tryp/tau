@@ -108,6 +108,32 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     const invocation = plan.invocation;
     const removed = boundText(invocation);
 
+    // A faithful view with a recoverable full capture needs no tutorial. The
+    // note is additive metadata only; the actual bounded body remains separate.
+    if (
+        observed.faithful &&
+        !invocation.mergedStderr &&
+        (observed.sourceId || observed.fullOutputPath)
+    ) {
+        const capture = [
+            `full output: ${observed.fullOutputPath ?? "indexed"}`,
+            ...(observed.sourceId
+                ? [
+                      `source ${observed.sourceId}; retrieve it with context_search query:"pattern" source_id:"${observed.sourceId}"`,
+                  ]
+                : []),
+            ...(observed.pipeStageZero
+                ? [
+                      `pre-filter: ${observed.pipeStageZero.path}` +
+                          (observed.pipeStageZero.sourceId
+                              ? ` (source ${observed.pipeStageZero.sourceId}; re-filter with context_search query:"pattern" source_id:"${observed.pipeStageZero.sourceId}")`
+                              : ""),
+                  ]
+                : []),
+        ].join("; ");
+        return `[pipe-nerf] ran ${preview(plan.rewritten)}; showing ${observed.viewDescription}; ${capture}`;
+    }
+
     const lines: string[] = [
         `[pipe-nerf] Removed the output-limiting pipe ${JSON.stringify(removed)} before running, so the whole output is now captured instead of discarded in the shell.`,
         `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
@@ -202,7 +228,10 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
             `- Read a range: sed -n '${Math.max(1, lines_total - 99)},${lines_total}p' ${observed.fullOutputPath}`
         );
     }
-    if (!observed.fullOutputPath && !observed.sourceId) {
+    const isReceiptView = observed.viewDescription.startsWith(
+        "a summary of the captured output"
+    );
+    if (!observed.fullOutputPath && !observed.sourceId && !isReceiptView) {
         // There is no RECOVERABLE capture, but the agent still asked for a bounded
         // view of one. Saying "what is shown is the complete output" would be
         // false (the view is 3 lines of 60), and telling it to re-run the same
