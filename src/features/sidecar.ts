@@ -555,26 +555,30 @@ async function tryIndexViaExternalApi(
 export interface SidecarIndexOptions {
     classify?: (text: string) => LogCounts;
     useExternalApi?: boolean;
-    /**
-     * Index even when the output is under the inline threshold.
-     *
-     * The threshold exists so ordinary small output is not indexed, which is
-     * right for output nobody has discarded. It is wrong when a pipe was hoisted
-     * off the command: the agent then sees a bounded view (say 5 of 60 lines)
-     * and the other 55 exist nowhere. `pipe-nerf` sets this for exactly those
-     * calls, because the capture is the only route to what the view hides.
-     *
-     * The caller is responsible for only setting it when a view was actually
-     * applied; indexing unconditionally would put every small command in
-     * context.db.
-     */
+    /** Index this output even when it is under the ordinary inline threshold. */
     force?: boolean;
 }
 
 /**
- * Index large foreground output before it is returned to the model.
- * The complete output remains in the log/sidecar; only a compact receipt or
- * bounded fallback is returned inline.
+ * Prepare foreground output for inline return, indexing it when required.
+ *
+ * A limiter decides what the agent SEES. It never decides whether the capture
+ * SURVIVES. If the limiter discarded any captured line, that capture is
+ * persisted and addressable regardless of how small the visible view is --
+ * size and addressability decide WHERE it is stored, never WHETHER it exists.
+ * The view being small is not evidence that the capture was small, and it must
+ * never be read as "nothing to keep".
+ *
+ * 1. The old branch said "small enough to return inline, so nothing was written
+ *    to disk or indexed". That described the VIEW and then drew a conclusion
+ *    about the CAPTURE, so `pytest | tail -5` -- thousands of lines captured,
+ *    five shown -- persisted nothing. Test and build output fits the inline
+ *    budget, so the discarded case was the common one, not the corner: the
+ *    single shape this code exists to prevent.
+ * 2. Size cannot be the test even where the view is large. A caller cannot tell
+ *    a 40-line capture from a 4000-line one by what it was shown, so any size
+ *    rule becomes a rule the agent has to guess at, and guessing wrong loses
+ *    the only copy.
  */
 export async function prepareInlineOutput(
     job: {

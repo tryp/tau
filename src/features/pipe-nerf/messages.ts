@@ -1,5 +1,4 @@
-import type { PipeInvocation, PipePlan } from "./parse.ts";
-import { BUILTIN_MAX_BYTES, BUILTIN_MAX_LINES } from "./parse.ts";
+import type { PipePlan } from "./parse.ts";
 
 /** What the tool actually captured, as far as the result can report it. */
 export interface PipeObservation {
@@ -42,18 +41,6 @@ export interface PipeObservation {
     } | null;
 }
 
-/** Visible line count, or the capture total, whichever the hook reported. */
-function visibleLines(observed: PipeObservation): number {
-    return observed.totalLines ?? observed.visibleLines ?? 100;
-}
-
-/** Render the removed stage so the note never claims a bound it did not read. */
-function boundText(invocation: PipeInvocation): string {
-    if (invocation.limit === null) return `| ${invocation.kind}`;
-    const token = invocation.limitToken ?? String(invocation.limit);
-    return `| ${invocation.kind} ${token}`;
-}
-
 /**
  * Bound the prose copy of a long command. The retrieval lines below carry the
  * source id rather than the command, so shortening here cannot lose anything
@@ -65,198 +52,64 @@ function preview(command: string): string {
         : `${command.slice(0, MAX_PREVIEW_CHARS)}…`;
 }
 
-/** pi's inline bounds, in the units the note reads best. */
-function _inlineBudget(): string {
-    return `the last ${BUILTIN_MAX_LINES} lines or ${Math.round(BUILTIN_MAX_BYTES / 1024)}KB`;
-}
-
-const PURE_READ_RE =
-    /^\s*(?:\/usr\/bin\/)?(?:cat|head|tail|sed|awk|rg|grep|ls|find|stat|pwd|git\s+(?:show|diff|log|blame))\b/;
-
-/**
- * Whether re-running the command is idempotent.
- *
- * \"Re-run without a pipe\" is safe advice for a reader and bad advice for a
- * build: `cat f | tail -5` re-run for more lines is free, while
- * `pytest | tail -5` re-run can produce different output against a tree that
- * changed underneath it. Telling an agent to re-run a suite to see 20 more lines
- * is the exact wasted work this nerf is meant to remove, so the case must be
- * split rather than answered with a blanket re-run.
- */
-function pureReadCommand(command: string): boolean {
-    const first = command.split(/[\n;&|]/)[0] ?? "";
-    return PURE_READ_RE.test(first);
-}
-
 /** Longest command rendered in full in the prose line of the note. */
 const MAX_PREVIEW_CHARS = 200;
 
 /**
  * The agent-facing note prepended to every modified call's result.
- *
- * The contract is: you asked for a bounded view, you still get one, and
- * nothing you would otherwise have re-run for is gone. So the note says what
- * was removed, how much is now captured, the err/warn mix (the stat an agent
- * would otherwise re-run the command to compute), and the exact call that
- * retrieves any part it cannot see.
- *
- * It is prepended to every modified call, so it stays short: the retrieval
- * instructions are one line each, not a tutorial.
+ * It leads with whether the output was captured or retained, then names the
+ * effective command and gives only the retrieval forms needed for another view.
+ * See `prepareInlineOutput` for the capture-retention contract.
  */
 export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     if (plan.action !== "rewrite" || !plan.invocation) return "";
     const invocation = plan.invocation;
-    const removed = boundText(invocation);
-
-    // A faithful view with a recoverable full capture needs no tutorial. The
-    // note is additive metadata only; the actual bounded body remains separate.
-    if (
-        observed.faithful &&
-        !invocation.mergedStderr &&
-        (observed.sourceId || observed.fullOutputPath)
-    ) {
-        const capture = [
-            `full output: ${observed.fullOutputPath ?? "indexed"}`,
-            ...(observed.sourceId
-                ? [
-                      `source ${observed.sourceId}; retrieve it with context_search query:"pattern" source_id:"${observed.sourceId}"`,
-                  ]
-                : []),
-            ...(observed.pipeStageZero
-                ? [
-                      `pre-filter: ${observed.pipeStageZero.path}` +
-                          (observed.pipeStageZero.sourceId
-                              ? ` (source ${observed.pipeStageZero.sourceId}; re-filter with context_search query:"pattern" source_id:"${observed.pipeStageZero.sourceId}")`
-                              : ""),
-                  ]
-                : []),
-        ].join("; ");
-        return `[pipe-nerf] ran ${preview(plan.rewritten)}; showing ${observed.viewDescription}; ${capture}`;
-    }
-
-    const lines: string[] = [
-        `[pipe-nerf] Removed the output-limiting pipe ${JSON.stringify(removed)} before running, so the whole output is now captured instead of discarded in the shell.`,
+    const capturedLines = observed.totalLines ?? observed.visibleLines;
+    const lines = [
         `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
     ];
+    const hasCapture =
+        Boolean(observed.fullOutputPath || observed.sourceId) &&
+        capturedLines !== 0;
+    const viewLimit =
+        invocation.limit ??
+        (["head", "tail"].includes(invocation.kind) ? 10 : null);
+    const hasMoreThanView =
+        !observed.faithful ||
+        (capturedLines !== null &&
+            capturedLines !== undefined &&
+            viewLimit !== null &&
+            ["head", "tail", "sed"].includes(invocation.kind) &&
+            capturedLines > viewLimit);
 
-    // What the agent sees is what it asked for, so say so explicitly: otherwise
-    // a short result next to "the whole output is captured" reads as if the
-    // capture were still filtered.
-    lines.push(`Showing below: ${observed.viewDescription}.`);
-
-    if (observed.caveat) {
-        lines.push(`Note: ${observed.caveat}.`);
-    }
-    if (invocation.mergedStderr) {
-        // The merged form is where the habit costs the most: stderr was folded
-        // into stdout and then cut, so a failure in the head of the output was
-        // dropped before anything could read it.
-        //
-        // The rewrite deliberately LEAVES the command's own `2>&1` in place
-        // (pinned by the rewrite tests): pi does not rewrite the command's own
-        // stream semantics, only the trailing limiter. So the streams are still
-        // merged, and the old note's "the separation is back" was false. What is
-        // true is that the merge is no longer CUT -- the whole merged stream is
-        // captured -- and the err/warn counts are reported over all of it.
-        // Saying so also tells the agent what would recover the separation:
-        // dropping the merge themselves, which pi will not silently do for them.
-        lines.push(
-            "Your command merged stderr into stdout before the pipe, so that merged stream is what was cut -- the error half of the output was discarded. It is no longer cut, and the err/warn mix below covers all of it. The streams are still merged because the command's own `2>&1` was left in place; drop it if you want them reported separately."
+    if (!hasCapture) {
+        lines.unshift(
+            "No output was captured, so there is nothing available to retrieve."
         );
-    }
-    if (invocation.kind === "head") {
-        // `head` and the tool's truncation disagree about which end to keep, so
-        // the agent has to be told or it will read a window it did not ask for.
-        lines.push(
-            "You asked for the beginning of the output. pi keeps the END of long output, so read the capture below if you needed the first lines."
-        );
+        return lines.join("\n");
     }
 
-    // `visibleLines` is null when the content is the tool's own sidecar receipt:
-    // the receipt carries the true totals, so substituting its own line count
-    // reported "Captured 7 lines" next to a receipt saying 60.
-    const counts = observed.totalLines ?? observed.visibleLines;
-    if (counts !== null && counts !== undefined) {
-        lines.push(
-            `Captured ${counts} lines (${observed.err} err, ${observed.warn} warn). The err/warn counts cover everything captured, not just the part shown.`
+    const count = capturedLines ?? 0;
+    if (!hasMoreThanView) {
+        lines.unshift(
+            `The complete ${count}-line output is retained; the view above contains all of it.`
         );
+        return lines.join("\n");
     }
 
-    if (observed.pipeStageZero) {
-        // The command's own output BEFORE any filter. The result is filtered, so
-        // a re-grep with a different pattern has to run against this rather than
-        // against a fresh execution of a build.
-        const { path, command, sourceId } = observed.pipeStageZero;
-        lines.push(
-            `Your command also filtered its output, so the pre-filter output of ${JSON.stringify(command)} was teed to a file: ${path}.`
-        );
-        if (sourceId) {
-            lines.push(
-                `It is indexed in the context sidecar as ${JSON.stringify(sourceId)}, so re-running a DIFFERENT filter is a search, not another execution.`
-            );
-            lines.push(
-                `- Re-filter it: context_search query:"pattern" source_id:"${sourceId}" or grep -nE "pattern" ${path}`
-            );
-        } else {
-            lines.push(
-                `It is on disk but was not indexed. Read or re-filter it there: grep -nE "pattern" ${path}`
-            );
-        }
-    }
-
+    const range = observed.fullOutputPath
+        ? `sed -n 'START,ENDp' ${observed.fullOutputPath}`
+        : observed.sourceId
+          ? `context_get source_id:${JSON.stringify(observed.sourceId)} chunk_id:${JSON.stringify(observed.receiptLines[1]?.match(/chunk_id:["']?([^"' ]+)/)?.[1] ?? `${observed.sourceId}_0001`)}`
+          : "";
+    lines.unshift(
+        `Captured ${count} lines; all are retained (${observed.err} err, ${observed.warn} warn). Read any window with ${range}.`
+    );
     if (observed.sourceId) {
         lines.push(
-            `The full output is indexed in the context sidecar as ${JSON.stringify(observed.sourceId)}. Do not re-run the command to read it.`
-        );
-        lines.push(...observed.receiptLines);
-    }
-    // The path is offered on BOTH routes, not just the disk one. The sidecar
-    // source is for `context_*` retrieval, but an agent that wants to re-filter
-    // or post-process (`sort`, `jq`, `awk`, a different grep) needs something it
-    // can point a tool at, and the log file is that. It was previously only
-    // surfaced when nothing was indexed, so the indexed case -- the common one for
-    // large output -- offered no way to post-process at all.
-    if (observed.fullOutputPath) {
-        const lines_total = observed.totalLines ?? visibleLines(observed);
-        lines.push(
-            `The full output is also on disk at ${observed.fullOutputPath} -- re-filter or post-process it there instead of re-running the command.`
-        );
-        lines.push(
-            `- Re-filter it: grep -nE "your-pattern" ${observed.fullOutputPath}`
-        );
-        lines.push(
-            `- Read a range: sed -n '${Math.max(1, lines_total - 99)},${lines_total}p' ${observed.fullOutputPath}`
+            `Search: context_search query:"pattern" source_id:${JSON.stringify(observed.sourceId)}`
         );
     }
-    const isReceiptView = observed.viewDescription.startsWith(
-        "a summary of the captured output"
-    );
-    if (!observed.fullOutputPath && !observed.sourceId && !isReceiptView) {
-        // There is no RECOVERABLE capture, but the agent still asked for a bounded
-        // view of one. Saying "what is shown is the complete output" would be
-        // false (the view is 3 lines of 60), and telling it to re-run the same
-        // command would repeat work for output that was never captured.
-        //
-        // The split that matters is whether re-execution is safe at all: a reader
-        // (`cat`, `git show`, `ls`) is idempotent, so a different bound gives a
-        // different slice of the same data. A runner (`pytest`, `make`, `ruff`)
-        // is not -- its output depends on the tree, so re-running to see 20 more
-        // lines can produce different output and is precisely the wasted work
-        // this nerf exists to remove. Point that case at bash_bg instead.
-        lines.push(
-            `The output was small enough to return inline, so nothing was written to disk or indexed. The lines above are a bounded view; the rest were never captured and cannot be retrieved afterwards.`
-        );
-        if (pureReadCommand(plan.rewritten)) {
-            lines.push(
-                `Your command only reads, so it is idempotent: run it again with a different bound (tail -N, head -N) or with no pipe to see any part you want.`
-            );
-        } else {
-            lines.push(
-                `Your command runs rather than only reads, so do NOT re-run it just to see more lines. Use bash_bg with the plain command next time: it writes the full output to a log and indexes it, so every part stays readable at any size.`
-            );
-        }
-    }
-
     return lines.join("\n");
 }
 

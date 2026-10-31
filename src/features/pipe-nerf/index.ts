@@ -200,10 +200,8 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 lineCount: null,
             });
         }
-        // The result will be a BOUNDED view, so the rest of the output has to be
-        // captured for the agent to read later. The sidecar's own threshold is
-        // 300 lines / 24KB, and the commands this touches are usually smaller
-        // than that, so the bash tool is told to index this call explicitly.
+        // Force indexing for a hoisted limiter; the retention contract and its
+        // rationale live at prepareInlineOutput, where storage is selected.
         state?.pipeHoistedCalls.add(event.toolCallId);
         // A duplicate toolCallId cannot be attributed to either call, so drop the
         // entry rather than annotate one result with the other call's note,
