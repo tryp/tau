@@ -24,7 +24,7 @@ import type { TauState } from "../../state.ts";
 import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
 import { formatSidecarReceipt } from "../sidecar.ts";
-import { bashGuidelines, pipeNote } from "./messages.ts";
+import { bashGuidelines, pipeNoteSections } from "./messages.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { applyLimiter, planPipeNerf } from "./parse.ts";
@@ -46,7 +46,8 @@ export type {
     PipeOptions,
     SkipReason,
 } from "./parse.ts";
-export { bashGuidelines, pipeNote } from "./messages.ts";
+export { bashGuidelines, pipeNote, pipeNoteSections } from "./messages.ts";
+export type { PipeNoteSections } from "./messages.ts";
 export type { PipeObservation } from "./messages.ts";
 
 /**
@@ -354,7 +355,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             ? { err: 0, warn: 0, lines: text.split("\n").length }
             : visibleSeverity(text);
 
-        const note = pipeNote(plan, {
+        const note = pipeNoteSections(plan, {
             // Core computes `totalLines` before its own truncation, so it counts
             // lines that are not in the inline result. Falling back to the
             // visible count would understate the output on a large result, so it
@@ -375,7 +376,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
             ),
             pipeStageZero: stageZero,
         });
-        if (!note) return;
+        if (!note.receipt && !note.notice) return;
 
         // The bounded view replaces the raw capture, so the agent's context
         // stays what they asked for. A faithful view is exactly what their pipe
@@ -393,8 +394,23 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                   },
               ]
             : [...event.content];
+        // Notes describe the rewrite or retrieval path, not the tool outcome;
+        // leaving isError untouched keeps command success/failure authoritative.
         return {
-            content: [{ type: "text" as const, text: note }, ...body],
+            content: [
+                ...(note.receipt
+                    ? [{ type: "text" as const, text: note.receipt }]
+                    : []),
+                ...body,
+                ...(note.notice
+                    ? [
+                          {
+                              type: "text" as const,
+                              text: `\n\n[notice] ${note.notice}`,
+                          },
+                      ]
+                    : []),
+            ],
         };
     });
 

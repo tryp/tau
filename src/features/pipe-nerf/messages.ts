@@ -104,11 +104,10 @@ const MAX_PREVIEW_CHARS = 200;
  *   to believe.
  * - It must never send the agent back to re-run the command for more lines.
  *
- * So there are three cases, in the order the code tests them:
+ * So there are three capture cases, in the order the code tests them:
  *
- * 1. No retrieval handle and no capture to speak of: say so plainly. The
- *    discarded lines really are gone at that point, so promising retrieval is
- *    the original lie in a new place.
+ * 1. No retrieval handle: say that no handle is available and point to the view.
+ *    Do not infer that no output was captured; visible output may still exist.
  * 2. A handle, and the view already contains every captured line: say the view
  *    is complete. "All are retained, read any window" beside complete output
  *    sends the agent to a tool call that cannot show it anything new.
@@ -116,17 +115,29 @@ const MAX_PREVIEW_CHARS = 200;
  *    give the retrieval forms. The count is over the WHOLE capture, so it is the
  *    stat the agent would otherwise re-run the command to compute.
  */
-export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
-    if (plan.action !== "rewrite" || !plan.invocation) return "";
+/** The rewrite receipt and capture/retrieval notice have different positions. */
+export interface PipeNoteSections {
+    /** Explains what command actually ran; keep this ahead of its output. */
+    receipt: string;
+    /** Capture state and retrieval guidance; keep this after the payload. */
+    notice: string;
+}
+
+export function pipeNoteSections(
+    plan: PipePlan,
+    observed: PipeObservation
+): PipeNoteSections {
+    if (plan.action !== "rewrite" || !plan.invocation) {
+        return { receipt: "", notice: "" };
+    }
     const invocation = plan.invocation;
     const capturedLines = observed.totalLines ?? observed.visibleLines;
-    const lines = [
-        `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
-    ];
-    if (observed.caveat) lines.push(`View caveat: ${observed.caveat}`);
+    const receipt = `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`;
+    const noticeLines: string[] = [];
+    if (observed.caveat) noticeLines.push(`View caveat: ${observed.caveat}`);
     // A handle, not a size. "Retained" means retrievable somewhere the agent can
-    // reach; zero lines is the one capture not worth indexing, and it is excluded
-    // here so an empty result reads as empty instead of as retained-but-hidden.
+    // reach; zero lines is the one capture not worth indexing, and is excluded
+    // here so it is not mistaken for retained-but-hidden output.
     const hasRetrievalHandle =
         Boolean(observed.fullOutputPath || observed.sourceId) &&
         capturedLines !== 0;
@@ -148,18 +159,18 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
             capturedLines > viewLimit);
 
     if (!hasRetrievalHandle) {
-        lines.unshift(
-            "No output was captured, so there is nothing available to retrieve."
+        noticeLines.push(
+            "No retrieval handle is available for this output; use the view below."
         );
-        return lines.join("\n");
+        return { receipt, notice: noticeLines.join("\n") };
     }
 
     const count = capturedLines ?? 0;
     if (!hasLinesBeyondView) {
-        lines.unshift(
+        noticeLines.push(
             `The complete ${count}-line output is retained; the view above contains all of it.`
         );
-        return lines.join("\n");
+        return { receipt, notice: noticeLines.join("\n") };
     }
 
     // The receipt's own chunk id is preferred because it is the chunk the agent
@@ -170,15 +181,21 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
         : observed.sourceId
           ? `context_get source_id:${JSON.stringify(observed.sourceId)} chunk_id:${JSON.stringify(observed.receiptLines[1]?.match(/chunk_id:["']?([^"' ]+)/)?.[1] ?? `${observed.sourceId}_0001`)}`
           : "";
-    lines.unshift(
+    noticeLines.push(
         `Captured ${count} lines; all are retained (${observed.err} err, ${observed.warn} warn). Read any window with ${range}.`
     );
     if (observed.sourceId) {
-        lines.push(
+        noticeLines.push(
             `Search: context_search query:"pattern" source_id:${JSON.stringify(observed.sourceId)}`
         );
     }
-    return lines.join("\n");
+    return { receipt, notice: noticeLines.join("\n") };
+}
+
+/** Combined form retained for callers that need to inspect the complete note. */
+export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
+    const sections = pipeNoteSections(plan, observed);
+    return [sections.receipt, sections.notice].filter(Boolean).join("\n");
 }
 
 /** Standing guidance contributed to the bash tool's prompt guidelines. */

@@ -24,6 +24,7 @@ import {
     findPipeInvocation,
     lastPipeOperator,
     pipeNote,
+    pipeNoteSections,
     planPipeNerf,
     registerPipeNerf,
     type PipeObservation,
@@ -885,8 +886,9 @@ void describe("pipe-nerf note", () => {
                     "a summary of the captured output, with its totals",
             })
         );
-        assert.match(receipt, /No output was captured/);
-        assert.doesNotMatch(receipt, /retained|context_search/);
+        assert.match(receipt, /No retrieval handle is available/);
+        assert.match(receipt, /view below/);
+        assert.doesNotMatch(receipt, /retained|context_search|no output was captured/i);
     });
 
     void it("retains every captured line discarded by the limiter and gives retrieval instructions", () => {
@@ -1003,7 +1005,7 @@ void describe("pipe-nerf note", () => {
                 },
             })
         );
-        assert.match(captured, /No output was captured/);
+        assert.match(captured, /No retrieval handle is available/);
         assert.doesNotMatch(captured, /pi-pipe-stage0|re-filter/);
     });
 
@@ -1029,17 +1031,16 @@ void describe("pipe-nerf note", () => {
         assert.ok(note.split("\n").length <= 4);
     });
 
-    void it("does not claim retention when nothing was captured", () => {
-        const note = pipeNote(
+    void it("does not claim the capture is empty when no retrieval handle exists", () => {
+        const sections = pipeNoteSections(
             plan("pytest -q | tail -5"),
             observation({ totalLines: 0, visibleLines: 0 })
         );
-        assert.match(
-            note,
-            /No output was captured, so there is nothing available to retrieve/
-        );
-        assert.doesNotMatch(note, /retained|context_search|sed -n/);
-        assert.doesNotMatch(note, /re-run|bash_bg/);
+        assert.doesNotMatch(sections.notice, /no output was captured/i);
+        assert.match(sections.notice, /view below/i);
+        assert.match(sections.notice, /no retrieval handle/i);
+        assert.doesNotMatch(sections.notice, /retained|context_search|sed -n/);
+        assert.doesNotMatch(sections.notice, /re-run|bash_bg/);
     });
 
     void it("does not claim there is more data when the visible view is complete", () => {
@@ -1072,12 +1073,14 @@ void describe("pipe-nerf note", () => {
         assert.doesNotMatch(note, /small enough|nothing was written/);
     });
 
-    void it("falls back to the visible count when the tool reports no detail", () => {
+    void it("does not infer a retrieval handle from the visible count alone", () => {
         const note = pipeNote(
             plan("ls | wc -l"),
             observation({ totalLines: null, visibleLines: 17 })
         );
-        assert.match(note, /No output was captured/);
+        assert.match(note, /No retrieval handle is available/);
+        assert.match(note, /view below/);
+        assert.doesNotMatch(note, /no output was captured/i);
     });
 
     void it("is empty for a skip", () => {
@@ -1152,6 +1155,52 @@ void describe("pipe-nerf registration", () => {
         return out;
     }
 
+    void it("keeps the rewrite receipt before a non-empty payload", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "receipt-order",
+            input: { command: "printf 'a\\nb\\n' | tail -2" },
+        });
+
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "receipt-order",
+            content: [{ type: "text", text: "a\nb" }],
+            details: { truncation: { truncated: false, totalLines: 2 } },
+        }) as { content: { type: string; text: string }[] };
+
+        assert.match(result.content[0].text, /^Effective command:/);
+        assert.equal(result.content[1].text, "a\nb");
+    });
+
+    void it("keeps the tagged capture tip after payload and never first", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "tip-order",
+            input: { command: "seq 1 60 | tail -2" },
+        });
+        const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "tip-order",
+            content: [{ type: "text", text: capture }],
+            details: {
+                truncation: { truncated: false, totalLines: 60 },
+                fullOutputPath: "/tmp/tip-order.log",
+            },
+        }) as { content: { type: string; text: string }[] };
+
+        assert.equal(result.content[1].text, "line-59\nline-60");
+        const tip = result.content.at(-1)?.text ?? "";
+        assert.ok(tip.startsWith("\n\n[notice] "));
+        assert.match(tip, /Captured 60 lines; all are retained/);
+        assert.doesNotMatch(result.content[0].text, /^\s*\[notice\]/);
+    });
+
     void it("rewrites the command and annotates the result", () => {
         const { pi, handlers, entries, guidelines } = fakePi();
         registerPipeNerf(pi as never);
@@ -1187,20 +1236,22 @@ void describe("pipe-nerf registration", () => {
                 .length,
             0
         );
-        const note = result.content[0].text;
+        const receipt = result.content[0].text;
+        const payload = result.content[1].text;
+        const notice = result.content[2].text;
         assert.ok(
-            note.includes(
+            receipt.includes(
                 `Effective command: ${JSON.stringify(actualCommand)}.`
             )
         );
+        assert.equal(payload, "FAILED tests/x");
+        assert.ok(notice.startsWith("\n\n[notice] "));
         assert.match(
-            note,
+            notice,
             /Captured 900 lines; all are retained \(0 err, 1 warn\)/
         );
-        assert.match(note, /sed -n 'START,ENDp' \/tmp\/out\.log/);
-        assert.doesNotMatch(note, /re-running/);
-        // The original content is preserved after the note.
-        assert.equal(result.content[1].text, "FAILED tests/x");
+        assert.match(notice, /sed -n 'START,ENDp' \/tmp\/out\.log/);
+        assert.doesNotMatch(notice, /re-running/);
     });
 
     void it("rewrites bash_bg too, which is where the log is the only record", () => {
@@ -1229,8 +1280,12 @@ void describe("pipe-nerf registration", () => {
             },
         }) as { content: { text: string }[] };
 
-        const note = result.content[0].text;
-        assert.match(note, /complete 1-line output is retained/);
+        assert.match(result.content[0].text, /^Effective command:/);
+        assert.equal(result.content[1].text, "ok");
+        assert.match(
+            result.content[2].text,
+            /complete 1-line output is retained/
+        );
     });
 
     void it("returns the requested small head content after a forced index, not a receipt", () => {
@@ -1258,8 +1313,9 @@ void describe("pipe-nerf registration", () => {
                 fullOutputPath: "/tmp/small-head.log",
             },
         }) as { content: { type: string; text: string }[] };
+        assert.match(result.content[0].text, /^Effective command:/);
         assert.match(
-            result.content[0].text,
+            result.content[2].text,
             /Captured 60 lines; all are retained/
         );
         assert.equal(
@@ -1370,7 +1426,7 @@ void describe("pipe-nerf registration", () => {
         }) as { content: { type: string; text: string }[] };
 
         const body = result.content
-            .slice(1)
+            .slice(1, -1)
             .map((part) => part.text)
             .join("\n");
         assert.equal(body, "line-58\nline-59\nline-60");
@@ -1402,9 +1458,9 @@ void describe("pipe-nerf registration", () => {
             },
         }) as { content: { type: string; text: string }[] };
 
-        const note = result.content[0].text;
+        const note = result.content.at(-1)?.text ?? "";
         const body = result.content
-            .slice(1)
+            .slice(1, -1)
             .map((part) => part.text)
             .join("\n");
         assert.equal(body, remnant, "the capture must be returned as-is");
@@ -1449,9 +1505,9 @@ void describe("pipe-nerf registration", () => {
             },
         }) as { content: { text: string }[] };
 
-        const note = result.content[0].text;
+        const note = result.content.at(-1)?.text ?? "";
         const body = result.content
-            .slice(1)
+            .slice(1, -1)
             .map((part) => part.text)
             .join("\n");
         // The receipt is untouched, not sliced to its last 3 lines.
