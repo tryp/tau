@@ -29,13 +29,9 @@ export interface PipeObservation {
     /**
      * Why the view is not faithful, phrased for the agent.
      *
-     * NOT rendered by `pipeNote` today. When a view is unfaithful the caller
-     * keeps the tool's own content as the body, so the agent is looking at the
-     * whole capture rather than at a reduced answer, and the note stays strictly
-     * about retention instead of describing a view it did not produce. The field
-     * is still populated because the distinction is what tells a caller (and a
-     * test) that the view is a lower bound; surfacing the sentence again is a
-     * one-line change here and should come with a test for the unfaithful note.
+     * Rendered by `pipeNote` when the requested view could not be reconstructed,
+     * so the agent knows why the body is the tool's capture rather than the
+     * bounded answer.
      */
     caveat: string | null;
     /**
@@ -127,6 +123,7 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     const lines = [
         `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
     ];
+    if (observed.caveat) lines.push(`View caveat: ${observed.caveat}`);
     // A handle, not a size. "Retained" means retrievable somewhere the agent can
     // reach; zero lines is the one capture not worth indexing, and it is excluded
     // here so an empty result reads as empty instead of as retained-but-hidden.

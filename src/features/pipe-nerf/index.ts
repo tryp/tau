@@ -241,7 +241,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
     pi.on("tool_result", (event) => {
         const plan = pending.get(event.toolCallId);
-        if (!plan || plan.action !== "rewrite" || !plan.invocation) {
+        if (!plan || plan.action !== "rewrite") {
             pending.delete(event.toolCallId);
             return;
         }
@@ -253,6 +253,28 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
         const details =
             (event as { details?: BashResultDetails }).details ?? {};
+        if (plan.preserveLimiterViews) {
+            const capture = (
+                details as {
+                    pipeStageZero?: { path: string; sourceId: string | null };
+                }
+            ).pipeStageZero;
+            const retrieval = capture?.sourceId
+                ? ` Stage-0 output is indexed as ${JSON.stringify(capture.sourceId)}.`
+                : capture?.path
+                  ? ` Stage-0 output is retained at ${capture.path}.`
+                  : "";
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: `Effective command: ${JSON.stringify(plan.rewritten)}. Every shell limiter was preserved, so the output below is already the requested view.${retrieval}`,
+                    },
+                    ...event.content,
+                ],
+            };
+        }
+        if (!plan.invocation) return;
         // Teed to by the rewrite when the command still filtered.
         const stageZero =
             (

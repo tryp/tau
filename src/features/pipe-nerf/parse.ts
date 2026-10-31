@@ -134,6 +134,8 @@ export interface PipePlan {
      * second file would duplicate it.
      */
     stageZero: { path: string; command: string; operatorAt: number } | null;
+    /** Compound calls keep their shell limiters, so the shell already made each view. */
+    preserveLimiterViews?: boolean;
 }
 
 /**
@@ -260,6 +262,28 @@ function controlOperatorIn(text: string): number {
     }
     return -1;
 }
+
+/** Split at top-level statement/status operators, retaining each separator. */
+function splitControlSegments(
+    command: string
+): { text: string; separator: string }[] {
+    const segments: { text: string; separator: string }[] = [];
+    let start = 0;
+    while (start < command.length) {
+        const relative = controlOperatorIn(command.slice(start));
+        if (relative < 0) break;
+        const at = start + relative;
+        const separator =
+            command.startsWith("&&", at) || command.startsWith("||", at)
+                ? command.slice(at, at + 2)
+                : command[at];
+        segments.push({ text: command.slice(start, at), separator });
+        start = at + separator.length;
+    }
+    segments.push({ text: command.slice(start), separator: "" });
+    return segments;
+}
+
 /**
  * Index of the command's FIRST top-level pipe operator, or -1.
  *
@@ -487,10 +511,25 @@ export function findPipeInvocation(command: string): PipeInvocation | null {
         mergedStderr: hasStderrMerge(command.slice(0, at)),
         stageStart,
         args,
-        // Any top-level `|` before the limiter is an upstream stage. `grep`/`sed`
-        // earlier in the chain is preserved by the rewrite, so it still runs --
-        // it just means the capture is no longer the limiter's direct input.
-        hasUpstreamStage: lastPipeOperator(command.slice(0, at)) >= 0,
+        // Only a pipe in this command segment is upstream. A pipeline after `;`,
+        // `&&`, or `||` is independent and must not make this limiter unfaithful.
+        hasUpstreamStage: (() => {
+            let segmentStart = 0;
+            while (segmentStart < at) {
+                const relative = controlOperatorIn(
+                    command.slice(segmentStart, at)
+                );
+                if (relative < 0) break;
+                const operatorAt = segmentStart + relative;
+                segmentStart =
+                    operatorAt +
+                    (command.startsWith("&&", operatorAt) ||
+                    command.startsWith("||", operatorAt)
+                        ? 2
+                        : 1);
+            }
+            return lastPipeOperator(command.slice(segmentStart, at)) >= 0;
+        })(),
     };
 }
 
@@ -776,6 +815,82 @@ export function planPipeNerf(
     options: PipeOptions = {}
 ): PipePlan {
     if (hasHeredocOperator(command)) return skipped(command, "heredoc");
+
+    // A compound call has more than one independently filtered stream. Removing
+    // one limiter and applying its view to the concatenated result would delete
+    // the other answer (or apply it to the wrong segment). Keep every limiter in
+    // the shell and tee each pipeline's stage 0 into the shared per-call capture;
+    // the shell's result is then already the exact view for every segment.
+    const segments = splitControlSegments(command);
+    if (segments.length > 1) {
+        const invocations = segments.map((segment) =>
+            findPipeInvocation(segment.text)
+        );
+        const filteredSegments = invocations
+            .map((invocation, index) => ({ invocation, index }))
+            .filter((item) => item.invocation !== null);
+        const pipelineCount = segments.filter(
+            (segment) => lastPipeOperator(segment.text) >= 0
+        ).length;
+        if (filteredSegments.length > 0 && pipelineCount > 1) {
+            const invocation = filteredSegments[0].invocation!;
+            if (options.enabled === false || !options.stageZeroPath) {
+                return skipped(command, "no-pipe", invocation);
+            }
+            if (TRAILING_COMMENT_RE.test(command)) {
+                return skipped(command, "limiter-in-comment", invocation);
+            }
+            let offset = 0;
+            let firstCapture: PipePlan["stageZero"] = null;
+            const rewrittenSegments = segments.map((segment, index) => {
+                const currentOffset = offset;
+                offset += segment.text.length + segment.separator.length;
+                const current = invocations[index];
+                if (!current) return segment;
+                const pipeAt = firstPipeOperator(segment.text);
+                if (
+                    pipeAt < 0 ||
+                    /\|&/.test(segment.text) ||
+                    (current.kind === "tail" &&
+                        /(?:^|\s)-[A-Za-z]*f(?:\s|$)/.test(current.args))
+                ) {
+                    return null;
+                }
+                const before = segment.text
+                    .slice(0, pipeAt)
+                    .replace(/\s+$/, "");
+                const after = segment.text
+                    .slice(pipeAt + 1)
+                    .replace(/^\s+/, "");
+                const teePath = JSON.stringify(options.stageZeroPath);
+                const text = `${before} | tee -a ${teePath} | ${after}`;
+                if (!firstCapture) {
+                    firstCapture = {
+                        path: options.stageZeroPath!,
+                        command: "compound pipeline stage-0 outputs",
+                        operatorAt: currentOffset + pipeAt,
+                    };
+                }
+                return { ...segment, text };
+            });
+            if (rewrittenSegments.some((segment) => segment === null)) {
+                return skipped(command, "no-pipe", invocation);
+            }
+            const rewritten = rewrittenSegments
+                .map((segment) => `${segment!.text}${segment!.separator}`)
+                .join("");
+            return {
+                action: "rewrite",
+                reason: null,
+                original: command,
+                invocation,
+                rewritten,
+                stageZero: firstCapture,
+                preserveLimiterViews: true,
+            };
+        }
+    }
+
     const at = lastPipeOperator(command);
     if (at < 0) return skipped(command, "no-pipe");
 

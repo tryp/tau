@@ -503,6 +503,86 @@ void describe("pipe-nerf rewrite safety", () => {
     });
 });
 
+void describe("pipe-nerf compound pipelines", () => {
+    const cases = [
+        [";", "seq 1 10 | tail -2; seq 1 10 | wc -l"],
+        ["&&", "seq 1 10 | tail -2 && seq 1 10 | wc -l"],
+        ["||", "false || seq 1 10 | tail -2; seq 1 10 | wc -l"],
+    ] as const;
+
+    for (const [separator, command] of cases) {
+        void it(`keeps and reproduces both pipeline views across ${separator}`, () => {
+            const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-compound-"));
+            const stageZeroPath = join(dir, "stage-zero.log");
+            try {
+                const plan = planPipeNerf(command, { stageZeroPath });
+                assert.equal(plan.action, "rewrite");
+                assert.equal(plan.preserveLimiterViews, true);
+                assert.match(plan.rewritten, /tail -2/);
+                assert.match(plan.rewritten, /wc -l/);
+                assert.equal(
+                    execFileSync("bash", ["-c", plan.rewritten], {
+                        encoding: "utf8",
+                    }),
+                    execFileSync("bash", ["-c", command], {
+                        encoding: "utf8",
+                    })
+                );
+                assert.equal(
+                    readFileSync(stageZeroPath, "utf8"),
+                    `${Array.from({ length: 10 }, (_, i) => i + 1).join("\n")}\n${Array.from({ length: 10 }, (_, i) => i + 1).join("\n")}\n`
+                );
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+    }
+
+    void it("does not apply one pipeline's limiter to another pipeline's output", () => {
+        const command = "seq 1 10 | grep '^1'; seq 1 10 | wc -l";
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-compound-single-"));
+        try {
+            const plan = planPipeNerf(command, {
+                stageZeroPath: join(dir, "stage-zero.log"),
+            });
+            assert.equal(plan.preserveLimiterViews, true);
+            assert.match(plan.rewritten, /wc -l/);
+            assert.equal(
+                execFileSync("bash", ["-c", plan.rewritten], {
+                    encoding: "utf8",
+                }),
+                execFileSync("bash", ["-c", command], { encoding: "utf8" })
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("declines the whole compound call when a segment cannot be instrumented", () => {
+        const command = "seq 1 10 |& cat | tail -2; seq 1 10 | wc -l";
+        const plan = planPipeNerf(command, {
+            stageZeroPath: "/tmp/stage-zero.log",
+        });
+        assert.equal(plan.action, "skip");
+        assert.equal(plan.rewritten, command);
+    });
+
+    void it("leaves a single-pipeline rewrite unchanged", () => {
+        assert.equal(plan("seq 1 10 | tail -2").rewritten, "seq 1 10");
+    });
+
+    void it("does not rewrite a limiter before a trailing control operator", () => {
+        for (const command of [
+            "seq 1 10 | tail -2; echo done",
+            "seq 1 10 | head -2 && echo done",
+        ]) {
+            const result = plan(command);
+            assert.equal(result.action, "skip", command);
+            assert.equal(result.rewritten, command);
+        }
+    });
+});
+
 void describe("pipe-nerf stage-0 capture", () => {
     const PATH_0 = "/tmp/stage0-test.log";
 
@@ -1142,16 +1222,16 @@ void describe("pipe-nerf registration", () => {
         const { pi, handlers } = fakePi();
         registerPipeNerf(pi as never);
         const capture = Array.from(
-            { length: 60 },
+            { length: 200 },
             (_, i) => `line-${i + 1}`
         ).join("\n");
-        const input: { command: string } = { command: "seq 1 60 | head -5" };
+        const input: { command: string } = { command: "seq 1 200 | head -5" };
         fire(handlers, "tool_call", {
             toolName: "bash",
             toolCallId: "small-head",
             input,
         });
-        assert.equal(input.command, "seq 1 60");
+        assert.equal(input.command, "seq 1 200");
         const result = fire(handlers, "tool_result", {
             toolName: "bash",
             toolCallId: "small-head",
@@ -1171,7 +1251,66 @@ void describe("pipe-nerf registration", () => {
             result.content[1].text,
             "line-1\nline-2\nline-3\nline-4\nline-5"
         );
+        assert.doesNotMatch(result.content[1].text, /line-6|line-200/);
         assert.doesNotMatch(result.content[1].text, /context-sidecar/);
+    });
+
+    void it("returns wc -l's answer to the agent instead of the raw capture", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        const capture = Array.from({ length: 200 }, (_, i) =>
+            String(i + 1)
+        ).join("\n");
+        const input: { command: string } = { command: "seq 1 200 | wc -l" };
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "small-wc",
+            input,
+        });
+        assert.equal(input.command, "seq 1 200");
+
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "small-wc",
+            content: [{ type: "text", text: capture }],
+            details: { truncation: { truncated: false, totalLines: 200 } },
+        }) as { content: { type: string; text: string }[] };
+
+        assert.equal(result.content[1].text, "200");
+        assert.doesNotMatch(result.content[1].text, /1\n2|200\n/);
+    });
+
+    void it("preserves both shell-produced views in a compound call", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        const input: { command: string } = {
+            command: "seq 1 10 | tail -2; echo ===; seq 1 10 | wc -l",
+        };
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "compound-wc",
+            input,
+        });
+        assert.match(input.command, /tail -2/);
+        assert.match(input.command, /wc -l/);
+
+        const visible = "9\n10\n===\n10";
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "compound-wc",
+            content: [{ type: "text", text: visible }],
+            details: {
+                truncation: { truncated: false, totalLines: 4 },
+                pipeStageZero: {
+                    path: "/tmp/compound-stage-zero.log",
+                    command: "seq 1 10",
+                    sourceId: "ctx_compound_stage_zero",
+                },
+            },
+        }) as { content: { type: string; text: string }[] };
+        assert.match(result.content[0].text, /ctx_compound_stage_zero/);
+        assert.equal(result.content[1].text, visible);
+        assert.doesNotMatch(result.content[1].text, /1\n2/);
     });
 
     void it("returns the bounded view, not the whole capture", () => {
@@ -1238,6 +1377,10 @@ void describe("pipe-nerf registration", () => {
             .join("\n");
         assert.equal(body, remnant, "the capture must be returned as-is");
         assert.match(note, /Captured 9000 lines; all are retained/);
+        assert.match(
+            note,
+            /View caveat: your pipe asked for the first 3 lines/
+        );
         assert.match(note, /sed -n 'START,ENDp' \/tmp\/out\.log/);
     });
 
