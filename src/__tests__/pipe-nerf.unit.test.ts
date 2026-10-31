@@ -767,21 +767,22 @@ void describe("pipe-nerf bounded view", () => {
         );
         assert.equal(view.faithful, false);
         assert.match(view.caveat ?? "", /awk program/);
-        // The note must name it, so the fallback reads as deliberate.
         const note = pipeNote(
             plan("ls | awk 'END{print}'"),
             observation({
+                fullOutputPath: "/tmp/awk.log",
+                totalLines: 60,
                 faithful: view.faithful,
                 caveat: view.caveat,
                 viewDescription: "the full captured output",
             })
         );
-        assert.match(note, /awk program/);
+        assert.match(note, /Captured 60 lines; all are retained/);
     });
 });
 
 void describe("pipe-nerf note", () => {
-    void it("keeps a faithful note to one line and avoids contradictory recovery claims", () => {
+    void it("keeps the retained-output note concise and avoids contradictory recovery claims", () => {
         const faithful = pipeNote(
             plan("cat output.txt | head -5"),
             observation({
@@ -789,7 +790,8 @@ void describe("pipe-nerf note", () => {
                 sourceId: "ctx_123",
             })
         );
-        assert.ok(faithful.split("\n").length <= 1, faithful);
+        assert.ok(faithful.split("\n").length <= 4, faithful);
+        assert.match(faithful, /all are retained/);
 
         const receipt = pipeNote(
             plan("cat output.txt | head -5"),
@@ -798,46 +800,47 @@ void describe("pipe-nerf note", () => {
                     "a summary of the captured output, with its totals",
             })
         );
-        const receiptBranch = receipt.includes("Showing below: a summary");
-        const noCaptureBranch = receipt.includes(
-            "nothing was written to disk or indexed"
-        );
-        assert.equal(
-            Number(receiptBranch) + Number(noCaptureBranch),
-            1,
-            receipt
-        );
+        assert.match(receipt, /No output was captured/);
+        assert.doesNotMatch(receipt, /retained|context_search/);
     });
 
-    void it("says what was removed, what ran, and what to do next", () => {
-        const note = pipeNote(plan("make -j8 2>&1 | tail -50"), observation());
-        assert.match(note, /\[pipe-nerf\]/);
-        assert.match(note, /\| tail -50/);
-        assert.match(note, /Effective command: "make -j8 2>&1"/);
-        assert.match(note, /stderr into stdout/);
-        assert.match(note, /small enough to return inline/);
-        assert.match(note, /do NOT re-run it just to see more lines/);
+    void it("retains every captured line discarded by the limiter and gives retrieval instructions", () => {
+        const note = pipeNote(
+            plan("pytest -q | tail -5"),
+            observation({
+                totalLines: 4000,
+                visibleLines: 5,
+                fullOutputPath: "/tmp/pytest.log",
+                sourceId: "ctx_pytest",
+            })
+        );
+        assert.match(note, /Captured 4000 lines; all are retained/);
+        assert.match(note, /sed -n 'START,ENDp' \/tmp\/pytest\.log/);
+        assert.match(note, /context_search.*ctx_pytest/);
+        assert.match(note, /Effective command:/);
+        assert.doesNotMatch(note, /nothing was written|re-run|export it whole/);
     });
 
     void it("does not claim the stream separation is back when it is not", () => {
-        // The rewrite deliberately leaves the command's own `2>&1` in place, so
-        // the streams are still merged. The old note claimed the separation was
-        // restored, which was false: the agent relied on it and got a merged
-        // stream back. The truthful claim is that the merge is no longer CUT.
-        const note = pipeNote(plan("make -j8 2>&1 | tail -50"), observation());
-        assert.ok(note.includes("no longer cut"), note);
-        assert.ok(!/separation is back/.test(note), note);
-        // And it names the one action that would recover the separation.
-        assert.match(note, /left in place/);
-        assert.match(note, /if you want them reported separately/);
+        const note = pipeNote(
+            plan("make -j8 2>&1 | tail -50"),
+            observation({ totalLines: 51, fullOutputPath: "/tmp/make.log" })
+        );
+        assert.match(note, /Captured 51 lines; all are retained/);
+        assert.doesNotMatch(note, /separation is back|left in place/);
     });
 
     void it("reports the err/warn mix with the line count", () => {
         const note = pipeNote(
             plan("pytest -q | tail -20"),
-            observation({ totalLines: 1204, err: 12, warn: 88 })
+            observation({
+                totalLines: 1204,
+                err: 12,
+                warn: 88,
+                fullOutputPath: "/tmp/test.log",
+            })
         );
-        assert.match(note, /1204 lines \(12 err, 88 warn\)/);
+        assert.match(note, /1204 lines; all are retained \(12 err, 88 warn\)/);
     });
 
     void it("points at the sidecar when the output was indexed", () => {
@@ -853,21 +856,23 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(note, /source ctx_bg_abc/);
-        assert.match(note, /full output: indexed/);
-        assert.equal(note.split("\n").length, 1);
+        assert.match(note, /context_get source_id:"ctx_bg_abc"/);
+        assert.match(note, /context_search.*ctx_bg_abc/);
+        assert.ok(note.split("\n").length <= 4);
     });
 
     void it("warns that head and the tool disagree about which end to keep", () => {
         const note = pipeNote(
             plan("git log | head -10"),
             observation({
+                totalLines: 30,
+                fullOutputPath: "/tmp/git.log",
                 viewDescription:
                     "the first 10 lines, as your pipe would have printed",
             })
         );
-        assert.match(note, /first 10 lines, as your pipe would have printed/);
-        assert.match(note, /keeps the END/);
+        assert.match(note, /Captured 30 lines; all are retained/);
+        assert.doesNotMatch(note, /keeps the END/);
     });
 
     void it("names the pre-filter capture and how to re-filter it", () => {
@@ -892,14 +897,9 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(captured, /pre-filter: \/home\/dev\/tmp\/pi-pipe-stage0/);
-        assert.match(captured, /source ctx_bg_stage0/);
-        assert.match(
-            captured,
-            /re-filter with context_search query:"pattern" source_id:"ctx_bg_stage0"/
-        );
-        assert.match(captured, /source ctx_bg_post/);
-        assert.equal(captured.split("\n").length, 1);
+        assert.match(captured, /Captured 12 lines; all are retained/);
+        assert.match(captured, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
+        assert.doesNotMatch(captured, /pre-filter:|re-filter/);
     });
 
     void it("falls back to the path when the pre-filter capture is not indexed", () => {
@@ -913,12 +913,8 @@ void describe("pipe-nerf note", () => {
                 },
             })
         );
-        assert.match(captured, /not indexed/);
-        assert.match(captured, /grep -nE "pattern" .*pi-pipe-stage0/);
-        assert.ok(
-            !/re-running a DIFFERENT filter is a search/.test(captured),
-            "an unindexed capture must not promise a sidecar search"
-        );
+        assert.match(captured, /No output was captured/);
+        assert.doesNotMatch(captured, /pi-pipe-stage0|re-filter/);
     });
 
     void it("offers the log path on the sidecar route too", () => {
@@ -937,45 +933,53 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(note, /full output: \/tmp\/pi-bg-job\.log/);
-        assert.match(note, /source ctx_bg_abc/);
-        assert.equal(note.split("\n").length, 1);
+        assert.match(note, /Captured 1204 lines; all are retained/);
+        assert.match(note, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
+        assert.match(note, /context_search.*ctx_bg_abc/);
+        assert.ok(note.split("\n").length <= 4);
     });
 
-    void it("is honest when the capture fit inline and the view is bounded", () => {
-        // `| wc -l` on 4 lines: the view IS the whole output, so the note says
-        // nothing was written to disk. But for a bounded view over an inline
-        // capture it must NOT claim "what is shown is the complete output" --
-        // that is false, and it hides that the rest has to be re-requested.
-        const bounded = pipeNote(
-            plan("ls | wc -l"),
-            observation({ totalLines: 4, visibleLines: 4 })
+    void it("does not claim retention when nothing was captured", () => {
+        const note = pipeNote(
+            plan("pytest -q | tail -5"),
+            observation({ totalLines: 0, visibleLines: 0 })
         );
-        assert.match(bounded, /nothing was written to disk/);
-        assert.match(bounded, /Captured 4 lines/);
-        assert.ok(
-            !/complete output/.test(bounded),
-            "an inline capture with a bounded view is not the complete output"
+        assert.match(
+            note,
+            /No output was captured, so there is nothing available to retrieve/
+        );
+        assert.doesNotMatch(note, /retained|context_search|sed -n/);
+        assert.doesNotMatch(note, /re-run|bash_bg/);
+    });
+
+    void it("does not claim there is more data when the visible view is complete", () => {
+        const note = pipeNote(
+            plan("pytest -q | tail -5"),
+            observation({
+                totalLines: 5,
+                visibleLines: 5,
+                fullOutputPath: "/tmp/pytest.log",
+            })
+        );
+        assert.match(note, /complete 5-line output/);
+        assert.doesNotMatch(
+            note,
+            /all are retained|Read any window|context_search/
         );
     });
 
-    void it("tells a pure reader it can safely re-run with a different bound", () => {
-        // A reader is idempotent, so a different bound is a valid answer to
-        // "show me more". A runner is not, and must be steered to bash_bg rather
-        // than told to re-run.
-        const read = pipeNote(
-            plan("cat f | tail -3"),
-            observation({ totalLines: 60, visibleLines: 3 })
+    void it("retains a small capture because size must not decide survival", () => {
+        const note = pipeNote(
+            plan("pytest -q | tail -5"),
+            observation({
+                totalLines: 8,
+                visibleLines: 5,
+                fullOutputPath: "/tmp/small-pytest.log",
+            })
         );
-        assert.match(read, /only reads, so it is idempotent/);
-        assert.match(read, /different bound/);
-
-        const run = pipeNote(
-            plan("pytest -q | tail -3"),
-            observation({ totalLines: 60, visibleLines: 3 })
-        );
-        assert.match(run, /do NOT re-run it just to see more lines/);
-        assert.match(run, /bash_bg with the plain command/);
+        assert.match(note, /Captured 8 lines; all are retained/);
+        assert.match(note, /sed -n 'START,ENDp' \/tmp\/small-pytest\.log/);
+        assert.doesNotMatch(note, /small enough|nothing was written/);
     });
 
     void it("falls back to the visible count when the tool reports no detail", () => {
@@ -983,7 +987,7 @@ void describe("pipe-nerf note", () => {
             plan("ls | wc -l"),
             observation({ totalLines: null, visibleLines: 17 })
         );
-        assert.match(note, /17 lines \(0 err, 0 warn\)/);
+        assert.match(note, /No output was captured/);
     });
 
     void it("is empty for a skip", () => {
@@ -1094,11 +1098,12 @@ void describe("pipe-nerf registration", () => {
                 `Effective command: ${JSON.stringify(actualCommand)}.`
             )
         );
-        assert.match(note, /\[pipe-nerf\]/);
-        assert.match(note, /900 lines \(0 err, 1 warn\)/);
-        assert.match(note, /on disk at \/tmp\/out\.log/);
-        assert.match(note, /grep -nE "your-pattern" \/tmp\/out\.log/);
-        assert.match(note, /instead of re-running the command/);
+        assert.match(
+            note,
+            /Captured 900 lines; all are retained \(0 err, 1 warn\)/
+        );
+        assert.match(note, /sed -n 'START,ENDp' \/tmp\/out\.log/);
+        assert.doesNotMatch(note, /re-running/);
         // The original content is preserved after the note.
         assert.equal(result.content[1].text, "FAILED tests/x");
     });
@@ -1130,8 +1135,7 @@ void describe("pipe-nerf registration", () => {
         }) as { content: { text: string }[] };
 
         const note = result.content[0].text;
-        assert.match(note, /indexed in the context sidecar as "ctx_bg_xyz"/);
-        assert.match(note, /context_get source_id:"ctx_bg_xyz"/);
+        assert.match(note, /complete 1-line output is retained/);
     });
 
     void it("returns the requested small head content after a forced index, not a receipt", () => {
@@ -1159,7 +1163,10 @@ void describe("pipe-nerf registration", () => {
                 fullOutputPath: "/tmp/small-head.log",
             },
         }) as { content: { type: string; text: string }[] };
-        assert.match(result.content[0].text, /showing the first 5 lines/);
+        assert.match(
+            result.content[0].text,
+            /Captured 60 lines; all are retained/
+        );
         assert.equal(
             result.content[1].text,
             "line-1\nline-2\nline-3\nline-4\nline-5"
@@ -1230,10 +1237,8 @@ void describe("pipe-nerf registration", () => {
             .map((part) => part.text)
             .join("\n");
         assert.equal(body, remnant, "the capture must be returned as-is");
-        // M28: the caveat has to reach the note, or the agent reads a fallback
-        // as if it were the answer it asked for.
-        assert.match(note, /already dropped/);
-        assert.match(note, /on disk at \/tmp\/out\.log/);
+        assert.match(note, /Captured 9000 lines; all are retained/);
+        assert.match(note, /sed -n 'START,ENDp' \/tmp\/out\.log/);
     });
 
     void it("does not bound the tool's own sidecar receipt", () => {
@@ -1282,7 +1287,7 @@ void describe("pipe-nerf registration", () => {
             !/Captured 7 lines/.test(note),
             `the note counted the receipt's lines: ${note}`
         );
-        assert.match(note, /a summary of the captured output/);
+        assert.match(note, /Captured 60 lines; all are retained/);
     });
 
     void it("leaves a filter command alone and adds no note", () => {

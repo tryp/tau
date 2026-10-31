@@ -556,25 +556,77 @@ export interface SidecarIndexOptions {
     classify?: (text: string) => LogCounts;
     useExternalApi?: boolean;
     /**
-     * Index even when the output is under the inline threshold.
+     * Index this output even when it is under the ordinary inline threshold.
      *
-     * The threshold exists so ordinary small output is not indexed, which is
-     * right for output nobody has discarded. It is wrong when a pipe was hoisted
-     * off the command: the agent then sees a bounded view (say 5 of 60 lines)
-     * and the other 55 exist nowhere. `pipe-nerf` sets this for exactly those
-     * calls, because the capture is the only route to what the view hides.
+     * This flag is where the retention invariant (see `prepareInlineOutput`)
+     * becomes code, so treat it as load-bearing rather than as a threshold
+     * override.
      *
-     * The caller is responsible for only setting it when a view was actually
-     * applied; indexing unconditionally would put every small command in
-     * context.db.
+     * Set only by pipe-nerf's two capture paths, and only because a limiter was
+     * hoisted off the command: the `prepareInlineOutput` call sites driven by
+     * `state.pipeHoistedCalls`, and `indexStageZeroCapture` in
+     * `features/background.ts` for the pre-filter tee (same argument -- that file
+     * is the only place stage 0's output exists). Those calls show the agent a
+     * bounded view, so every line outside that view exists only in this capture.
+     * Removing the flag -- or setting it conditionally on the output size --
+     * silently reinstates the rule the invariant forbids ("the view is small, so
+     * there is nothing worth keeping") and loses the only copy for exactly the
+     * `pytest | tail -5` shape the nerf exists to protect.
+     *
+     * The chain that must stay intact for the invariant to hold:
+     *   1. `pipe-nerf/index.ts` adds the toolCallId to `TauState.pipeHoistedCalls`
+     *      when it rewrites a command (that set documents why the sidecar's own
+     *      threshold is wrong for these calls).
+     *   2. Every `prepareInlineOutput` call site in `features/background.ts`
+     *      passes `{ force: state.pipeHoistedCalls.has(toolCallId) }` and then
+     *      clears the entry, so the flag cannot leak onto a later call.
+     *   3. The forced branches below index the full text even when it is small,
+     *      and return that full text rather than a receipt so pipe-nerf can still
+     *      rebuild the window the agent asked for.
+     *
+     * Links 1 and 3 are pinned by tests, so removing either fails a run rather
+     * than only a comment: `pipe-nerf.unit.test.ts` "records a hoisted call so the
+     * bash tool forces an index", and `sidecar.unit.test.ts` "indexes
+     * sub-threshold output when forced". Link 2 is a mechanical pattern repeated
+     * at every call site and is not covered by a test; grep for
+     * `pipeHoistedCalls` when adding one. If a change here makes those tests look
+     * over-strict, the invariant -- not the test -- is what is being argued with.
      */
     force?: boolean;
 }
 
 /**
- * Index large foreground output before it is returned to the model.
- * The complete output remains in the log/sidecar; only a compact receipt or
- * bounded fallback is returned inline.
+ * Prepare foreground output for inline return, indexing it when required.
+ *
+ * A limiter decides what the agent SEES. It never decides whether the capture
+ * SURVIVES. If the limiter discarded any captured line, that capture is
+ * persisted and addressable regardless of how small the visible view is --
+ * size and addressability decide WHERE it is stored, never WHETHER it exists.
+ * The view being small is not evidence that the capture was small, and it must
+ * never be read as "nothing to keep".
+ *
+ * 1. The old branch said "small enough to return inline, so nothing was written
+ *    to disk or indexed". That described the VIEW and then drew a conclusion
+ *    about the CAPTURE, so `pytest | tail -5` -- thousands of lines captured,
+ *    five shown -- persisted nothing. Test and build output fits the inline
+ *    budget, so the discarded case was the common one, not the corner: the
+ *    single shape this code exists to prevent.
+ * 2. Size cannot be the test even where the view is large. A caller cannot tell
+ *    a 40-line capture from a 4000-line one by what it was shown, so any size
+ *    rule becomes a rule the agent has to guess at, and guessing wrong loses
+ *    the only copy.
+ *
+ * The invariant is enforced, not merely described: `SidecarIndexOptions.force`
+ * documents the three links in the chain (pipe-nerf sets the flag, every bash
+ * call site passes it, the forced branches below honour it). A change to any
+ * link needs the others re-read. The note the agent reads is produced by
+ * `pipe-nerf/messages.ts`, whose module comment states what it may and may not
+ * claim about this function's result -- in particular that it may never report
+ * a capture as lost on the strength of a small view.
+ *
+ * When indexing yields no source the capture's only remaining copy is the text
+ * returned here. The caller then bounds it to the requested view, so the note
+ * must not promise retrieval it cannot honour; `messages.ts` owns that branch.
  */
 export async function prepareInlineOutput(
     job: {

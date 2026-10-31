@@ -200,10 +200,12 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 lineCount: null,
             });
         }
-        // The result will be a BOUNDED view, so the rest of the output has to be
-        // captured for the agent to read later. The sidecar's own threshold is
-        // 300 lines / 24KB, and the commands this touches are usually smaller
-        // than that, so the bash tool is told to index this call explicitly.
+        // Link 1 of the retention invariant; the invariant itself, and every
+        // other link in the chain, is documented on `SidecarIndexOptions.force`.
+        // A hoisted limiter means the agent is shown a bounded view, so this
+        // call's output must be indexed whatever its size. Deleting this line, or
+        // making it conditional on the output size, loses the only copy for
+        // exactly the small `pytest | tail -5` capture the nerf exists to protect.
         state?.pipeHoistedCalls.add(event.toolCallId);
         // A duplicate toolCallId cannot be attributed to either call, so drop the
         // entry rather than annotate one result with the other call's note,
@@ -337,7 +339,12 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
         // The bounded view replaces the raw capture, so the agent's context
         // stays what they asked for. A faithful view is exactly what their pipe
-        // printed; an unfaithful one is the capture, with the note saying so.
+        // printed; an unfaithful one keeps the capture itself, because a view
+        // that could not be reconstructed must not be handed back as if it were
+        // the answer. `faithful`/`caveat` reach the note as facts (see
+        // `PipeObservation`), and the note uses `faithful` only to decide between
+        // "the view is complete" and "read another window" -- it never presents
+        // a number that would be quietly wrong.
         const body = view.faithful
             ? [
                   {
