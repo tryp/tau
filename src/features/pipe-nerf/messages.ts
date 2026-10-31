@@ -26,13 +26,36 @@ export interface PipeObservation {
      * rather than the answer the agent asked for.
      */
     faithful: boolean;
-    /** Why the view is not faithful, phrased for the agent. */
+    /**
+     * Why the view is not faithful, phrased for the agent.
+     *
+     * NOT rendered by `pipeNote` today. When a view is unfaithful the caller
+     * keeps the tool's own content as the body, so the agent is looking at the
+     * whole capture rather than at a reduced answer, and the note stays strictly
+     * about retention instead of describing a view it did not produce. The field
+     * is still populated because the distinction is what tells a caller (and a
+     * test) that the view is a lower bound; surfacing the sentence again is a
+     * one-line change here and should come with a test for the unfaithful note.
+     */
     caveat: string | null;
-    /** How the agent's own pipe would have bounded what it now sees. */
+    /**
+     * How the agent's own pipe would have bounded what it now sees.
+     *
+     * Currently computed by `describeView` and passed in, but no branch of the
+     * note renders it: the note states the captured count and the retrieval form
+     * instead of describing the view. Left in place because it is the only
+     * agent-facing description of the view the tool actually returned, which the
+     * receipt path still needs.
+     */
     viewDescription: string;
     /**
      * The pre-filter (stage-0) capture, when the command still filtered after
      * the limiter was hoisted. This is the data a re-filter will want.
+     *
+     * Not mentioned by the retention note: the note names one retrieval route,
+     * and the stage-0 file is reachable through the same source id the note
+     * already gives. Kept because the tool result carries it and the measurement
+     * entries record it.
      */
     pipeStageZero: {
         path: string;
@@ -56,10 +79,46 @@ function preview(command: string): string {
 const MAX_PREVIEW_CHARS = 200;
 
 /**
- * The agent-facing note prepended to every modified call's result.
- * It leads with whether the output was captured or retained, then names the
- * effective command and gives only the retrieval forms needed for another view.
- * See `prepareInlineOutput` for the capture-retention contract.
+ * The retention note: what it may and may not claim.
+ *
+ * The invariant itself lives in `prepareInlineOutput` (features/sidecar.ts);
+ * this module is only its agent-facing wording, and that function must be read
+ * before any branch below is changed. Short version: a limiter decides what the
+ * agent SEES, never whether the capture SURVIVES. If the limiter discarded a
+ * captured line, that line is persisted and addressable whatever its size --
+ * size decides WHERE the capture lives, never WHETHER it exists.
+ *
+ * That gives the note hard limits, and they are the reason it is shaped this
+ * way rather than as a paragraph of advice:
+ *
+ * - It must always say whether the capture was retained and, when it was, the
+ *   cheapest way to read another window. An agent that cannot tell whether its
+ *   `pytest | tail -5` output still exists re-runs the suite, which is the exact
+ *   work this feature exists to remove.
+ * - It must never infer retention from the size of the view. The note this
+ *   replaced said "small enough to return inline, so nothing was written to disk
+ *   or indexed" -- it described the VIEW and concluded it of the CAPTURE, so
+ *   test and build output, which routinely fits the inline budget, discarded
+ *   data in the common case. The same inference pointing the other way (naming a
+ *   path or source id that does not exist) is equally wrong, so every branch
+ *   keys off the handles the tool actually returned, never off a line count.
+ * - It must never contradict the rest of the result. One note claimed "nothing
+ *   was written to disk or indexed" in the same result as a sidecar receipt
+ *   saying the output had been indexed, and the agent had no way to tell which
+ *   to believe.
+ * - It must never send the agent back to re-run the command for more lines.
+ *
+ * So there are three cases, in the order the code tests them:
+ *
+ * 1. No retrieval handle and no capture to speak of: say so plainly. The
+ *    discarded lines really are gone at that point, so promising retrieval is
+ *    the original lie in a new place.
+ * 2. A handle, and the view already contains every captured line: say the view
+ *    is complete. "All are retained, read any window" beside complete output
+ *    sends the agent to a tool call that cannot show it anything new.
+ * 3. A handle, and the limiter dropped lines: state the captured line count and
+ *    give the retrieval forms. The count is over the WHOLE capture, so it is the
+ *    stat the agent would otherwise re-run the command to compute.
  */
 export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     if (plan.action !== "rewrite" || !plan.invocation) return "";
@@ -68,13 +127,22 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     const lines = [
         `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`,
     ];
-    const hasCapture =
+    // A handle, not a size. "Retained" means retrievable somewhere the agent can
+    // reach; zero lines is the one capture not worth indexing, and it is excluded
+    // here so an empty result reads as empty instead of as retained-but-hidden.
+    const hasRetrievalHandle =
         Boolean(observed.fullOutputPath || observed.sourceId) &&
         capturedLines !== 0;
+    // What the agent's own pipe bounded the view to, used only to decide whether
+    // any captured line sits outside that view. Compare against the capture, not
+    // the view: a view of 5 lines can be the whole 5-line capture.
     const viewLimit =
         invocation.limit ??
         (["head", "tail"].includes(invocation.kind) ? 10 : null);
-    const hasMoreThanView =
+    // An unfaithful view has already dropped a region, so it needs no count to
+    // prove there is more than the agent can see; the count comparison only
+    // decides the faithful case.
+    const hasLinesBeyondView =
         !observed.faithful ||
         (capturedLines !== null &&
             capturedLines !== undefined &&
@@ -82,7 +150,7 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
             ["head", "tail", "sed"].includes(invocation.kind) &&
             capturedLines > viewLimit);
 
-    if (!hasCapture) {
+    if (!hasRetrievalHandle) {
         lines.unshift(
             "No output was captured, so there is nothing available to retrieve."
         );
@@ -90,13 +158,16 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
     }
 
     const count = capturedLines ?? 0;
-    if (!hasMoreThanView) {
+    if (!hasLinesBeyondView) {
         lines.unshift(
             `The complete ${count}-line output is retained; the view above contains all of it.`
         );
         return lines.join("\n");
     }
 
+    // The receipt's own chunk id is preferred because it is the chunk the agent
+    // was already shown; the conventional first-chunk id keeps the call valid
+    // when the tool reported a source without rendering a receipt.
     const range = observed.fullOutputPath
         ? `sed -n 'START,ENDp' ${observed.fullOutputPath}`
         : observed.sourceId

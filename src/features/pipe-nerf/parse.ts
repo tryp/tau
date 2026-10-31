@@ -540,8 +540,10 @@ function splitLines(text: string): string[] {
  * the hook: the tool's own 2000-line / 50KB budget may have dropped the region
  * the limiter reads (a `head` loses the head, a `grep -c` loses its matches),
  * and a program like `awk 'END{...}'` is not re-implementable here. In those
- * cases the note says so and points at the capture rather than presenting a
- * number that would be quietly wrong.
+ * cases the view is the capture itself and the note points at it rather than
+ * presenting a number that would be quietly wrong: `caveat` carries the reason
+ * for callers that want to surface it, and `messages.ts` records why the note
+ * itself currently leaves it to the body.
  */
 export function applyLimiter(
     text: string,
