@@ -48,7 +48,10 @@ describe("tmux argument safety", () => {
         );
         assert.match(command, /-n 'i_0_'/);
         assert.ok(!command.includes("-n 'i=0;'"));
-        assert.ok(command.includes("-c '/tmp/work; dir'"), "cwd stays one shell argument");
+        assert.ok(
+            command.includes("-c '/tmp/work; dir'"),
+            "cwd must stay one shell argument for tmux's -c option"
+        );
         assert.ok(
             command.includes("\"/tmp/run; dir/script.sh\""),
             "script path stays one tmux/shell argument"
