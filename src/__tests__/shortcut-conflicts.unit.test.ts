@@ -24,6 +24,10 @@ const piTauShortcuts = [
 ];
 
 void describe("pi-tau shortcut conflicts", () => {
+    void it("registers no duplicate shortcuts", () => {
+        assert.equal(new Set(piTauShortcuts).size, piTauShortcuts.length);
+    });
+
     void it("registers no shortcut that collides with a built-in or restricted key", () => {
         for (const shortcut of piTauShortcuts) {
             assert.equal(piBuiltInKeys.has(shortcut), false, `${shortcut} conflicts with pi`);

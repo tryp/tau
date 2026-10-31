@@ -19,6 +19,7 @@ import {
     handleTmuxCompletion,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
+import { BACKGROUND_SHORTCUTS } from "../features/shortcut-keys.ts";
 import { TauState } from "../state.ts";
 import type { BackgroundJob, RunningProcess } from "../types.ts";
 import { createJobDonePromise, markJobTerminal } from "../utils.ts";
@@ -589,7 +590,7 @@ function captureCtrlXHandler(state: TauState) {
             key: string,
             handler: { handler: (ctx: unknown) => Promise<void> }
         ) {
-            if (key === "ctrl+x") captured = handler.handler;
+            if (key === BACKGROUND_SHORTCUTS.kill) captured = handler.handler;
         },
         registerCommand: () => {},
         registerTool: () => {},
@@ -654,7 +655,7 @@ function captureTasksInterface(
             key: string,
             handler: { handler: (ctx: unknown) => Promise<void> }
         ) {
-            if (key === "ctrl+j") captured = handler.handler;
+            if (key === BACKGROUND_SHORTCUTS.tasks) captured = handler.handler;
         },
         registerCommand: () => {},
         registerTool: () => {},
