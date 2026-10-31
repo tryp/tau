@@ -649,6 +649,10 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(unseen, state, pi as never, notificationContext());
         flushCompletionBatch();
         assert.equal(queuedMessages.length, 1);
+        assert.deepEqual(
+            (queuedMessages[0]?.message as { details: { jobIds: string[] } }).details.jobIds,
+            [known.id, unseen.id]
+        );
         const originalQueueKey = queuedMessages[0]?.options.queueKey;
 
         try {
@@ -675,6 +679,40 @@ void describe("job completion regression coverage", () => {
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
+    });
+
+    void it("retains cancel misses and restores autonomous wake state", () => {
+        const state = new TauState();
+        const { pi, queuedMessages, processQueuedMessages, appendedEntries } =
+            registerTestTools(state, { holdFollowUps: true });
+        let wakeCount = 0;
+        state.wakeupEvaluate = () => { wakeCount++; };
+        const job = makeJob({ id: "job-cancel-miss", status: "failed" });
+        state.backgroundJobs.set(job.id, job);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 1);
+        processQueuedMessages();
+        clearAllCompletionBatches();
+        assert.equal(job.completionNotified, false);
+        assert.ok(wakeCount > 0);
+        assert.ok(appendedEntries.some(({ data }) => data.event === "cancel-miss-retained"));
+    });
+
+    void it("suppresses old acknowledged completions with telemetry", () => {
+        const state = new TauState();
+        const { pi, sentMessages, appendedEntries } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-stale-ack",
+            status: "failed",
+            endTime: Date.now() - 10 * 60 * 1000,
+        });
+        state.backgroundJobs.set(job.id, job);
+        state.cancelCompletionBatchForJob?.(job.id);
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(sentMessages.length, 0);
+        assert.ok(appendedEntries.some(({ data }) => data.event === "suppressed-stale"));
     });
 
     void it("keeps independent queue keys through agent_start and cancels only the acknowledged job", async () => {

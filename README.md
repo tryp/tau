@@ -11,17 +11,17 @@ Background tasks, notifications, plan mode, presets, and other enhancements for 
 
 ### Background Tasks
 
-- **Ctrl+B** — background running bash, background the agent loop, or resume a backgrounded agent
+- **Ctrl+Alt+B** — background running bash, background the agent loop, or resume a backgrounded agent
 - **15-second auto-background** — long-running commands are automatically backgrounded with agent confirmation
-- **Agent loop backgrounding** — Ctrl+B during agent processing blocks further tool calls and yields control back to you
+- **Agent loop backgrounding** — Ctrl+Alt+B during agent processing blocks further tool calls and yields control back to you
 - **Disk-based output** — all background job output written to `/tmp/pi-bg-<jobId>.log`, not memory
 - **Process-group kill** — `process.kill(-pid)` terminates entire process trees
 - **Stall detection** — detects interactive prompts (`(y/n)`, `Press any key`) in background jobs after 45s of stagnant output
 - **Size watchdog** — kills background jobs exceeding 100 MiB output
-- **Background hint** — `⏱ Ctrl+B to background` appears after 2s of bash or agent activity
+- **Background hint** — `⏱ Ctrl+Alt+B to background` appears after 2s of bash or agent activity
 - **Pill bar** — `◐ job-1: cmd (12s) · ◐ agent (backgrounded)` in the status area
-- **Task management UI** — Shift+↓ or Ctrl+J opens grouped task list with detail views
-- **Ctrl+X** — kill most recent running background task
+- **Task management UI** — Shift+↓ or Ctrl+Alt+J opens grouped task list with detail views
+- **Ctrl+Alt+X** — kill most recent running background task
 - **Session persistence** — job history survives pi restarts
 
 ### Notifications
@@ -202,7 +202,7 @@ unchanged. Tau does not depend on or import `pi-subagents`.
 
 | Tool | Purpose |
 |------|---------|
-| `bash` | Standard bash, enhanced with 15s auto-background timeout and Ctrl+B support |
+| `bash` | Standard bash, enhanced with 15s auto-background timeout and Ctrl+Alt+B support |
 | `bash_bg` | Start a command in the background immediately |
 | `jobs` | `list`, `output`, `kill`, or `attach` to background jobs |
 | `job_decide` | Decide what to do with a timed-out background job |
@@ -216,7 +216,7 @@ unchanged. Tau does not depend on or import `pi-subagents`.
 
 | Command | Purpose |
 |---------|---------|
-| `/bg` | Same as Ctrl+B — background bash/agent or resume |
+| `/bg` | Same as Ctrl+Alt+B — background bash/agent or resume |
 | `/fg` | Attach to a background job, optionally with `--snapshot` |
 | `/jobs` | Open task management interface |
 | `/tasks` | Show all tasks on the current branch |
@@ -236,9 +236,9 @@ unchanged. Tau does not depend on or import `pi-subagents`.
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+B` | Background running bash + agent, or resume backgrounded agent |
-| `Ctrl+X` | Kill most recent running background task |
-| `Ctrl+J` / `Shift+↓` | Open task management interface |
+| `Ctrl+Alt+B` | Background running bash + agent, or resume backgrounded agent |
+| `Ctrl+Alt+X` | Kill most recent running background task |
+| `Ctrl+Alt+J` / `Shift+↓` | Open task management interface |
 | `Ctrl+Alt+P` | Toggle plan mode |
 | `Ctrl+Shift+U` | Cycle presets |
 
@@ -260,7 +260,7 @@ src/
   plan-utils.ts         Plan-mode pure functions (step extraction, safe command checking)
   features/
     background.ts       bash override, bash_bg, jobs, job_decide tools
-    background-commands.ts  /bg, /fg, /jobs commands, Ctrl+B/X/J shortcuts, task UI
+    background-commands.ts  /bg, /fg, /jobs commands, Ctrl+Alt+B/X/J shortcuts, task UI
     titlebar.ts         Braille spinner and elapsed timer
     plan-mode.ts        /plan, Ctrl+Alt+P, plan execution tracking
     task.ts             task tool, /tasks command (nesting, links, status)

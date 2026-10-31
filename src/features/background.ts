@@ -1436,6 +1436,7 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
 
 const BATCH_DEBOUNCE_MS = 2000; // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
+const ACKNOWLEDGED_STALE_MAX_AGE_MS = 5 * 60 * 1000;
 
 type CompletionBatchItem = {
     job: BackgroundJob;
@@ -1460,6 +1461,8 @@ type PendingCompletionDelivery = {
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 const queuedCompletionDeliveries = new Map<string, PendingCompletionDelivery>();
+const possiblyDeliveredCompletionDeliveries = new Map<string, PendingCompletionDelivery>();
+const acknowledgedCompletionAt = new Map<string, number>();
 const completionDeliveryInstance = randomUUID();
 let completionDeliverySequence = 0;
 
@@ -1557,6 +1560,17 @@ export function flushCompletionBatch(): void {
     completionBatch.state = undefined;
 
     if (batch.length === 0) return;
+    const freshBatch = batch.filter(({ job }) => {
+        const acknowledgedAt = acknowledgedCompletionAt.get(job.id);
+        const age = job.endTime === undefined ? 0 : Date.now() - job.endTime;
+        if (acknowledgedAt !== undefined && age > ACKNOWLEDGED_STALE_MAX_AGE_MS) {
+            recordCompletionTelemetry(pi, "suppressed-stale", { jobIds: [job.id] });
+            pendingCompletionJobs.delete(job.id);
+            return false;
+        }
+        return true;
+    });
+    if (freshBatch.length === 0) return;
 
     // Suppress successful completions to avoid wasted LLM turns — UNLESS
     // one of the jobs has linked callbacks (meaning the agent explicitly
@@ -1565,8 +1579,8 @@ export function flushCompletionBatch(): void {
     // still wants the final completion notification). In either case,
     // deliver the notification (which cancels any remaining linked callbacks).
     // Failed completions are always delivered.
-    if (!hasFailedCompletion(batch)) {
-        const hasLinked = batch.some(
+    if (!hasFailedCompletion(freshBatch)) {
+        const hasLinked = freshBatch.some(
             (j) =>
                 hasLinkedCallbacksForJob(j.job.id) ||
                 j.job.wantsCompletionNotification
@@ -1575,7 +1589,7 @@ export function flushCompletionBatch(): void {
             // No normal follow-up is emitted for an unlinked successful
             // completion. Leave it visible to the optional autonomous wake
             // evaluator as an unacknowledged terminal result.
-            for (const item of batch) {
+            for (const item of freshBatch) {
                 item.job.completionNotified = false;
                 completionNotifiedJobs.delete(item.job);
                 pendingCompletionJobs.delete(item.job.id);
@@ -1585,7 +1599,7 @@ export function flushCompletionBatch(): void {
         }
     }
 
-    queueCompletionDelivery(batch, pi, state);
+    queueCompletionDelivery(freshBatch, pi, state);
 }
 
 function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
@@ -1859,6 +1873,7 @@ function deliverCompletionNotification(
             content: `${header}\n${lines.join("\n")}${outputEvidence ? `\nOutput evidence: ${outputEvidence}` : ""}\n${detailLines.join("\n")}${resourceInfo}`,
             display: true,
             details: {
+                jobIds: batch.map(({ job }) => job.id),
                 batch: batch.map((b) => ({
                     jobId: b.job.id,
                     status: b.job.status,
@@ -1932,6 +1947,11 @@ function queueCompletionDelivery(
  * notifications for jobs the agent has already acknowledged.
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
+    acknowledgedCompletionAt.set(jobId, Date.now());
+    for (const [queueKey, delivery] of possiblyDeliveredCompletionDeliveries) {
+        if (!delivery.jobs.some(({ job }) => job.id === jobId)) continue;
+        possiblyDeliveredCompletionDeliveries.delete(queueKey);
+    }
     // Completion messages already handed to pi remain cancellable while queued.
     // A false result is the delivery boundary: do not re-emit siblings because
     // the original batch may already have reached the agent.
@@ -2060,6 +2080,15 @@ export function clearAllCompletionBatches(): void {
             }
         );
         if (cancelled === true) {
+            for (const { job } of delivery.jobs) {
+                restoreCompletionForWake(job, wakeStates, delivery.state);
+            }
+        } else {
+            possiblyDeliveredCompletionDeliveries.set(queueKey, delivery);
+            recordCompletionTelemetry(delivery.pi, "cancel-miss-retained", {
+                queueKey,
+                jobIds: delivery.jobs.map(({ job }) => job.id),
+            });
             for (const { job } of delivery.jobs) {
                 restoreCompletionForWake(job, wakeStates, delivery.state);
             }
@@ -2612,7 +2641,7 @@ export function registerBackgroundJobs(
 
             // Background hint
             const hintTimer = setTimeout(() => {
-                ctx.ui.notify("⏱ Ctrl+B to background", "info");
+                ctx.ui.notify("⏱ Ctrl+Alt+B to background", "info");
             }, 2_000);
             hintTimer.unref();
 
@@ -4052,7 +4081,7 @@ async function executeTmuxForeground(
 
     // Background hint
     const hintTimer = setTimeout(() => {
-        ctx.ui.notify("⏱ Ctrl+B to background", "info");
+        ctx.ui.notify("⏱ Ctrl+Alt+B to background", "info");
     }, 2_000);
     hintTimer.unref();
 

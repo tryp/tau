@@ -31,6 +31,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
+import { BACKGROUND_SHORTCUTS } from "./shortcut-keys.ts";
 import { staleSafe } from "./ctx-guard.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
 
@@ -820,7 +821,7 @@ You will receive periodic <${TICK_TAG}> prompts. These are check-ins: continue w
 
     // --- Keyboard shortcut ---
 
-    pi.registerShortcut("ctrl+l", {
+    pi.registerShortcut(BACKGROUND_SHORTCUTS.loop, {
         description: "Open loop manager",
         handler: async (_ctx) => {
             if (!isFeatureEnabled(state, "loop")) return;

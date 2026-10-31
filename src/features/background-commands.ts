@@ -1,7 +1,7 @@
 /**
  * Background commands and keyboard shortcuts.
  *
- * /bg, /fg, /jobs commands, Ctrl+B/X/J/Shift+Down shortcuts,
+ * /bg, /fg, /jobs commands, Ctrl+Alt+B/X/J and Shift+Down shortcuts,
  * and the interactive tasks interface.
  */
 
@@ -10,6 +10,7 @@ import type {
     ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
+import { BACKGROUND_SHORTCUTS } from "./shortcut-keys.ts";
 import type { BackgroundJob, UiContext } from "../types.ts";
 import {
     updateWidget,
@@ -27,7 +28,7 @@ import {
 } from "../utils.ts";
 import { getTmuxContext, killTmuxJob } from "./bash-tmux.ts";
 
-// ── Background shortcut handler (Ctrl+B) — signal-based ────────────
+// ── Background shortcut handler (Ctrl+Alt+B) — signal-based ────────────
 
 export async function handleBackgroundShortcut(
     state: TauState,
@@ -67,7 +68,7 @@ export async function handleBackgroundShortcut(
     );
     updateWidget(state, ctx);
 
-    ctx.ui.notify("⏸ Backgrounded. Ctrl+B to resume.", "info");
+    ctx.ui.notify("⏸ Backgrounded. Ctrl+Alt+B to resume.", "info");
 }
 
 // ── Interactive task detail ──────────────────────────────────────────
@@ -192,7 +193,7 @@ export async function showTasksInterface(
 
     const items: string[] = [];
     if (state.agentBackgrounded) {
-        items.push("◐ agent · backgrounded · Ctrl+B to resume");
+        items.push("◐ agent · backgrounded · Ctrl+Alt+B to resume");
     }
     for (const job of runningJobs) {
         const duration = formatDuration(Date.now() - job.startTime);
@@ -235,14 +236,14 @@ export function registerBackgroundCommands(
     pi: ExtensionAPI,
     state: TauState
 ): void {
-    pi.registerShortcut("ctrl+b", {
+    pi.registerShortcut(BACKGROUND_SHORTCUTS.background, {
         description: "Background bash/agent, or resume backgrounded agent",
         handler: async (ctx) => {
             await handleBackgroundShortcut(state, pi, ctx);
         },
     });
 
-    pi.registerShortcut("ctrl+j", {
+    pi.registerShortcut(BACKGROUND_SHORTCUTS.tasks, {
         description: "Open background tasks",
         handler: async (ctx) => {
             await showTasksInterface(state, pi, ctx);
@@ -256,7 +257,7 @@ export function registerBackgroundCommands(
         },
     });
 
-    pi.registerShortcut("ctrl+x", {
+    pi.registerShortcut(BACKGROUND_SHORTCUTS.kill, {
         description: "Kill most recent running background task",
         handler: async (ctx) => {
             const runningJobs = Array.from(state.backgroundJobs.values())

@@ -8,8 +8,8 @@
  * Commands: /bg, /fg, /jobs, /tasks, /tools, /plan, /perm, /bookmark,
  *           /unbookmark, /context, /footer, /goal, /notifications, /preset,
  *           /session-name, /summarize
- * Shortcuts: Ctrl+B (background/resume), Ctrl+J / Shift+Down (tasks),
- *            Ctrl+X (kill), Ctrl+Alt+P (plan mode), Ctrl+Shift+U (preset cycle),
+ * Shortcuts: Ctrl+Alt+B (background/resume), Ctrl+Alt+J / Shift+Down (tasks),
+ *            Ctrl+Alt+X (kill), Ctrl+Alt+P (plan mode), Ctrl+Shift+U (preset cycle),
  *            Ctrl+Shift+M (permission mode cycle), Ctrl+Shift+T (thinking level)
  */
 
@@ -283,7 +283,7 @@ export default function (pi: ExtensionAPI) {
                 block: true,
                 reason:
                     "Agent is backgrounded. Run any bash command to auto-resume, " +
-                    "or use Ctrl+B or /bg to resume.",
+                    "or use Ctrl+Alt+B or /bg to resume.",
             };
         }
 

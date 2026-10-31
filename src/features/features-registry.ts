@@ -171,7 +171,7 @@ export const FEATURE_REGISTRY: ReadonlyArray<FeatureDef> = [
     {
         id: "agent-background",
         label: "Agent backgrounding",
-        description: "Pause the agent mid-turn with Ctrl+B",
+        description: "Pause the agent mid-turn with Ctrl+Alt+B",
         group: "Background",
         defaultOn: true,
     },
