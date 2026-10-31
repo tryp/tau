@@ -19,10 +19,10 @@
  *    `job_decide` is the tool that ends the loop. 15,093 `jobs` calls against
  *    2,157 `job_decide` calls in the same window.
  *
- * Each rule fires at most once per session (per job id for job-poll), because a
- * hint repeated is a hint that gets ignored -- the failure mode is visible in
- * the corpus: `read`'s paging notice is emitted 22,467 times in 30 days and
- * followed 28% of the time.
+ * Admission is controlled by `HintGate`, not by a once-per-session flag: a hint
+ * repeated every turn is noise, but a hint retired after one ignored attempt is
+ * silent for the rest of the session. See `gate.ts` for why compaction made the
+ * original rule wrong.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -34,6 +34,7 @@ import {
     jobIdOf,
     matchSedRange,
 } from "./hints.ts";
+import { HintGate } from "./gate.ts";
 import { diagnosticsHint, jobPollHint, sedRangeHint } from "./messages.ts";
 
 /** `tool_result` arrives with the tool name narrowed per tool; only these fields are read. */
@@ -60,10 +61,9 @@ function resultText(event: HintableResultEvent): string {
 }
 
 export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
-    /** Rules already spent for this session. */
-    const fired = new Set<string>();
-    /** Job ids already hinted, so a second job is still reachable. */
-    const hintedJobs = new Set<string>();
+    /** Per-rule admission, keyed by rule; job polling is keyed per job id. */
+    const ruleGate = new HintGate();
+    const jobGate = new HintGate();
     /** Poll counts per job id. */
     const polls = new Map<string, number>();
     /** Suppression is silent by construction; record the first one per rule. */
@@ -91,8 +91,9 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             const view = matchSedRange(e.input.command);
             if (!view) return;
             rule = "sed-range";
-            if (fired.has(rule)) {
-                suppress(rule, "already-fired");
+            const decision = ruleGate.offer(rule);
+            if (!decision.fire) {
+                suppress(rule, "rearm-pending");
                 return;
             }
             hint = sedRangeHint(view);
@@ -100,8 +101,9 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             const pos = findDiagnosticPosition(resultText(e));
             if (!pos) return;
             rule = "diagnostics";
-            if (fired.has(rule)) {
-                suppress(rule, "already-fired");
+            const decision = ruleGate.offer(rule);
+            if (!decision.fire) {
+                suppress(rule, "rearm-pending");
                 return;
             }
             hint = diagnosticsHint(pos);
@@ -110,17 +112,20 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             if (!jobId) return;
             const count = (polls.get(jobId) ?? 0) + 1;
             polls.set(jobId, count);
-            if (count < POLL_THRESHOLD || hintedJobs.has(jobId)) return;
+            // The first hint waits for a loop to be real; after that the gate
+            // decides whether the job has been ignored long enough to re-offer.
+            if (count < POLL_THRESHOLD) return;
             rule = "job-poll";
-            hintedJobs.add(jobId);
+            if (!jobGate.offer(jobId).fire) {
+                suppress(rule, "rearm-pending");
+                return;
+            }
             hint = jobPollHint(jobId);
         } else {
             return;
         }
 
         if (!hint || !rule) return;
-        // job-poll is keyed per job id, the other two per session.
-        if (rule !== "job-poll") fired.add(rule);
         pi.appendEntry("tool-hints", {
             rule,
             tool: e.toolName,
@@ -132,8 +137,8 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
     });
 
     pi.on("session_shutdown", () => {
-        fired.clear();
-        hintedJobs.clear();
+        ruleGate.reset();
+        jobGate.reset();
         polls.clear();
         suppressionRecorded.clear();
     });

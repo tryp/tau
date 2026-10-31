@@ -19,6 +19,11 @@ import {
     jobIdOf,
     matchSedRange,
 } from "../features/tool-hints/hints.ts";
+import {
+    DEFAULT_MAX_FIRES,
+    DEFAULT_REARM_AFTER,
+    HintGate,
+} from "../features/tool-hints/gate.ts";
 import { registerToolHints } from "../features/tool-hints/index.ts";
 import { HINT_PREFIX } from "../features/tool-hints/messages.ts";
 
@@ -175,8 +180,10 @@ void describe("tool-hints registration", () => {
     }
 
     function hintBlocks(result: unknown): string[] {
-        const content = (result as { content?: Array<{ text?: string }> })
-            .content;
+        // A handler that returns nothing left the result alone, which is what
+        // "suppressed" looks like from the outside; `result` is undefined there.
+        const content = (result as { content?: Array<{ text?: string }> } | undefined)
+            ?.content;
         return (content ?? [])
             .map((block) => block.text ?? "")
             .filter((text) => text.startsWith(HINT_PREFIX));
@@ -196,7 +203,7 @@ void describe("tool-hints registration", () => {
         assert.match(content[1].text, /offset=10, limit=31/);
     });
 
-    void it("fires once per session and records the suppression", async () => {
+    void it("holds the hint back on a single repeat and records the suppression", async () => {
         const { pi, handlers, appended } = fakePi();
         registerToolHints(pi);
         const handler = resultHandler(handlers);
@@ -295,6 +302,24 @@ void describe("tool-hints registration", () => {
         assert.equal(await handler(poll("job-a")), undefined);
     });
 
+    void it("re-offers after a sustained pattern, then stops for good", async () => {
+        // Compaction replaces old tool results but not this counter, so the
+        // gate -- not the context window -- is what decides whether an ignored
+        // hint ever comes back.
+        const { pi, handlers } = fakePi();
+        registerToolHints(pi);
+        const handler = resultHandler(handlers);
+        assert.ok(handler);
+
+        let fired = 0;
+        const calls = 1 + DEFAULT_MAX_FIRES + DEFAULT_MAX_FIRES * (DEFAULT_REARM_AFTER + 1);
+        for (let i = 0; i < calls; i++) {
+            const result = await handler(bashResult(`sed -n '1,${i + 2}p' a.txt`));
+            if (hintBlocks(result).length > 0) fired++;
+        }
+        assert.equal(fired, DEFAULT_MAX_FIRES);
+    });
+
     void it("never marks a result as an error", async () => {
         const { pi, handlers } = fakePi();
         registerToolHints(pi);
@@ -307,5 +332,46 @@ void describe("tool-hints registration", () => {
             Object.prototype.hasOwnProperty.call(result, "isError"),
             false
         );
+    });
+});
+
+void describe("tool-hints gate", () => {
+    void it("fires the first match immediately", () => {
+        const gate = new HintGate();
+        const first = gate.offer("sed-range");
+        assert.equal(first.fire, true);
+        assert.equal(first.fires, 1);
+    });
+
+    void it("counts suppressed matches instead of forgetting them", () => {
+        const gate = new HintGate({ maxFires: 2, rearmAfter: 2 });
+        gate.offer("r"); // fires
+        const a = gate.offer("r");
+        const b = gate.offer("r");
+        assert.deepEqual(
+            [a.fire, a.sinceFire, b.fire, b.sinceFire],
+            [false, 1, false, 2]
+        );
+        const third = gate.offer("r"); // the rearm fires
+        assert.equal(third.fire, true);
+        assert.equal(third.fires, 2);
+    });
+
+    void it("goes quiet once maxFires is reached", () => {
+        const gate = new HintGate({ maxFires: 1, rearmAfter: 0 });
+        assert.equal(gate.offer("r").fire, true);
+        for (let i = 0; i < 5; i++) {
+            const decision = gate.offer("r");
+            assert.equal(decision.fire, false);
+            assert.equal(decision.suppressed, true);
+        }
+        assert.equal(gate.fireCount("r"), 1);
+    });
+
+    void it("keys independently, so a second job is still reachable", () => {
+        const gate = new HintGate({ maxFires: 1 });
+        assert.equal(gate.offer("job-a").fire, true);
+        assert.equal(gate.offer("job-a").fire, false);
+        assert.equal(gate.offer("job-b").fire, true);
     });
 });
