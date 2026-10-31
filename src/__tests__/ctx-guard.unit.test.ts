@@ -339,6 +339,22 @@ void describe("sidecar indexing under a stale ctx", () => {
                 await import("../features/sidecar.ts");
             await trackJobOutputIndex(job, staleSessionCtx, "bash_bg");
         });
+        // Resolving is not enough: the outcome has to name the cause, or a stale
+        // ctx degrades into an unattributed row and the next investigation reads
+        // "index failed, reason unknown". Both the category and the counter are
+        // pinned because either one alone can be satisfied while the other is
+        // never reached.
         assert.equal(job.sidecarIndexStatus, "failed");
+        assert.equal(job.sidecarIndexErrorCategory, "stale");
+        const { getSidecarIndexStats, resetSidecarIndexStats } =
+            await import("../features/sidecar.ts");
+        // Exactly three reads, one per site that needs identity: the external-API
+        // probe, the direct-DB attempt, and the failure-path dedupe key. The exact
+        // count is pinned because it is also the record of *which* sites consult a
+        // guard that can throw: a fourth read added without this number moving
+        // would be a site nobody audited. If you deliberately reduce the reads,
+        // update the number and say so in the commit.
+        assert.equal(getSidecarIndexStats().staleSessionIdentity, 3);
+        resetSidecarIndexStats();
     });
 });

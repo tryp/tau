@@ -71,7 +71,67 @@ let sidecarIndexStats: SidecarIndexStats = {
     emptySkipped: 0,
     unavailableSkipped: 0,
     schemaSkipped: 0,
+    staleSessionIdentity: 0,
 };
+
+/**
+ * The captured ctx was replaced before indexing ran.
+ *
+ * A distinct type rather than a message match: the retry loop decides whether to
+ * retry by pattern-matching SQLite busy errors, and a stale ctx is not
+ * retryable, so the classification must not depend on wording. The message is
+ * stable so `errorMessage` in the recorded outcome is readable, and deliberately
+ * contains neither "busy" nor "locked" so the retry loop breaks immediately.
+ */
+class StaleSessionIdentityError extends Error {
+    constructor() {
+        super(
+            "session ctx is stale after session replacement or reload; indexing skipped"
+        );
+        this.name = "StaleSessionIdentityError";
+    }
+}
+
+/**
+ * Read session identity from a possibly-stale extension ctx.
+ *
+ * Optional chaining is not enough here. `ctx?.sessionManager?.getSessionFile?.()`
+ * guards a *missing* receiver; it does not guard a receiver method that
+ * **throws**. pi-core makes a captured ctx stale after `newSession`, `fork`,
+ * `switchSession` or `reload`, and from then on `getSessionFile()` and
+ * `getSessionId()` throw by design.
+ *
+ * The distinction between `null` and `stale` is deliberate:
+ *
+ * - `null` identity means the caller supplied no session identity (fixtures,
+ *   headless indexing). Indexing proceeds; the row is stored unattributed.
+ * - `stale` means a real session existed and has been replaced. Indexing must
+ *   not proceed under a borrowed identity, so the direct-DB path raises and the
+ *   outcome is classified as `errorCategory: "stale"`.
+ *
+ * The stale case has to be *reportable* here rather than thrown at the point of
+ * access, because the failure path also needs the identity: it derived its
+ * dedupe key from the same accessor, so a throw there replaced the failure being
+ * reported with an unhandled rejection (see `ctx-guard.unit.test.ts`, "indexing a
+ * real log resolves without an unhandled rejection").
+ */
+function readSessionIdentity(ctx: SidecarContext | undefined): {
+    value: string | null;
+    stale: boolean;
+} {
+    try {
+        return {
+            value:
+                ctx?.sessionManager?.getSessionFile?.() ??
+                ctx?.sessionManager?.getSessionId?.() ??
+                null,
+            stale: false,
+        };
+    } catch {
+        sidecarIndexStats.staleSessionIdentity += 1;
+        return { value: null, stale: true };
+    }
+}
 
 export interface PreparedInlineOutput {
     text: string;
@@ -105,6 +165,7 @@ export function resetSidecarIndexStats(): void {
         emptySkipped: 0,
         unavailableSkipped: 0,
         schemaSkipped: 0,
+        staleSessionIdentity: 0,
     };
 }
 
@@ -508,10 +569,11 @@ async function tryIndexViaExternalApi(
     if (typeof getContextStore !== "function") return undefined;
 
     try {
-        const sessionId =
-            ctx?.sessionManager?.getSessionFile?.() ??
-            ctx?.sessionManager?.getSessionId?.() ??
-            null;
+        const identity = readSessionIdentity(ctx);
+        if (identity.stale) {
+            throw new StaleSessionIdentityError();
+        }
+        const sessionId = identity.value;
         const projectPath = ctx?.cwd ?? process.cwd();
 
         const store = getContextStore({
@@ -841,10 +903,11 @@ async function indexViaDirectDb(
 ): Promise<string | undefined> {
     const bytes = Buffer.byteLength(text, "utf8");
     const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-    const sessionId =
-        ctx?.sessionManager?.getSessionFile?.() ??
-        ctx?.sessionManager?.getSessionId?.() ??
-        null;
+    const identity = readSessionIdentity(ctx);
+    if (identity.stale) {
+        throw new StaleSessionIdentityError();
+    }
+    const sessionId = identity.value;
     const projectPath = ctx?.cwd ?? process.cwd();
 
     const db = new DatabaseSync(dbPath, {
@@ -1133,15 +1196,17 @@ export async function indexJobOutputWithOutcome(
     const errorCode = getSqliteErrorCode(lastError);
     const normalizedMessage = errorMessage.toLowerCase();
     const errorCategory: SidecarIndexOutcome["errorCategory"] =
-        /no such table|no such column|malformed schema|fts5|constraint failed/.test(
-            normalizedMessage
-        )
-            ? "schema"
-            : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(
+        lastError instanceof StaleSessionIdentityError
+            ? "stale"
+            : /no such table|no such column|malformed schema|fts5|constraint failed/.test(
                     normalizedMessage
                 )
-              ? "io"
-              : "unknown";
+              ? "schema"
+              : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(
+                      normalizedMessage
+                  )
+                ? "io"
+                : "unknown";
     const outcome: SidecarIndexOutcome = {
         status: "failed",
         eligible: true,
@@ -1165,10 +1230,8 @@ export async function indexJobOutputWithOutcome(
     } catch {
         // Diagnostic persistence must not affect the completed job.
     }
-    const sessionKey =
-        ctx.sessionManager?.getSessionFile?.() ??
-        ctx.sessionManager?.getSessionId?.() ??
-        "unknown-session";
+    // A stale ctx must not turn a reported failure into an unhandled rejection.
+    const sessionKey = readSessionIdentity(ctx).value ?? "unknown-session";
     const warningKey = `${sessionKey}:${errorCategory}`;
     if (!warnedIndexFailures.has(warningKey)) {
         warnedIndexFailures.add(warningKey);

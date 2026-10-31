@@ -44,7 +44,7 @@ export interface SidecarIndexOutcome {
         | "schema_unavailable"
         | "read_failed"
         | "index_failed";
-    errorCategory?: "io" | "schema" | "unavailable" | "unknown";
+    errorCategory?: "io" | "schema" | "unavailable" | "stale" | "unknown";
     errorMessage?: string;
     errorCode?: string | number;
     retryCount?: number;
@@ -61,6 +61,17 @@ export interface SidecarIndexStats {
     emptySkipped: number;
     unavailableSkipped: number;
     schemaSkipped: number;
+    /**
+     * Session identity was unreadable because the captured ctx was stale.
+     *
+     * Counted rather than thrown: pi-core nulls out a ctx after
+     * `newSession`/`fork`/`switchSession`/`reload`, and then the session
+     * accessors throw instead of returning undefined. The identity is read on
+     * failure paths, where the session has often just been replaced, so the
+     * throw would replace the failure being reported with an unhandled
+     * rejection. Without this counter the degradation would be invisible.
+     */
+    staleSessionIdentity: number;
 }
 
 /**

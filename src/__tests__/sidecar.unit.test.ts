@@ -499,6 +499,7 @@ void describe("indexJobOutputInSidecar", () => {
             emptySkipped: 0,
             unavailableSkipped: 1,
             schemaSkipped: 0,
+            staleSessionIdentity: 0,
         });
     });
 
@@ -536,6 +537,7 @@ void describe("indexJobOutputInSidecar", () => {
             emptySkipped: 0,
             unavailableSkipped: 0,
             schemaSkipped: 0,
+            staleSessionIdentity: 0,
         });
     });
 
@@ -559,6 +561,7 @@ void describe("indexJobOutputInSidecar", () => {
             emptySkipped: 0,
             unavailableSkipped: 0,
             schemaSkipped: 0,
+            staleSessionIdentity: 0,
         });
     });
 
