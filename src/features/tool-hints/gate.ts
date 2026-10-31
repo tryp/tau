@@ -37,6 +37,11 @@ export interface FireDecision {
     fire: boolean;
     /** True when this call was suppressed rather than fired, for the counter. */
     suppressed: boolean;
+    /**
+     * Why the decision went the way it did, for the session record:
+     * `first` and `rearm` fire, `pending` and `capped` suppress.
+     */
+    reason: "first" | "rearm" | "pending" | "capped";
     /** Fires so far for this key, after this decision. */
     fires: number;
     /** Suppressed matches since the last fire. */
@@ -67,10 +72,22 @@ export class HintGate {
         if (fires === 0) {
             this.fires.set(key, 1);
             this.pending.set(key, 0);
-            return { fire: true, suppressed: false, fires: 1, sinceFire: 0 };
+            return {
+                fire: true,
+                suppressed: false,
+                reason: "first",
+                fires: 1,
+                sinceFire: 0,
+            };
         }
         if (fires >= this.maxFires) {
-            return { fire: false, suppressed: true, fires, sinceFire };
+            return {
+                fire: false,
+                suppressed: true,
+                reason: "capped",
+                fires,
+                sinceFire,
+            };
         }
 
         const nextSince = sinceFire + 1;
@@ -79,6 +96,7 @@ export class HintGate {
             return {
                 fire: false,
                 suppressed: true,
+                reason: "pending",
                 fires,
                 sinceFire: nextSince,
             };
@@ -89,6 +107,7 @@ export class HintGate {
         return {
             fire: true,
             suppressed: false,
+            reason: "rearm",
             fires: fires + 1,
             sinceFire: 0,
         };

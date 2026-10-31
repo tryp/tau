@@ -222,9 +222,9 @@ void describe("tool-hints registration", () => {
             (e) => e.customType === "tool-hints-suppressed"
         );
         assert.equal(suppressed.length, 1);
-        assert.equal(
-            (suppressed[0].data as { rule: string }).rule,
-            "sed-range"
+        assert.deepEqual(
+            suppressed[0].data as { rule: string; reason: string },
+            { rule: "sed-range", reason: "pending" }
         );
     });
 
@@ -306,7 +306,7 @@ void describe("tool-hints registration", () => {
         // Compaction replaces old tool results but not this counter, so the
         // gate -- not the context window -- is what decides whether an ignored
         // hint ever comes back.
-        const { pi, handlers } = fakePi();
+        const { pi, handlers, appended } = fakePi();
         registerToolHints(pi);
         const handler = resultHandler(handlers);
         assert.ok(handler);
@@ -317,7 +317,16 @@ void describe("tool-hints registration", () => {
             const result = await handler(bashResult(`sed -n '1,${i + 2}p' a.txt`));
             if (hintBlocks(result).length > 0) fired++;
         }
+        // Exactly the budget: more is noise, fewer means an ignored hint was
+        // retired for good.
         assert.equal(fired, DEFAULT_MAX_FIRES);
+
+        // The progression is in the record, not just in memory: `pending` while
+        // re-arming and `capped` once the budget is spent.
+        const reasons = appended
+            .filter((e) => e.customType === "tool-hints-suppressed")
+            .map((e) => (e.data as { reason: string }).reason);
+        assert.deepEqual(reasons.sort(), ["capped", "pending"]);
     });
 
     void it("never marks a result as an error", async () => {
@@ -341,6 +350,8 @@ void describe("tool-hints gate", () => {
         const first = gate.offer("sed-range");
         assert.equal(first.fire, true);
         assert.equal(first.fires, 1);
+        // The reason is what the session record reports, so it is pinned too.
+        assert.equal(first.reason, "first");
     });
 
     void it("counts suppressed matches instead of forgetting them", () => {
@@ -352,9 +363,11 @@ void describe("tool-hints gate", () => {
             [a.fire, a.sinceFire, b.fire, b.sinceFire],
             [false, 1, false, 2]
         );
+        assert.equal(a.reason, "pending");
         const third = gate.offer("r"); // the rearm fires
         assert.equal(third.fire, true);
         assert.equal(third.fires, 2);
+        assert.equal(third.reason, "rearm");
     });
 
     void it("goes quiet once maxFires is reached", () => {
@@ -364,6 +377,9 @@ void describe("tool-hints gate", () => {
             const decision = gate.offer("r");
             assert.equal(decision.fire, false);
             assert.equal(decision.suppressed, true);
+            // `capped` is distinguishable from `pending`: a rule that never
+            // converted anyone stops being counted as still arming.
+            assert.equal(decision.reason, "capped");
         }
         assert.equal(gate.fireCount("r"), 1);
     });

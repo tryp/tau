@@ -67,13 +67,16 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
     /** Poll counts per job id. */
     const polls = new Map<string, number>();
     /** Suppression is silent by construction; record the first one per rule. */
+    // Keyed by rule *and* reason, so a rule that goes from `pending` to `capped`
+    // is visible as a progression while the number of entries stays bounded.
     const suppressionRecorded = new Set<string>();
 
     const enabled = (): boolean => !state || isFeatureEnabled(state, "tool-hints");
 
     const suppress = (rule: HintRule, reason: string): void => {
-        if (suppressionRecorded.has(rule)) return;
-        suppressionRecorded.add(rule);
+        const key = `${rule}:${reason}`;
+        if (suppressionRecorded.has(key)) return;
+        suppressionRecorded.add(key);
         pi.appendEntry("tool-hints-suppressed", { rule, reason });
     };
 
@@ -93,7 +96,7 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             rule = "sed-range";
             const decision = ruleGate.offer(rule);
             if (!decision.fire) {
-                suppress(rule, "rearm-pending");
+                suppress(rule, decision.reason);
                 return;
             }
             hint = sedRangeHint(view);
@@ -103,7 +106,7 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             rule = "diagnostics";
             const decision = ruleGate.offer(rule);
             if (!decision.fire) {
-                suppress(rule, "rearm-pending");
+                suppress(rule, decision.reason);
                 return;
             }
             hint = diagnosticsHint(pos);
@@ -116,8 +119,9 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
             // decides whether the job has been ignored long enough to re-offer.
             if (count < POLL_THRESHOLD) return;
             rule = "job-poll";
-            if (!jobGate.offer(jobId).fire) {
-                suppress(rule, "rearm-pending");
+            const decision = jobGate.offer(jobId);
+            if (!decision.fire) {
+                suppress(rule, decision.reason);
                 return;
             }
             hint = jobPollHint(jobId);
