@@ -1339,7 +1339,9 @@ async function indexStageZeroCapture(
         const outcome = await indexJobOutputWithOutcome(
             {
                 id: `${toolCallId}-stage0`,
-                command,
+                command: capture.command.startsWith("Compound stage-0 capture:")
+                    ? capture.command
+                    : command,
                 logPath: capture.path,
                 exitCode,
                 status,
@@ -1464,7 +1466,10 @@ type PendingCompletionDelivery = {
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
 const queuedCompletionDeliveries = new Map<string, PendingCompletionDelivery>();
-const possiblyDeliveredCompletionDeliveries = new Map<string, PendingCompletionDelivery>();
+const possiblyDeliveredCompletionDeliveries = new Map<
+    string,
+    PendingCompletionDelivery
+>();
 const acknowledgedCompletionAt = new Map<string, number>();
 const completionDeliveryInstance = randomUUID();
 let completionDeliverySequence = 0;
@@ -1566,8 +1571,13 @@ export function flushCompletionBatch(): void {
     const freshBatch = batch.filter(({ job }) => {
         const acknowledgedAt = acknowledgedCompletionAt.get(job.id);
         const age = job.endTime === undefined ? 0 : Date.now() - job.endTime;
-        if (acknowledgedAt !== undefined && age > ACKNOWLEDGED_STALE_MAX_AGE_MS) {
-            recordCompletionTelemetry(pi, "suppressed-stale", { jobIds: [job.id] });
+        if (
+            acknowledgedAt !== undefined &&
+            age > ACKNOWLEDGED_STALE_MAX_AGE_MS
+        ) {
+            recordCompletionTelemetry(pi, "suppressed-stale", {
+                jobIds: [job.id],
+            });
             pendingCompletionJobs.delete(job.id);
             return false;
         }

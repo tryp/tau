@@ -136,6 +136,12 @@ export interface PipePlan {
     stageZero: { path: string; command: string; operatorAt: number } | null;
     /** Compound calls keep their shell limiters, so the shell already made each view. */
     preserveLimiterViews?: boolean;
+    /** Ordered pipeline inputs appended to the compound call's stage-0 file. */
+    stageZeroSegments?: {
+        command: string;
+        separator: string;
+        captured: boolean;
+    }[];
 }
 
 /**
@@ -841,7 +847,7 @@ export function planPipeNerf(
                 return skipped(command, "limiter-in-comment", invocation);
             }
             let offset = 0;
-            let firstCapture: PipePlan["stageZero"] = null;
+            let firstOperatorAt: number | null = null;
             const rewrittenSegments = segments.map((segment, index) => {
                 const currentOffset = offset;
                 offset += segment.text.length + segment.separator.length;
@@ -864,12 +870,8 @@ export function planPipeNerf(
                     .replace(/^\s+/, "");
                 const teePath = JSON.stringify(options.stageZeroPath);
                 const text = `${before} | tee -a ${teePath} | ${after}`;
-                if (!firstCapture) {
-                    firstCapture = {
-                        path: options.stageZeroPath!,
-                        command: "compound pipeline stage-0 outputs",
-                        operatorAt: currentOffset + pipeAt,
-                    };
+                if (firstOperatorAt === null) {
+                    firstOperatorAt = currentOffset + pipeAt;
                 }
                 return { ...segment, text };
             });
@@ -879,6 +881,25 @@ export function planPipeNerf(
             const rewritten = rewrittenSegments
                 .map((segment) => `${segment!.text}${segment!.separator}`)
                 .join("");
+            const stageZeroSegments = segments.map((segment, index) => ({
+                command: segment.text.trim(),
+                separator: segment.separator,
+                captured: Boolean(invocations[index]),
+            }));
+            const segmentLabel = stageZeroSegments
+                .map(
+                    (segment, index) =>
+                        `(${index + 1}) ${JSON.stringify(segment.command)}${segment.captured ? " [stage-0 captured]" : " [not captured]"}${segment.separator ? ` [then ${segment.separator}]` : ""}`
+                )
+                .join("; ");
+            const firstCapture =
+                firstOperatorAt === null
+                    ? null
+                    : {
+                          path: options.stageZeroPath,
+                          command: `Compound stage-0 capture: ${segmentLabel}`,
+                          operatorAt: firstOperatorAt,
+                      };
             return {
                 action: "rewrite",
                 reason: null,
@@ -887,6 +908,7 @@ export function planPipeNerf(
                 rewritten,
                 stageZero: firstCapture,
                 preserveLimiterViews: true,
+                stageZeroSegments,
             };
         }
     }

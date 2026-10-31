@@ -190,6 +190,15 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
         if (plan.action !== "rewrite") return;
 
         input.command = plan.rewritten;
+        if (plan.stageZeroSegments && plan.stageZeroSegments.length > 1) {
+            pi.appendEntry("pipe-nerf-compound-stage0", {
+                toolCallId: event.toolCallId,
+                segmentCount: plan.stageZeroSegments.length,
+                capturedPipelineCount: plan.stageZeroSegments.filter(
+                    (segment) => segment.captured
+                ).length,
+            });
+        }
         if (plan.stageZero) {
             // The bash tool owns output capture, and it is the only place with
             // the session context the sidecar needs. Record the path so it can
@@ -259,16 +268,25 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                     pipeStageZero?: { path: string; sourceId: string | null };
                 }
             ).pipeStageZero;
+            const captureSegments = plan.stageZeroSegments
+                ?.map(
+                    (segment, index) =>
+                        `(${index + 1}) ${JSON.stringify(segment.command)}${segment.captured ? " [stage-0 captured]" : " [not captured]"}${segment.separator ? ` [then ${segment.separator}]` : ""}`
+                )
+                .join("; ");
+            const captureDescription = captureSegments
+                ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}.`
+                : "";
             const retrieval = capture?.sourceId
-                ? ` Stage-0 output is indexed as ${JSON.stringify(capture.sourceId)}.`
+                ? ` It is indexed as ${JSON.stringify(capture.sourceId)}.`
                 : capture?.path
-                  ? ` Stage-0 output is retained at ${capture.path}.`
+                  ? ` It is retained at ${capture.path}.`
                   : "";
             return {
                 content: [
                     {
                         type: "text" as const,
-                        text: `Effective command: ${JSON.stringify(plan.rewritten)}. Every shell limiter was preserved, so the output below is already the requested view.${retrieval}`,
+                        text: `Effective command: ${JSON.stringify(plan.rewritten)}. Every shell limiter was preserved, so the output below is already the requested view.${captureDescription}${retrieval}`,
                     },
                     ...event.content,
                 ],

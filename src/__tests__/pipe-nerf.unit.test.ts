@@ -518,6 +518,11 @@ void describe("pipe-nerf compound pipelines", () => {
                 const plan = planPipeNerf(command, { stageZeroPath });
                 assert.equal(plan.action, "rewrite");
                 assert.equal(plan.preserveLimiterViews, true);
+                assert.equal(
+                    plan.stageZeroSegments?.length,
+                    separator === "||" ? 3 : 2
+                );
+                assert.match(plan.stageZero?.command ?? "", /tail -2.*wc -l/);
                 assert.match(plan.rewritten, /tail -2/);
                 assert.match(plan.rewritten, /wc -l/);
                 assert.equal(
@@ -898,6 +903,7 @@ void describe("pipe-nerf note", () => {
         assert.match(note, /sed -n 'START,ENDp' \/tmp\/pytest\.log/);
         assert.match(note, /context_search.*ctx_pytest/);
         assert.match(note, /Effective command:/);
+        assert.doesNotMatch(note, /Stage-0 holds the pipeline inputs/);
         assert.doesNotMatch(note, /nothing was written|re-run|export it whole/);
     });
 
@@ -978,6 +984,10 @@ void describe("pipe-nerf note", () => {
             })
         );
         assert.match(captured, /Captured 12 lines; all are retained/);
+        assert.doesNotMatch(
+            captured,
+            /Stage-0 contains the inputs for captured pipeline segments/
+        );
         assert.match(captured, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
         assert.doesNotMatch(captured, /pre-filter:|re-filter/);
     });
@@ -1172,6 +1182,11 @@ void describe("pipe-nerf registration", () => {
         }) as { content: { type: string; text: string }[] };
 
         assert.equal(entries.filter((e) => e.type === "pipe-nerf").length, 1);
+        assert.equal(
+            entries.filter((e) => e.type === "pipe-nerf-compound-stage0")
+                .length,
+            0
+        );
         const note = result.content[0].text;
         assert.ok(
             note.includes(
@@ -1281,7 +1296,7 @@ void describe("pipe-nerf registration", () => {
     });
 
     void it("preserves both shell-produced views in a compound call", () => {
-        const { pi, handlers } = fakePi();
+        const { pi, handlers, entries } = fakePi();
         registerPipeNerf(pi as never);
         const input: { command: string } = {
             command: "seq 1 10 | tail -2; echo ===; seq 1 10 | wc -l",
@@ -1293,6 +1308,14 @@ void describe("pipe-nerf registration", () => {
         });
         assert.match(input.command, /tail -2/);
         assert.match(input.command, /wc -l/);
+        const counter = entries.find(
+            (entry) => entry.type === "pipe-nerf-compound-stage0"
+        );
+        assert.deepEqual(counter?.data, {
+            toolCallId: "compound-wc",
+            segmentCount: 3,
+            capturedPipelineCount: 2,
+        });
 
         const visible = "9\n10\n===\n10";
         const result = fire(handlers, "tool_result", {
@@ -1309,6 +1332,15 @@ void describe("pipe-nerf registration", () => {
             },
         }) as { content: { type: string; text: string }[] };
         assert.match(result.content[0].text, /ctx_compound_stage_zero/);
+        assert.match(
+            result.content[0].text,
+            /Stage-0 contains the inputs for captured pipeline segments, concatenated in order/
+        );
+        assert.match(
+            result.content[0].text,
+            /\(1\).*tail -2.*\(2\).*echo ===.*\(3\).*wc -l/
+        );
+        assert.match(result.content[0].text, /\[then ;\].*\[then ;\]/);
         assert.equal(result.content[1].text, visible);
         assert.doesNotMatch(result.content[1].text, /1\n2/);
     });
