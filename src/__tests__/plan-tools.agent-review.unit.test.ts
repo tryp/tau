@@ -4,10 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-    PLAN_MODE_ACTIVE_TOOLS,
-    registerPlanTools,
-} from "../features/plan-tools.ts";
+import { registerPlanTools } from "../features/plan-tools.ts";
 import { createPlanFile } from "../features/plan-file.ts";
 import { TauState } from "../state.ts";
 
@@ -72,6 +69,7 @@ function makeAgentReviewHarness() {
         hasUI: false,
         sessionManager: {
             getSessionDir: () => sessionDir,
+            getSessionId: () => "test-session-id",
         },
         ui: {
             select: async () => {
@@ -113,18 +111,41 @@ async function callExit(
 }
 
 void describe("agent-driven plan review", () => {
-    void it("keeps subagent planning and review tools available", () => {
-        assert.deepEqual(
-            PLAN_MODE_ACTIVE_TOOLS.filter((tool) =>
-                [
-                    "subagent",
-                    "subagent_wait",
-                    "enter_plan_mode",
-                    "exit_plan_mode",
-                ].includes(tool)
-            ),
-            ["subagent", "subagent_wait", "enter_plan_mode", "exit_plan_mode"]
-        );
+    void it("enters plan mode without replacing the active tool schema", async () => {
+        const harness = makeAgentReviewHarness();
+        try {
+            harness.state.permissionMode = "allow";
+            harness.state.planSlug = undefined;
+            const enter = harness.tools.get("enter_plan_mode");
+            assert.ok(enter);
+            await enter.execute(
+                "test-call",
+                {},
+                undefined,
+                undefined,
+                harness.ctx
+            );
+            assert.equal(harness.state.permissionMode, "plan");
+            assert.equal(harness.state.planModeExitNoticePending, false);
+            assert.deepEqual(harness.activeToolCalls, []);
+        } finally {
+            harness.cleanup();
+        }
+    });
+
+    void it("registers plan tools without replacing the active tool schema", async () => {
+        const harness = makeAgentReviewHarness();
+        try {
+            for (const name of ["enter_plan_mode", "exit_plan_mode"]) {
+                assert.ok(harness.tools.has(name));
+            }
+            await callExit(harness, { action: "review" });
+            const approved = await callExit(harness, { action: "approve" });
+            assert.equal(approved.details?.approved, true);
+            assert.deepEqual(harness.activeToolCalls, []);
+        } finally {
+            harness.cleanup();
+        }
     });
 
     void it("returns review to the agent, then approves without UI prompts", async () => {
@@ -161,7 +182,7 @@ void describe("agent-driven plan review", () => {
         }
     });
 
-    void it("restores the complete pre-plan tool selection after approval", async () => {
+    void it("does not change tools on approval", async () => {
         const harness = makeAgentReviewHarness();
         try {
             const toolsBeforePlan = [
@@ -175,8 +196,9 @@ void describe("agent-driven plan review", () => {
             harness.state.enabledTools = new Set(toolsBeforePlan);
             await callExit(harness, { action: "review" });
             await callExit(harness, { action: "approve" });
-            assert.deepEqual(harness.activeToolCalls.at(-1), toolsBeforePlan);
+            assert.deepEqual(harness.activeToolCalls, []);
             assert.equal(harness.state.toolsBeforePlanMode, undefined);
+            assert.equal(harness.state.planModeExitNoticePending, true);
         } finally {
             harness.cleanup();
         }

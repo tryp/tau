@@ -60,7 +60,7 @@ export function registerPermissions(pi: ExtensionAPI, state: TauState): void {
             }
 
             if (subcommand === "cycle") {
-                cycleMode(pi, state, ctx);
+                cycleMode(state, ctx);
                 return;
             }
 
@@ -136,7 +136,7 @@ export function registerPermissions(pi: ExtensionAPI, state: TauState): void {
                     );
                     return;
                 }
-                setMode(pi, state, ctx, target);
+                setMode(state, ctx, target);
                 return;
             }
 
@@ -161,7 +161,7 @@ export function registerPermissions(pi: ExtensionAPI, state: TauState): void {
     pi.registerShortcut(Key.ctrlShift("m"), {
         description: "Cycle permission mode",
         handler: async (ctx) => {
-            cycleMode(pi, state, ctx);
+            cycleMode(state, ctx);
         },
     });
 
@@ -191,40 +191,32 @@ export function registerPermissions(pi: ExtensionAPI, state: TauState): void {
 
 // ── Mode cycling ─────────────────────────────────────────────────────
 
-function cycleMode(
-    pi: ExtensionAPI,
-    state: TauState,
-    ctx: ExtensionContext
-): void {
+function cycleMode(state: TauState, ctx: ExtensionContext): void {
     const next = nextMode(
         state.permissionMode,
         isBypassAvailable(state.permissionDisableBypass)
     );
-    setMode(pi, state, ctx, next);
+    setMode(state, ctx, next);
 }
 
 function setMode(
-    pi: ExtensionAPI,
     state: TauState,
     ctx: ExtensionContext,
     mode: PermissionMode
 ): void {
     const prev = state.permissionMode;
     state.permissionMode = mode;
-
-    // Update tool sets based on mode
-    if (mode === "plan") {
-        pi.setActiveTools([
-            "read",
-            "bash",
-            "grep",
-            "find",
-            "ls",
-            "questionnaire",
-        ]);
-    } else if (prev === "plan") {
-        pi.setActiveTools(["read", "bash", "edit", "write"]);
+    if (prev === "plan" && mode !== "plan") {
+        state.planModeExitNoticePending = true;
+    } else if (mode === "plan") {
+        state.planModeExitNoticePending = false;
     }
+
+    // Permission mode changes authorization, not the active tool schema. The
+    // provider cache includes the tool block, so replacing tools on a plan-mode
+    // transition would truncate the cached prompt prefix (see coding-agent
+    // docs/extensions.md:2392-2396). Plan-mode restrictions are enforced below
+    // in checkToolPermission, not by hiding tools from the model.
 
     // Update status bar with shortcut hint that fades after 4s
     if (ctx.hasUI) {

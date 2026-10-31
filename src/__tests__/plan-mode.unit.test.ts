@@ -17,7 +17,9 @@ import {
 import type {
     ToolCallEvent,
     ExtensionContext,
+    ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { cancelPlanMode } from "../features/plan-tools.ts";
 import { TauState } from "../state.ts";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -221,48 +223,42 @@ void describe("PLAN_MODE_TIMEOUT_MS", () => {
 // 3. cancelPlanMode — state clearing (tested via inline helper)
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Inline version of cancelPlanMode for testing purposes.
- * Mirrors the logic in plan-tools.ts without its module dependencies.
- */
+/** Invoke the real cancellation path while tracking any active-tool changes. */
 function testableCancelPlanMode(
     state: TauState,
-    setActiveTools: Mock<(...args: unknown[]) => unknown>,
     appendEntry: Mock<(...args: unknown[]) => unknown>
 ): void {
-    const previousMode = state.planPreviousMode ?? "allow";
-    state.permissionMode = previousMode;
-    state.planSlug = undefined;
-    state.planPreviousMode = undefined;
-    state.planExiting = false;
-    state.planEnteredAt = undefined;
-    setActiveTools(["read", "bash", "edit", "write"]);
-    appendEntry("plan-mode", {
-        enabled: false,
-        planId: undefined,
-        executing: false,
-    });
+    const setActiveTools = mock.fn();
+    const pi = { setActiveTools, appendEntry } as unknown as ExtensionAPI;
+    const ctx = {
+        hasUI: false,
+        ui: { notify() {} },
+    } as unknown as ExtensionContext;
+
+    cancelPlanMode(pi, state, ctx);
+    assert.equal(setActiveTools.mock.callCount(), 0);
 }
 
 void describe("cancelPlanMode state clearing", () => {
-    void it("clears all plan-mode state fields", () => {
+    void it("clears plan state without changing the active tool schema", () => {
         const state = new TauState();
         state.permissionMode = "plan";
         state.planSlug = "2026-07-26-test-plan";
         state.planPreviousMode = "allow";
         state.planExiting = false;
         state.planEnteredAt = Date.now();
+        state.toolsBeforePlanMode = ["read", "bash"];
 
-        const setActiveTools = mock.fn();
         const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
+        testableCancelPlanMode(state, appendEntry);
 
         assert.equal(state.permissionMode, "allow");
         assert.equal(state.planSlug, undefined);
         assert.equal(state.planPreviousMode, undefined);
         assert.equal(state.planExiting, false);
         assert.equal(state.planEnteredAt, undefined);
+        assert.equal(state.toolsBeforePlanMode, undefined);
+        assert.equal(state.planModeExitNoticePending, true);
     });
 
     void it("restores to allow when no previous mode", () => {
@@ -271,12 +267,7 @@ void describe("cancelPlanMode state clearing", () => {
         state.planSlug = "test-plan";
         state.planEnteredAt = Date.now();
 
-        const setActiveTools = mock.fn();
-        const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
-
-        // planPreviousMode is undefined, defaults to "allow"
+        testableCancelPlanMode(state, mock.fn());
         assert.equal(state.permissionMode, "allow");
     });
 
@@ -287,11 +278,7 @@ void describe("cancelPlanMode state clearing", () => {
         state.planPreviousMode = "dontAsk";
         state.planEnteredAt = Date.now();
 
-        const setActiveTools = mock.fn();
-        const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
-
+        testableCancelPlanMode(state, mock.fn());
         assert.equal(state.permissionMode, "dontAsk");
     });
 
@@ -302,32 +289,8 @@ void describe("cancelPlanMode state clearing", () => {
         state.planPreviousMode = "edit";
         state.planEnteredAt = Date.now();
 
-        const setActiveTools = mock.fn();
-        const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
-
+        testableCancelPlanMode(state, mock.fn());
         assert.equal(state.permissionMode, "edit");
-    });
-
-    void it("calls setActiveTools with normal mode tools", () => {
-        const state = new TauState();
-        state.permissionMode = "plan";
-        state.planSlug = "test-plan";
-        state.planEnteredAt = Date.now();
-
-        const setActiveTools = mock.fn();
-        const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
-
-        assert.equal(setActiveTools.mock.callCount(), 1);
-        assert.deepEqual(setActiveTools.mock.calls[0].arguments[0], [
-            "read",
-            "bash",
-            "edit",
-            "write",
-        ]);
     });
 
     void it("appends plan-mode disabled entry", () => {
@@ -336,10 +299,8 @@ void describe("cancelPlanMode state clearing", () => {
         state.planSlug = "test-plan";
         state.planEnteredAt = Date.now();
 
-        const setActiveTools = mock.fn();
         const appendEntry = mock.fn();
-
-        testableCancelPlanMode(state, setActiveTools, appendEntry);
+        testableCancelPlanMode(state, appendEntry);
 
         assert.equal(appendEntry.mock.callCount(), 1);
         assert.deepEqual(appendEntry.mock.calls[0].arguments, [

@@ -32,7 +32,6 @@ import {
 } from "./plan-preferences.ts";
 import { formatTaskTree, countIndependentBranches } from "./task.ts";
 import { captureReload } from "./reload.ts";
-import { NORMAL_MODE_TOOLS } from "../utils.ts";
 
 // ─── Tool parameter schemas ─────────────────────────────────────────
 
@@ -87,44 +86,16 @@ const EXECUTION_MODE_LABELS: Record<ExecutionMode, string> = {
     manual: "Manual (read plan when needed)",
 };
 
-/** Tools the agent may use while it plans and reviews without user UI. */
-export const PLAN_MODE_ACTIVE_TOOLS = [
-    "read",
-    "bash",
-    "grep",
-    "find",
-    "ls",
-    "questionnaire",
-    "task",
-    "subagent",
-    "subagent_wait",
-    "write",
-    "enter_plan_mode",
-    "exit_plan_mode",
-];
-
-/** Capture the user's active tool selection before plan mode narrows it. */
-export function captureToolsBeforePlanMode(
-    pi: ExtensionAPI,
-    state: TauState
-): void {
-    if (state.toolsBeforePlanMode === undefined) {
-        state.toolsBeforePlanMode = pi.getActiveTools();
-    }
-}
-
-/** Restore the exact pre-plan tool selection instead of a hard-coded subset. */
-export function restoreToolsAfterPlanMode(
-    pi: ExtensionAPI,
-    state: TauState
-): void {
-    const tools =
-        state.toolsBeforePlanMode ??
-        (state.enabledTools.size > 0
-            ? Array.from(state.enabledTools)
-            : NORMAL_MODE_TOOLS);
-    pi.setActiveTools(tools);
-    state.enabledTools = new Set(tools);
+/**
+ * Clear the legacy saved tool selection without changing the active schema.
+ * Plan mode is a permission policy, not a tool-schema change: replacing the
+ * active set truncates the provider's cached prompt prefix. The coding-agent
+ * docs explicitly recommend adding tools instead of replacing the active set
+ * (docs/extensions.md:2392-2396); the upstream example at
+ * packages/coding-agent/examples/extensions/plan-mode/index.ts (docs/extensions.md:2994)
+ * still illustrates the old, cache-hostile pattern.
+ */
+export function clearToolsBeforePlanMode(state: TauState): void {
     state.toolsBeforePlanMode = undefined;
 }
 
@@ -140,7 +111,7 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             "Enter plan mode for read-only codebase exploration and planning. " +
             "Creates a plan file at ~/.pi/agent/sessions/{dir}/plans/{timestamp}-{name}.md " +
             "where the plan will be written. " +
-            "In plan mode, only read tools and the plan file are accessible — no edits or writes. " +
+            "In plan mode, the active tool set remains available, but permission checks block edits and writes except to the plan file and restrict bash to read-only commands. " +
             "Use this when the task is complex enough to warrant structured planning first.",
         parameters: EnterPlanModeParams,
 
@@ -159,18 +130,17 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             // Create plan file
             const planPath = createPlanFile(sessionDir, planId, title);
 
-            // Preserve the user's complete tool selection. Plan mode temporarily
-            // narrows tools; execution must restore this exact selection.
-            captureToolsBeforePlanMode(pi, state);
-
             // Store previous mode for restoration
             state.planSlug = planId;
             state.planPreviousMode = state.permissionMode;
             state.planReviewPending = false;
+            state.planModeExitNoticePending = false;
 
-            // Switch to plan mode
+            // Enter plan mode without changing the tool schema: the permission
+            // pipeline below gates writes and unsafe commands, while replacing
+            // active tools truncates the provider's cached prompt prefix.
             state.permissionMode = "plan";
-            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
+            clearToolsBeforePlanMode(state);
 
             // Update status bar
             if (ctx.hasUI) {
@@ -188,7 +158,6 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                 previousMode: state.planPreviousMode,
                 enteredAt: Date.now(),
                 reviewPending: false,
-                toolsBeforePlanMode: state.toolsBeforePlanMode,
             });
 
             return {
@@ -443,7 +412,9 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
             state.planExiting = true;
             state.planEnteredAt = undefined;
             state.permissionMode = previousMode;
-            restoreToolsAfterPlanMode(pi, state);
+            state.planModeExitNoticePending = true;
+            // Keep the active tool schema stable; permissions change, tools do not.
+            clearToolsBeforePlanMode(state);
 
             // Update status bar
             if (ctx.hasUI) {
@@ -576,8 +547,10 @@ export function registerPlanTools(pi: ExtensionAPI, state: TauState): void {
                 state.planPreviousMode = state.permissionMode;
                 state.planReviewPending = false;
                 state.planEnteredAt = Date.now();
+                // Keep the schema stable; plan mode's permission checks enforce
+                // read-only access without invalidating the cached prompt prefix.
                 state.permissionMode = "plan";
-                pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
+                clearToolsBeforePlanMode(state);
 
                 if (ctx.hasUI) {
                     const colour = modeColour("plan");
@@ -662,7 +635,10 @@ export function cancelPlanMode(
     state.planExiting = false;
     state.planReviewPending = false;
     state.planEnteredAt = undefined;
-    restoreToolsAfterPlanMode(pi, state);
+    state.planModeExitNoticePending = true;
+    // Keep the active tool schema stable; the permission mode now changes only
+    // authorization, not the provider's cached prompt prefix.
+    clearToolsBeforePlanMode(state);
 
     if (ctx.hasUI) {
         const colour = modeColour(previousMode);

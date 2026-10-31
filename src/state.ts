@@ -118,6 +118,8 @@ export class TauState {
     planExiting = false;
     /** Whether an agent-driven plan review is awaiting an approve/revise action. */
     planReviewPending = false;
+    /** Append one tail message after plan mode ends so preserved history is not stale. */
+    planModeExitNoticePending = false;
     /** Timestamp (Date.now()) when plan mode was entered. Used for auto-exit timeout. */
     planEnteredAt: number | undefined;
 
@@ -143,7 +145,7 @@ export class TauState {
     enabledTools = new Set<string>();
     allTools: ToolInfo[] = [];
 
-    /** Active tools captured before entering plan mode, for exact restoration. */
+    /** Legacy session field retained only so exiting old saved plan state can clear it. */
     toolsBeforePlanMode: string[] | undefined;
 
     // ── Feature toggle overrides ─────────────────────────────────────

@@ -18,11 +18,7 @@ import { isFeatureEnabled } from "./features-helpers.ts";
 import type { PermissionMode } from "./permissions/types.js";
 import { modeStatusText, modeColour } from "./permissions/index.js";
 import { planIdFromSession, createPlanFile } from "./plan-file.ts";
-import {
-    captureToolsBeforePlanMode,
-    PLAN_MODE_ACTIVE_TOOLS,
-    restoreToolsAfterPlanMode,
-} from "./plan-tools.ts";
+import { clearToolsBeforePlanMode } from "./plan-tools.ts";
 
 /**
  * Auto-exit plan mode after 30 minutes of inactivity.
@@ -39,11 +35,7 @@ function updatePlanStatus(state: TauState, ctx: ExtensionContext): void {
     ctx.ui.setWidget("plan-todos", undefined);
 }
 
-export function togglePlanMode(
-    pi: ExtensionAPI,
-    state: TauState,
-    ctx: ExtensionContext
-): void {
+export function togglePlanMode(state: TauState, ctx: ExtensionContext): void {
     if (state.permissionMode === "plan") {
         const previousMode: PermissionMode = state.planPreviousMode ?? "allow";
         state.permissionMode = previousMode;
@@ -51,7 +43,8 @@ export function togglePlanMode(
         state.planPreviousMode = undefined;
         state.planReviewPending = false;
         state.planEnteredAt = undefined;
-        restoreToolsAfterPlanMode(pi, state);
+        state.planModeExitNoticePending = true;
+        clearToolsBeforePlanMode(state);
 
         if (ctx.hasUI) {
             const colour = modeColour(previousMode);
@@ -74,8 +67,14 @@ export function togglePlanMode(
         state.planSlug = planId;
         state.planReviewPending = false;
         state.planEnteredAt = Date.now();
-        captureToolsBeforePlanMode(pi, state);
-        pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
+        state.planModeExitNoticePending = false;
+        // Plan mode is a permission policy, not a tool-schema change. The
+        // provider cache includes the tool block; replacing the active set
+        // truncates the cached prefix. The coding-agent docs recommend adding
+        // tools instead of replacing the active set (docs/extensions.md:2392-2396);
+        // the referenced plan-mode example at docs/extensions.md:2994 uses the
+        // cache-hostile replacement pattern.
+        clearToolsBeforePlanMode(state);
 
         if (ctx.hasUI) {
             const colour = modeColour("plan");
@@ -108,7 +107,7 @@ export function registerPlanMode(pi: ExtensionAPI, state: TauState): void {
                 );
                 return;
             }
-            togglePlanMode(pi, state, ctx);
+            togglePlanMode(state, ctx);
         },
     });
 
@@ -116,7 +115,7 @@ export function registerPlanMode(pi: ExtensionAPI, state: TauState): void {
         description: "Toggle plan mode",
         handler: async (ctx) => {
             if (!isFeatureEnabled(state, "plan-mode")) return;
-            togglePlanMode(pi, state, ctx);
+            togglePlanMode(state, ctx);
         },
     });
 }

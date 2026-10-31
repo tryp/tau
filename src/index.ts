@@ -15,7 +15,6 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { TauState } from "./state.ts";
 import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
 import { registerPipeNerf } from "./features/pipe-nerf/index.ts";
@@ -87,10 +86,7 @@ import { buildStatusBars, readUsageSnapshot } from "./features/quota-bars.ts";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
 import { registerPermissions } from "./features/permissions/commands.js";
-import {
-    registerPlanTools,
-    PLAN_MODE_ACTIVE_TOOLS,
-} from "./features/plan-tools.js";
+import { registerPlanTools } from "./features/plan-tools.js";
 import { registerTauCommand } from "./features/features-register.ts";
 import { registerWakeup } from "./features/wakeup.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
@@ -444,6 +440,8 @@ export default function (pi: ExtensionAPI) {
         ) {
             const planSlug = state.planSlug;
             cancelPlanMode(pi, state, ctx);
+            // The auto-exit message below already supplies the one-shot nudge.
+            state.planModeExitNoticePending = false;
             return {
                 message: {
                     customType: "plan-mode-context",
@@ -453,6 +451,18 @@ Plan mode was automatically disabled after 30 minutes of inactivity.
 If you need to continue planning, call enter_plan_mode again.
 Previous plan ID: ${planSlug ?? "(none)"}`,
                     display: true,
+                },
+            };
+        }
+
+        if (state.planModeExitNoticePending) {
+            state.planModeExitNoticePending = false;
+            return {
+                message: {
+                    customType: "plan-mode-ended-context",
+                    content:
+                        "[PLAN MODE ENDED] The earlier plan-mode restrictions applied only while plan mode was active. Follow the current permission mode and task instructions now.",
+                    display: false,
                 },
             };
         }
@@ -471,11 +481,12 @@ Previous plan ID: ${planSlug ?? "(none)"}`,
 You are in plan mode — a read-only exploration mode for structured planning.
 
 Restrictions:
-- Only read-only tools are available (read, bash, grep, find, ls, lsp_*)
+- The active tool set remains unchanged to preserve the provider's cached prompt prefix
+- Permission checks block Edit/Write except for the plan file at: ${planPath}
 - Bash is restricted to an allowlist of read-only commands
-- The ONLY writable file is the plan file at: ${planPath}
-- The write tool is available but restricted to writing the plan file only
-- The task tool is fully available — use it to structure the implementation
+- Read access outside permitted working directories is blocked
+- Use available read-only exploration tools; use task/subagent tools if active
+- If the write tool is active, use it only for the plan file at: ${planPath}
 
 Your job is to:
 1. Explore the codebase using read-only tools
@@ -495,32 +506,12 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         }
     });
 
-    // Plan-mode: filter out stale context when not active
-    pi.on("context", async (event) => {
-        if (state.permissionMode === "plan") return;
-
-        return {
-            messages: event.messages.filter((m) => {
-                const msg = m as AgentMessage & {
-                    customType?: string;
-                };
-                if (msg.customType === "plan-mode-context") return false;
-                if (msg.role !== "user") return true;
-
-                const content = msg.content;
-                if (typeof content === "string")
-                    return !content.includes("[PLAN MODE ACTIVE]");
-                if (Array.isArray(content)) {
-                    return !content.some(
-                        (c) =>
-                            c.type === "text" &&
-                            c.text?.includes("[PLAN MODE ACTIVE]")
-                    );
-                }
-                return true;
-            }),
-        };
-    });
+    // Keep this extension from rewriting history when plan mode ends. Removing
+    // earlier plan-mode-context messages changes the provider's cached prefix,
+    // just as replacing the active tool set does. In the measured 2026-10-31
+    // session, entering and exiting plan mode each dropped cacheRead from about
+    // 143k/137k tokens to 11k, re-billing about 256k tokens across one round trip.
+    // The messages are display:false and remain as stable historical context.
 
     pi.on("session_tree", async (_event, ctx) => {
         restoreFeaturesState(state, ctx);
@@ -647,7 +638,6 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                       previousMode?: import("./features/permissions/types.js").PermissionMode;
                       enteredAt?: number;
                       reviewPending?: boolean;
-                      toolsBeforePlanMode?: string[];
                   };
               }
             | undefined;
@@ -662,8 +652,6 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 state.planReviewPending =
                     planModeEntry.data.reviewPending ?? false;
                 state.planEnteredAt = planModeEntry.data.enteredAt;
-                state.toolsBeforePlanMode =
-                    planModeEntry.data.toolsBeforePlanMode;
             } else {
                 state.planSlug = undefined;
                 state.planPreviousMode = undefined;
@@ -676,13 +664,13 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         // Restore task state
         reconstructTaskState(state, ctx);
 
-        // Restore the user's normal tool selection before applying the
-        // temporary plan-mode restriction. This also gives restored plan
-        // sessions an exact selection to return to on approval/cancel.
+        // Restore the user's selected tools from the branch, but do not replace
+        // them when restoring plan mode. Per coding-agent docs/extensions.md
+        // (2392-2396), replacing the active set truncates the cached prompt prefix;
+        // plan mode enforces read-only access through the permission pipeline.
         restoreToolsFromBranch(pi, state, ctx);
         if (state.permissionMode === "plan") {
-            state.toolsBeforePlanMode ??= Array.from(state.enabledTools);
-            pi.setActiveTools(PLAN_MODE_ACTIVE_TOOLS);
+            state.toolsBeforePlanMode = undefined;
         }
 
         // ── Permission state initialisation ────────────────────────
