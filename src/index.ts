@@ -18,6 +18,7 @@ import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { TauState } from "./state.ts";
 import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
 import { registerPipeNerf } from "./features/pipe-nerf/index.ts";
+import { registerToolHints } from "./features/tool-hints/index.ts";
 import { registerTimeoutNerf } from "./features/timeout-nerf/index.ts";
 import { isSafeCommand } from "./plan-utils.ts";
 import { Text } from "@earendil-works/pi-tui";
@@ -355,6 +356,10 @@ export default function (pi: ExtensionAPI) {
     // handler above so a `block` decision still short-circuits first.
     registerTimeoutNerf(pi, state);
     registerPipeNerf(pi, state);
+    // Annotations on other tools' results, after they ran. Registered last so a
+    // hint cannot reorder a rewrite receipt that pipe-nerf or timeout-nerf put
+    // in front of the payload.
+    registerToolHints(pi, state);
 
     // Handoff disabled — file path tracking removed
     // pi.on("tool_result", async (event) => {

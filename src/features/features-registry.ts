@@ -205,6 +205,14 @@ export const FEATURE_REGISTRY: ReadonlyArray<FeatureDef> = [
         group: "Background",
         defaultOn: true,
     },
+    {
+        id: "tool-hints",
+        label: "Tool hints",
+        description:
+            "Annotate another tool's result when a cheaper alternative exists (sed -> read, diagnostics -> lsp_code_action, poll -> job_decide)",
+        group: "Background",
+        defaultOn: true,
+    },
 ];
 
 const BY_ID: ReadonlyMap<string, FeatureDef> = new Map(
