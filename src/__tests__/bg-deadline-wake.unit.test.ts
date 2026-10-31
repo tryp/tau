@@ -351,6 +351,110 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         );
     });
 
+    void it("attach returns completed output inline before the cutoff and consumes it", async () => {
+        mock.timers.enable({ apis: ["setTimeout", "Date"] });
+        const started = await h.bashBg.execute(
+            "tc-inline",
+            { command: "printf 'quick result'; sleep 30" },
+            undefined,
+            undefined,
+            ctxFor()
+        );
+        const jobId = (started.details as JobResultDetails).jobId!;
+        const job = h.state.backgroundJobs.get(jobId)!;
+        let progressResolve!: () => void;
+        const firstProgress = new Promise<void>((resolve) => {
+            progressResolve = resolve;
+        });
+        const attachPromise = h.jobs.execute(
+            "tc-inline-attach",
+            { action: "attach", jobId },
+            undefined,
+            progressResolve,
+            ctxFor()
+        );
+        await firstProgress;
+        job.proc!.emit("close", 0);
+        const result = await attachPromise;
+        assert.match(result.content[0].text, /Attach finished/);
+        assert.match(result.content[0].text, /quick result/);
+        assert.equal(job.status, "completed");
+        assert.equal(job.outputConsumed, true);
+        killGroup(job);
+    });
+
+    void it("inline cutoff returns a resumable handle and later completion notifies once", async () => {
+        mock.timers.enable({ apis: ["setTimeout", "Date"] });
+        const started = await h.bashBg.execute(
+            "tc-inline-cutoff",
+            { command: "trap '' TERM; sleep 30" },
+            undefined,
+            undefined,
+            ctxFor()
+        );
+        const jobId = (started.details as JobResultDetails).jobId!;
+        const job = h.state.backgroundJobs.get(jobId)!;
+        let progressResolve!: () => void;
+        const firstProgress = new Promise<void>((resolve) => {
+            progressResolve = resolve;
+        });
+        const attachPromise = h.jobs.execute(
+            "tc-inline-cutoff-attach",
+            { action: "attach", jobId },
+            undefined,
+            progressResolve,
+            ctxFor()
+        );
+        await firstProgress;
+        mock.timers.tick(30_000);
+        const result = await attachPromise;
+        assert.match(result.content[0].text, /still running/);
+        assert.match(result.content[0].text, /partial output/);
+        assert.match(result.content[0].text, new RegExp(`Job ID: ${jobId}`));
+        assert.equal(result.details?.jobId, jobId);
+        assert.equal(result.details?.status, "running");
+        assert.equal(job.outputConsumed, undefined);
+
+        // Exercise the normal proc-close completion path after attach returned.
+        job.proc!.emit("close", 0);
+        await job.outputIndexPromise;
+        flushCompletionBatch();
+        assert.equal(
+            h.sent.message.filter((m) => m.customType === "job-completion").length,
+            1
+        );
+        killGroup(job);
+    });
+
+    void it("reattaching to completed output consumes it and suppresses stale completion", async () => {
+        const started = await h.bashBg.execute(
+            "tc-reattach-consume",
+            { command: "trap '' TERM; sleep 30" },
+            undefined,
+            undefined,
+            ctxFor()
+        );
+        const jobId = (started.details as JobResultDetails).jobId!;
+        const job = h.state.backgroundJobs.get(jobId)!;
+        job.proc!.emit("close", 0);
+        const result = await h.jobs.execute(
+            "tc-reattach-consume-attach",
+            { action: "attach", jobId, wait: false },
+            undefined,
+            undefined,
+            ctxFor()
+        );
+        assert.match(result.content[0].text, /Attach finished/);
+        assert.equal(job.outputConsumed, true);
+        await job.outputIndexPromise;
+        flushCompletionBatch();
+        assert.equal(
+            h.sent.message.filter((m) => m.customType === "job-completion").length,
+            0
+        );
+        killGroup(job);
+    });
+
     void it("attach timeout is wait-only: returns without killing or altering the job", async () => {
         mock.timers.enable({ apis: ["setTimeout", "Date"] });
         const started = await h.bashBg.execute(

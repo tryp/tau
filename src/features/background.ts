@@ -1436,6 +1436,9 @@ function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
 
 const BATCH_DEBOUNCE_MS = 2000; // sliding window: each new completion resets this
 const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job in the batch
+// 284k completed tool-call pairs across 628 files: p95 25.7s, p99 81.4s.
+// Round p95 up to 30s (25.7 + 4.3s headroom); about 5% take the handle path.
+const INLINE_ATTACH_WINDOW_MS = 30_000;
 const ACKNOWLEDGED_STALE_MAX_AGE_MS = 5 * 60 * 1000;
 
 type CompletionBatchItem = {
@@ -3625,7 +3628,10 @@ export function registerBackgroundJobs(
 
                     const POLL_INTERVAL_MS = 5_000;
                     const MAX_ATTACH_MS = (params.timeout ?? 600) * 1_000;
-                    const deadline = Date.now() + MAX_ATTACH_MS;
+                    const attachStartedAt = Date.now();
+                    const deadline = attachStartedAt + MAX_ATTACH_MS;
+                    const inlineDeadline =
+                        attachStartedAt + INLINE_ATTACH_WINDOW_MS;
 
                     // Resolve when the caller aborts so the poll wait below
                     // wakes immediately instead of waiting out the 5s interval.
@@ -3663,8 +3669,12 @@ export function registerBackgroundJobs(
                             }
                         }
 
-                        // Check timeout
-                        if (Date.now() >= deadline) {
+                        // The configured deadline remains the backstop; the
+                        // shorter inline window returns a resumable job handle.
+                        if (
+                            Date.now() >= deadline ||
+                            Date.now() >= inlineDeadline
+                        ) {
                             break;
                         }
 
@@ -3700,9 +3710,14 @@ export function registerBackgroundJobs(
                         });
 
                         // Wait for the next poll interval, job completion, or abort
+                        const now = Date.now();
                         const waitMs = Math.max(
                             0,
-                            Math.min(POLL_INTERVAL_MS, deadline - Date.now())
+                            Math.min(
+                                POLL_INTERVAL_MS,
+                                deadline - now,
+                                inlineDeadline - now
+                            )
                         );
                         await Promise.race([
                             new Promise<void>((resolve) =>
@@ -3727,6 +3742,28 @@ export function registerBackgroundJobs(
                         outputReadFailed(job, output)
                     );
                     const source = await sourceDetailsForJob(job);
+                    if (
+                        job.status === "running" &&
+                        !signal?.aborted &&
+                        Date.now() >= inlineDeadline &&
+                        inlineDeadline < deadline
+                    ) {
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text:
+                                        `Inline attach window elapsed for ${job.id}; ` +
+                                        `the job is still running. This is partial output.\n` +
+                                        `Job ID: ${job.id}\nLog: ${job.logPath}\n` +
+                                        `Use jobs(attach) with this job ID to attach again.\n\n${output}`,
+                                },
+                            ],
+                            details: outputDetails(job, metadata, source, {
+                                timedOut: false,
+                            }),
+                        };
+                    }
                     if (job.status !== "running") {
                         job.outputConsumed = true;
                         state.cancelCompletionBatchForJob?.(job.id);
