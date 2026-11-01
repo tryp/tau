@@ -58,6 +58,14 @@ export interface PipeObservation {
         command: string;
         sourceId: string | null;
     } | null;
+    /** Capture-helper status, absent when the helper could not write its status file. */
+    stageZeroStatus?: {
+        truncated: boolean;
+        bytesWritten: number;
+        reason: "cap" | "epipe" | null;
+    } | null;
+    /** PIPESTATUS entries for each rewritten pipeline segment, when recorded. */
+    pipelineExitLines?: string[];
 }
 
 /**
@@ -139,10 +147,27 @@ export function pipeNoteSections(
         const captureHandle = observed.pipeStageZero.sourceId
             ? `context source ${JSON.stringify(observed.pipeStageZero.sourceId)}`
             : `file ${observed.pipeStageZero.path}`;
-        noticeLines.push(
-            `Pre-filter stage-0 capture: ${captureHandle}. It is capped by PI_TAU_STAGE0_MAX_BYTES (default 64 MiB); an end marker means that capture was truncated.`
-        );
+        noticeLines.push(`Pre-filter stage-0 capture: ${captureHandle}.`);
+        if (observed.pipeStageZero.sourceId) {
+            noticeLines.push(
+                `Inspect stage-0 with context_search/context_get/context_export using source id ${JSON.stringify(observed.pipeStageZero.sourceId)}.`
+            );
+        } else {
+            noticeLines.push(
+                `Inspect the local file with sed or grep; it is subject to the stage-0 capture retention budget.`
+            );
+        }
+        if (observed.stageZeroStatus?.truncated) {
+            const mib = (
+                observed.stageZeroStatus.bytesWritten /
+                (1024 * 1024)
+            ).toFixed(1);
+            noticeLines.push(
+                `Stage-0 capture truncated at ${mib} MiB (reason ${observed.stageZeroStatus.reason ?? "cap"}); only this captured prefix is available.`
+            );
+        }
     }
+    noticeLines.push(...(observed.pipelineExitLines ?? []));
     // A handle, not a size. "Retained" means retrievable somewhere the agent can
     // reach; zero lines is the one capture not worth indexing, and is excluded
     // here so it is not mistaken for retained-but-hidden output.
@@ -176,7 +201,7 @@ export function pipeNoteSections(
     const count = capturedLines ?? 0;
     if (!hasLinesBeyondView) {
         noticeLines.push(
-            `The complete ${count}-line output is retained; the view above contains all of it.`
+            `The complete ${count}-line output is available through the retrieval handle; the view above contains all of it.`
         );
         return { receipt, notice: noticeLines.join("\n") };
     }
@@ -190,7 +215,7 @@ export function pipeNoteSections(
           ? `context_get source_id:${JSON.stringify(observed.sourceId)} chunk_id:${JSON.stringify(observed.receiptLines[1]?.match(/chunk_id:["']?([^"' ]+)/)?.[1] ?? `${observed.sourceId}_0001`)}`
           : "";
     noticeLines.push(
-        `Captured ${count} lines; all are retained (${observed.err} err, ${observed.warn} warn). Read any window with ${range}.`
+        `Captured ${count} lines (${observed.err} err, ${observed.warn} warn). Read any window with ${range}.`
     );
     if (observed.sourceId) {
         noticeLines.push(
@@ -209,8 +234,8 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
 /** Standing guidance contributed to the bash tool's prompt guidelines. */
 export function bashGuidelines(): string[] {
     return [
-        "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: the whole output is captured to a file (and to the context sidecar for large or background output) while your result stays bounded to the N lines you asked for. The pipe is what prevents that capture from happening, and it discards the beginning of an output before anything can read it.",
-        "The removal note tells you the captured line count and the err/warn mix over the WHOLE captured output. Read that before re-running anything: it is the stat you would have run the command again to compute.",
+        "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: output is captured up to the stage-0 byte cap (and indexed when available) while your result stays bounded to the N lines you asked for. A stage-0 truncation notice means only the captured prefix is available; do not assume the omitted suffix can be recovered.",
+        "The removal note tells you the captured line count and the err/warn mix over the captured output, and reports exit codes for each rewritten pipeline process when available. Read it before re-running anything. A truncated stage-0 capture is only a prefix, so its count and diagnostics do not describe the omitted suffix.",
         "Filtering is fine and is left alone. `| grep pattern`, `| sed`, and `| awk` change which lines and what text the command produces, so they are NOT removed; they return a different answer, not more of the same one.",
         'To read more of an output you just produced, never re-run the command with a narrower pipe. If the removal note gave you a source id: context_search query:"..." source_id:"...", then context_get source_id:"..." chunk_id:"...", then context_export source_id:"...". If it gave you a file path, grep or sed that path.',
     ];

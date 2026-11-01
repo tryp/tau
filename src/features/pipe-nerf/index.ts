@@ -20,6 +20,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import type { TauState } from "../../state.ts";
 import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
@@ -100,6 +101,74 @@ function visibleSeverity(text: string): {
  * The retrieval lines for a sidecar source, in the same wording as
  * `sidecar.formatSidecarReceipt`, so the agent sees one consistent vocabulary.
  */
+function stageZeroStatus(path: string | undefined): {
+    truncated: boolean;
+    bytesWritten: number;
+    reason: "cap" | "epipe" | null;
+} | null {
+    if (!path) return null;
+    try {
+        const parsed: unknown = JSON.parse(
+            readFileSync(`${path}.status.json`, "utf8")
+        );
+        if (parsed === null || typeof parsed !== "object") return null;
+        const status = parsed as {
+            truncated?: unknown;
+            bytesWritten?: unknown;
+            reason?: unknown;
+        };
+        if (
+            typeof status.truncated !== "boolean" ||
+            !Number.isSafeInteger(status.bytesWritten) ||
+            (status.reason !== null &&
+                status.reason !== "cap" &&
+                status.reason !== "epipe")
+        )
+            return null;
+        return {
+            truncated: status.truncated,
+            bytesWritten: status.bytesWritten as number,
+            reason: status.reason,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function pipelineExitLines(plan: PipePlan): string[] {
+    if (!plan.stageExitPath || !plan.pipelineExitCommands) return [];
+    let records: string[];
+    try {
+        records = readFileSync(plan.stageExitPath, "utf8").trim().split("\n");
+    } catch {
+        return [];
+    }
+    const lines: string[] = [];
+    for (const record of records) {
+        const [segmentText, codesText] = record.split("\t", 2);
+        const segment = Number(segmentText);
+        const codes = codesText?.split(/\s+/).map(Number);
+        const commands = plan.pipelineExitCommands[segment - 1];
+        if (
+            !commands ||
+            !codes?.length ||
+            codes.some((code) => !Number.isInteger(code))
+        )
+            continue;
+        const statuses = codes.map((code, index) => {
+            const command = commands[index] ?? "unknown stage";
+            const label = command.includes("stage0-capture.mjs")
+                ? "pipe-hoist capture"
+                : JSON.stringify(command.slice(0, 120));
+            return `stage ${index + 1} ${label}=${code}`;
+        });
+        lines.push(
+            `Pipeline exits (segment ${segment}): ${statuses.join(", ")}.`
+        );
+    }
+    return lines;
+}
+
 function retrievalLines(details: BashResultDetails): string[] {
     const sourceId = details.sourceId;
     if (!sourceId) return [];
@@ -180,7 +249,10 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
         // capture. `planPipeNerf` decides that, so the path is offered rather
         // than prescribed.
         const captureDirectory = stageZeroDirectory();
-        const stageZeroPath = stageZeroPathFor(event.toolCallId, captureDirectory);
+        const stageZeroPath = stageZeroPathFor(
+            event.toolCallId,
+            captureDirectory
+        );
         const plan = planPipeNerf(command, {
             stageZeroPath,
             stageZeroDirectory: captureDirectory,
@@ -283,6 +355,8 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                     pipeStageZero?: { path: string; sourceId: string | null };
                 }
             ).pipeStageZero;
+            const status = stageZeroStatus(capture?.path);
+            const exitLines = pipelineExitLines(plan);
             const captureSegments = plan.stageZeroSegments
                 ?.map(
                     (segment, index) =>
@@ -290,18 +364,21 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 )
                 .join("; ");
             const captureDescription = captureSegments
-                ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}. Each stage-0 capture is capped by PI_TAU_STAGE0_MAX_BYTES (default 64 MiB); an end marker means the capture was truncated.`
+                ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}.`
                 : "";
             const retrieval = capture?.sourceId
-                ? ` It is indexed as ${JSON.stringify(capture.sourceId)}.`
+                ? ` Stage-0 is indexed as ${JSON.stringify(capture.sourceId)}; inspect with context_search query:"pattern" source_id:${JSON.stringify(capture.sourceId)}, then context_get or context_export.`
                 : capture?.path
-                  ? ` It is retained at ${capture.path}.`
+                  ? ` Stage-0 file: ${capture.path}; inspect it with sed -n 'START,ENDp' or grep; it is subject to the stage-0 capture retention budget.`
                   : "";
+            const truncated = status?.truncated
+                ? ` Stage-0 capture truncated at ${(status.bytesWritten / (1024 * 1024)).toFixed(1)} MiB (reason ${status.reason ?? "cap"}); only this captured prefix is available.`
+                : "";
             return {
                 content: [
                     {
                         type: "text" as const,
-                        text: `Effective command: ${JSON.stringify(plan.rewritten)}. Every shell limiter was preserved, so the output below is already the requested view.${captureDescription}${retrieval}`,
+                        text: `Effective command: ${JSON.stringify(plan.rewritten)}. Every shell limiter was preserved, so the output below is already the requested view.${captureDescription}${retrieval}${truncated}${exitLines.length ? ` ${exitLines.join(" ")}` : ""}`,
                     },
                     ...event.content,
                 ],
@@ -320,6 +397,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 }
             ).pipeStageZero ?? null;
         const truncation = details.truncation;
+        const captureStatus = stageZeroStatus(stageZero?.path);
         const text = event.content
             .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
             .join("\n");
@@ -389,6 +467,8 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 showReceipt ? "receipt" : undefined
             ),
             pipeStageZero: stageZero,
+            stageZeroStatus: captureStatus,
+            pipelineExitLines: pipelineExitLines(plan),
         });
         if (!note.receipt && !note.notice) return;
 

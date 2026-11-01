@@ -54,6 +54,72 @@ function stageZeroCaptureCommand(path: string): string {
     return `${JSON.stringify(process.execPath)} ${JSON.stringify(stageZeroCaptureScript)} ${JSON.stringify(path)}`;
 }
 
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Split a pipeline into shell stages, respecting quoting and subshells. */
+function splitPipelineStages(command: string): string[] {
+    const stages: string[] = [];
+    let start = 0;
+    let quote = "";
+    let depth = 0;
+    for (let i = 0; i < command.length; i++) {
+        const ch = command[i];
+        if (quote) {
+            if (ch === "\\" && quote === '"') i++;
+            else if (ch === quote) quote = "";
+            continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+        else if (ch === "\\") i++;
+        else if (ch === "(") depth++;
+        else if (ch === ")") depth = Math.max(0, depth - 1);
+        else if (ch === "|" && depth === 0 && command[i + 1] !== "|") {
+            stages.push(command.slice(start, i).trim());
+            if (command[i + 1] === "&") i++;
+            start = i + 1;
+        }
+    }
+    stages.push(command.slice(start).trim());
+    return stages;
+}
+
+/** Capture PIPESTATUS without changing the pipeline's observable exit code. */
+function recordPipelineExit(
+    segment: string,
+    path: string,
+    index: number
+): string {
+    const exitPath = shellQuote(path);
+    return `( ${segment}; __pi_pipe_rc=$? __pi_pipe_status=("\${PIPESTATUS[@]}"); printf '%s\\t%s\\n' ${index} "\${__pi_pipe_status[*]}" >> ${exitPath}; exit "$__pi_pipe_rc" )`;
+}
+
+function instrumentPipelineExits(
+    command: string,
+    capturePath: string
+): { command: string; exitPath: string; stages: string[][] } {
+    const exitPath = `${capturePath}.exits`;
+    const stages: string[][] = [];
+    const segments = splitControlSegments(command).map((segment) => {
+        if (!segment.text.includes(stageZeroCaptureScript)) return segment;
+        const commands = splitPipelineStages(segment.text);
+        stages.push(commands);
+        return {
+            ...segment,
+            text: recordPipelineExit(segment.text, exitPath, stages.length),
+        };
+    });
+    const joined = segments
+        .map((segment) => segment.text + segment.separator)
+        .join("");
+    return {
+        command: `: > ${shellQuote(exitPath)}; ${joined}`,
+        exitPath,
+        stages,
+    };
+}
+
 /** A filter stage that bounds how much output reaches the tool. */
 export type LimiterKind =
     | "tail"
@@ -158,6 +224,10 @@ export interface PipePlan {
     }[];
     /** Directory named in the self-reference preflight notice. */
     captureDirectory?: string;
+    /** Path containing per-segment PIPESTATUS records. */
+    stageExitPath?: string;
+    /** Rewritten process names for each captured pipeline segment. */
+    pipelineExitCommands?: string[][];
 }
 
 /**
@@ -893,9 +963,14 @@ function planPipeNerfCore(
             if (rewrittenSegments.some((segment) => segment === null)) {
                 return skipped(command, "no-pipe", invocation);
             }
-            const rewritten = rewrittenSegments
+            const rawRewritten = rewrittenSegments
                 .map((segment) => `${segment!.text}${segment!.separator}`)
                 .join("");
+            const exitCapture = instrumentPipelineExits(
+                rawRewritten,
+                options.stageZeroPath
+            );
+            const rewritten = exitCapture.command;
             const stageZeroSegments = segments.map((segment, index) => ({
                 command: segment.text.trim(),
                 separator: segment.separator,
@@ -924,6 +999,8 @@ function planPipeNerfCore(
                 stageZero: firstCapture,
                 preserveLimiterViews: true,
                 stageZeroSegments,
+                stageExitPath: exitCapture.exitPath,
+                pipelineExitCommands: exitCapture.stages,
             };
         }
     }
@@ -1063,14 +1140,23 @@ function planPipeNerfCore(
               rewritten.slice(stageZero.operatorAt + 1).replace(/^\s+/, ""),
           ].join(" ")
         : rewritten;
+    const exitCapture = stageZero
+        ? instrumentPipelineExits(final, stageZero.path)
+        : null;
 
     return {
         action: "rewrite",
         reason: null,
         original: command,
         invocation,
-        rewritten: final.trim(),
+        rewritten: (exitCapture?.command ?? final).trim(),
         stageZero,
+        ...(exitCapture
+            ? {
+                  stageExitPath: exitCapture.exitPath,
+                  pipelineExitCommands: exitCapture.stages,
+              }
+            : {}),
     };
 }
 
@@ -1080,11 +1166,7 @@ export function planPipeNerf(
 ): PipePlan {
     const plan = planPipeNerfCore(command, options);
     const directory = options.stageZeroDirectory;
-    if (
-        plan.action === "rewrite" &&
-        directory &&
-        command.includes(directory)
-    ) {
+    if (plan.action === "rewrite" && directory && command.includes(directory)) {
         return {
             ...skipped(command, "capture-directory-reference", plan.invocation),
             captureDirectory: directory,

@@ -43,7 +43,10 @@ import {
 } from "../features/features-registry.ts";
 import { classifyLine, countLines } from "../features/log-classify.ts";
 import type { TauState } from "../state.ts";
-import { stageZeroDirectory, stageZeroPathFor } from "../features/pipe-nerf/stage0-path.ts";
+import {
+    stageZeroDirectory,
+    stageZeroPathFor,
+} from "../features/pipe-nerf/stage0-path.ts";
 import {
     markStage0CaptureIndexed,
     sweepStage0Captures,
@@ -681,8 +684,18 @@ void describe("pipe-nerf stage-0 retention", () => {
         try {
             writeFileSync(currentPath, "curr");
             writeFileSync(legacyPath, "old!");
-            markStage0CaptureIndexed(currentPath, "source-current", Date.now(), current);
-            markStage0CaptureIndexed(legacyPath, "source-legacy", Date.now(), current);
+            markStage0CaptureIndexed(
+                currentPath,
+                "source-current",
+                Date.now(),
+                current
+            );
+            markStage0CaptureIndexed(
+                legacyPath,
+                "source-legacy",
+                Date.now(),
+                current
+            );
             const result = sweepStage0Captures({
                 directories: [current, legacy],
                 budgetBytes: 1,
@@ -704,14 +717,17 @@ void describe("pipe-nerf stage-0 capture", () => {
 
     void it("uses the XDG cache directory, with a hidden home-cache fallback", () => {
         assert.equal(
-            stageZeroDirectory({ XDG_CACHE_HOME: "/cache" } as NodeJS.ProcessEnv, "/home/test"),
+            stageZeroDirectory({ XDG_CACHE_HOME: "/cache" }, "/home/test"),
             "/cache/pi-tau/stage0"
         );
         assert.equal(
-            stageZeroDirectory({} as NodeJS.ProcessEnv, "/home/test"),
+            stageZeroDirectory({}, "/home/test"),
             "/home/test/.cache/pi-tau/stage0"
         );
-        assert.equal(stageZeroPathFor("call/1", "/cache/pi-tau/stage0"), "/cache/pi-tau/stage0/pi-pipe-stage0-call1.log");
+        assert.equal(
+            stageZeroPathFor("call/1", "/cache/pi-tau/stage0"),
+            "/cache/pi-tau/stage0/pi-pipe-stage0-call1.log"
+        );
     });
 
     void it("skips rewriting when the command references the capture directory", () => {
@@ -733,7 +749,10 @@ void describe("pipe-nerf stage-0 capture", () => {
         const p = planPipeNerf("seq 1 60 | grep -E '1|3' | tail -3", {
             stageZeroPath: PATH_0,
         });
-        assert.match(p.rewritten, /seq 1 60 \| .*stage0-capture\.mjs.* \| grep -E '1\|3'/);
+        assert.match(
+            p.rewritten,
+            /seq 1 60 \| .*stage0-capture\.mjs.* \| grep -E '1\|3'/
+        );
         assert.ok(p.stageZero);
         assert.equal(p.stageZero?.command, "seq 1 60");
         assert.equal(p.stageZero?.path, PATH_0);
@@ -742,14 +761,29 @@ void describe("pipe-nerf stage-0 capture", () => {
     void it("creates the cache directory on first capture use", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-cache-"));
         const capture = join(dir, "nested", "stage-zero.log");
-        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        );
         try {
-            const result = spawnSync(process.execPath, [helper.pathname, capture], {
-                input: "cache output\\n",
-                encoding: "utf8",
-            });
+            const result = spawnSync(
+                process.execPath,
+                [helper.pathname, capture],
+                {
+                    input: "cache output\\n",
+                    encoding: "utf8",
+                }
+            );
             assert.equal(result.status, 0, result.stderr);
             assert.equal(readFileSync(capture, "utf8"), "cache output\\n");
+            assert.deepEqual(
+                JSON.parse(readFileSync(`${capture}.status.json`, "utf8")),
+                {
+                    truncated: false,
+                    bytesWritten: Buffer.byteLength("cache output\\n"),
+                    reason: null,
+                }
+            );
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -758,18 +792,67 @@ void describe("pipe-nerf stage-0 capture", () => {
     void it("caps stage-0 disk bytes while forwarding the complete pipeline stream", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-cap-"));
         const capture = join(dir, "stage-zero.log");
-        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        );
         const input = Buffer.alloc(1024 * 1024, 0x61);
         try {
-            const result = spawnSync(process.execPath, [helper.pathname, capture], {
-                input,
-                env: { ...process.env, PI_TAU_STAGE0_MAX_BYTES: "4096" },
-            });
+            const result = spawnSync(
+                process.execPath,
+                [helper.pathname, capture],
+                {
+                    input,
+                    env: { ...process.env, PI_TAU_STAGE0_MAX_BYTES: "4096" },
+                }
+            );
             assert.equal(result.status, 0);
             assert.equal(result.stdout.length, input.length);
             const saved = readFileSync(capture);
             assert.ok(saved.length <= 4096);
-            assert.match(saved.toString(), /\[stage-0 capture truncated at byte cap\]/);
+            assert.match(
+                saved.toString(),
+                /\[stage-0 capture truncated at byte cap\]/
+            );
+            const status = JSON.parse(
+                readFileSync(`${capture}.status.json`, "utf8")
+            ) as { truncated: boolean; reason: string | null };
+            assert.equal(status.truncated, true);
+            assert.equal(status.reason, "cap");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("records an early downstream EPIPE in the status sidecar", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-epipe-"));
+        const capture = join(dir, "stage-zero.log");
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        );
+        try {
+            const result = spawnSync(
+                "bash",
+                [
+                    "-c",
+                    `dd if=/dev/zero bs=1M count=50 status=none | ${JSON.stringify(process.execPath)} ${JSON.stringify(helper.pathname)} ${JSON.stringify(capture)} | head -c 1 >/dev/null`,
+                ],
+                {
+                    encoding: "utf8",
+                    timeout: 5000,
+                    env: {
+                        ...process.env,
+                        PI_TAU_STAGE0_MAX_BYTES: "200000000",
+                    },
+                }
+            );
+            assert.ok(!result.error || !/ETIMEDOUT/.test(result.error.message));
+            const status = JSON.parse(
+                readFileSync(`${capture}.status.json`, "utf8")
+            ) as { truncated: boolean; reason: string | null };
+            assert.equal(status.truncated, true);
+            assert.equal(status.reason, "epipe");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -779,13 +862,19 @@ void describe("pipe-nerf stage-0 capture", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-feedback-"));
         const capture = join(dir, "stage-zero.log");
         writeFileSync(capture, "");
-        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        );
         const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
         const producer = `import os,sys\np=${JSON.stringify(capture)}\nwhile os.path.getsize(p) < 4000:\n data=open(p,'rb').read()\n sys.stdout.buffer.write(data or b'seed\\n')`;
         try {
             const output = execFileSync(
                 "bash",
-                ["-c", `python3 -c ${quote(producer)} | ${quote(process.execPath)} ${quote(helper.pathname)} ${quote(capture)} | wc -c`],
+                [
+                    "-c",
+                    `python3 -c ${quote(producer)} | ${quote(process.execPath)} ${quote(helper.pathname)} ${quote(capture)} | wc -c`,
+                ],
                 {
                     encoding: "utf8",
                     env: { ...process.env, PI_TAU_STAGE0_MAX_BYTES: "4096" },
@@ -794,7 +883,31 @@ void describe("pipe-nerf stage-0 capture", () => {
             const saved = readFileSync(capture);
             assert.ok(Number(output.trim()) > 0);
             assert.ok(saved.length <= 4096);
-            assert.match(saved.toString(), /\[stage-0 capture truncated at byte cap\]/);
+            assert.match(
+                saved.toString(),
+                /\[stage-0 capture truncated at byte cap\]/
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("records every rewritten pipeline process exit without changing final status", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-exits-"));
+        const capture = join(dir, "stage-zero.log");
+        const plan = planPipeNerf("printf 'x\\n' | grep absent | tail -1", {
+            stageZeroPath: capture,
+        });
+        try {
+            const result = spawnSync("bash", ["-c", plan.rewritten], {
+                encoding: "utf8",
+            });
+            assert.equal(result.status, 1);
+            assert.equal(
+                readFileSync(`${capture}.exits`, "utf8").trim(),
+                "1\t0 0 1"
+            );
+            assert.equal(plan.pipelineExitCommands?.[0].length, 3);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -1058,7 +1171,7 @@ void describe("pipe-nerf bounded view", () => {
                 viewDescription: "the full captured output",
             })
         );
-        assert.match(note, /Captured 60 lines; all are retained/);
+        assert.match(note, /Captured 60 lines/);
     });
 });
 
@@ -1072,7 +1185,7 @@ void describe("pipe-nerf note", () => {
             })
         );
         assert.ok(faithful.split("\n").length <= 4, faithful);
-        assert.match(faithful, /all are retained/);
+        assert.match(faithful, /Captured 10 lines/);
 
         const receipt = pipeNote(
             plan("cat output.txt | head -5"),
@@ -1083,7 +1196,10 @@ void describe("pipe-nerf note", () => {
         );
         assert.match(receipt, /No retrieval handle is available/);
         assert.match(receipt, /view below/);
-        assert.doesNotMatch(receipt, /retained|context_search|no output was captured/i);
+        assert.doesNotMatch(
+            receipt,
+            /retained|context_search|no output was captured/i
+        );
     });
 
     void it("retains every captured line discarded by the limiter and gives retrieval instructions", () => {
@@ -1096,7 +1212,7 @@ void describe("pipe-nerf note", () => {
                 sourceId: "ctx_pytest",
             })
         );
-        assert.match(note, /Captured 4000 lines; all are retained/);
+        assert.match(note, /Captured 4000 lines/);
         assert.match(note, /sed -n 'START,ENDp' \/tmp\/pytest\.log/);
         assert.match(note, /context_search.*ctx_pytest/);
         assert.match(note, /Effective command:/);
@@ -1109,7 +1225,7 @@ void describe("pipe-nerf note", () => {
             plan("make -j8 2>&1 | tail -50"),
             observation({ totalLines: 51, fullOutputPath: "/tmp/make.log" })
         );
-        assert.match(note, /Captured 51 lines; all are retained/);
+        assert.match(note, /Captured 51 lines/);
         assert.doesNotMatch(note, /separation is back|left in place/);
     });
 
@@ -1123,7 +1239,7 @@ void describe("pipe-nerf note", () => {
                 fullOutputPath: "/tmp/test.log",
             })
         );
-        assert.match(note, /1204 lines; all are retained \(12 err, 88 warn\)/);
+        assert.match(note, /Captured 1204 lines \(12 err, 88 warn\)/);
     });
 
     void it("points at the sidecar when the output was indexed", () => {
@@ -1154,7 +1270,7 @@ void describe("pipe-nerf note", () => {
                     "the first 10 lines, as your pipe would have printed",
             })
         );
-        assert.match(note, /Captured 30 lines; all are retained/);
+        assert.match(note, /Captured 30 lines/);
         assert.doesNotMatch(note, /keeps the END/);
     });
 
@@ -1175,19 +1291,38 @@ void describe("pipe-nerf note", () => {
                     command: "make test 2>&1",
                     sourceId: "ctx_bg_stage0",
                 },
+                stageZeroStatus: {
+                    truncated: true,
+                    bytesWritten: 1024 * 1024,
+                    reason: "cap",
+                },
+                pipelineExitLines: [
+                    'Pipeline exits (segment 1): stage 1 "make test 2>&1"=0, stage 2 pipe-hoist capture=0, stage 3 "grep FAILED"=0.',
+                ],
                 receiptLines: [
                     `- Search it first: context_search query:"..." source_id:"ctx_bg_post"`,
                 ],
             })
         );
-        assert.match(captured, /Captured 12 lines; all are retained/);
+        assert.match(captured, /Captured 12 lines/);
         assert.doesNotMatch(
             captured,
             /Stage-0 contains the inputs for captured pipeline segments/
         );
         assert.match(captured, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
-        assert.match(captured, /Pre-filter stage-0 capture: context source "ctx_bg_stage0"/);
-        assert.match(captured, /default 64 MiB.*end marker means that capture was truncated/);
+        assert.match(
+            captured,
+            /Pre-filter stage-0 capture: context source "ctx_bg_stage0"/
+        );
+        assert.match(
+            captured,
+            /Stage-0 capture truncated at 1\.0 MiB.*only this captured prefix/
+        );
+        assert.match(captured, /Pipeline exits \(segment 1\)/);
+        assert.match(
+            captured,
+            /Inspect stage-0 with context_search\/context_get\/context_export/
+        );
     });
 
     void it("falls back to the path when the pre-filter capture is not indexed", () => {
@@ -1202,8 +1337,12 @@ void describe("pipe-nerf note", () => {
             })
         );
         assert.match(captured, /No retrieval handle is available/);
-        assert.match(captured, /Pre-filter stage-0 capture: file \/home\/dev\/\.cache\/pi-tau\/stage0\/pi-pipe-stage0-call_00_y\.log/);
-        assert.match(captured, /default 64 MiB.*end marker means that capture was truncated/);
+        assert.match(
+            captured,
+            /Pre-filter stage-0 capture: file \/home\/dev\/\.cache\/pi-tau\/stage0\/pi-pipe-stage0-call_00_y\.log/
+        );
+        assert.match(captured, /Inspect the local file with sed or grep/);
+        assert.doesNotMatch(captured, /Capture truncated/);
     });
 
     void it("offers the log path on the sidecar route too", () => {
@@ -1222,7 +1361,7 @@ void describe("pipe-nerf note", () => {
                 ],
             })
         );
-        assert.match(note, /Captured 1204 lines; all are retained/);
+        assert.match(note, /Captured 1204 lines/);
         assert.match(note, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
         assert.match(note, /context_search.*ctx_bg_abc/);
         assert.ok(note.split("\n").length <= 4);
@@ -1265,7 +1404,7 @@ void describe("pipe-nerf note", () => {
                 fullOutputPath: "/tmp/small-pytest.log",
             })
         );
-        assert.match(note, /Captured 8 lines; all are retained/);
+        assert.match(note, /Captured 8 lines/);
         assert.match(note, /sed -n 'START,ENDp' \/tmp\/small-pytest\.log/);
         assert.doesNotMatch(note, /small enough|nothing was written/);
     });
@@ -1402,7 +1541,10 @@ void describe("pipe-nerf registration", () => {
             toolCallId: "tip-order",
             input: { command: "seq 1 60 | tail -2" },
         });
-        const capture = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
+        const capture = Array.from(
+            { length: 60 },
+            (_, i) => `line-${i + 1}`
+        ).join("\n");
         const result = fire(handlers, "tool_result", {
             toolName: "bash",
             toolCallId: "tip-order",
@@ -1416,7 +1558,7 @@ void describe("pipe-nerf registration", () => {
         assert.equal(result.content[1].text, "line-59\nline-60");
         const tip = result.content.at(-1)?.text ?? "";
         assert.ok(tip.startsWith("\n\n[notice] "));
-        assert.match(tip, /Captured 60 lines; all are retained/);
+        assert.match(tip, /Captured 60 lines/);
         assert.doesNotMatch(result.content[0].text, /^\s*\[notice\]/);
     });
 
@@ -1465,10 +1607,7 @@ void describe("pipe-nerf registration", () => {
         );
         assert.equal(payload, "FAILED tests/x");
         assert.ok(notice.startsWith("\n\n[notice] "));
-        assert.match(
-            notice,
-            /Captured 900 lines; all are retained \(0 err, 1 warn\)/
-        );
+        assert.match(notice, /Captured 900 lines \(0 err, 1 warn\)/);
         assert.match(notice, /sed -n 'START,ENDp' \/tmp\/out\.log/);
         assert.doesNotMatch(notice, /re-running/);
     });
@@ -1503,7 +1642,7 @@ void describe("pipe-nerf registration", () => {
         assert.equal(result.content[1].text, "ok");
         assert.match(
             result.content[2].text,
-            /complete 1-line output is retained/
+            /complete 1-line output is available/
         );
     });
 
@@ -1533,10 +1672,7 @@ void describe("pipe-nerf registration", () => {
             },
         }) as { content: { type: string; text: string }[] };
         assert.match(result.content[0].text, /^Effective command:/);
-        assert.match(
-            result.content[2].text,
-            /Captured 60 lines; all are retained/
-        );
+        assert.match(result.content[2].text, /Captured 60 lines/);
         assert.equal(
             result.content[1].text,
             "line-1\nline-2\nline-3\nline-4\nline-5"
@@ -1609,7 +1745,7 @@ void describe("pipe-nerf registration", () => {
         assert.match(result.content[0].text, /ctx_compound_stage_zero/);
         assert.match(
             result.content[0].text,
-            /Stage-0 contains the inputs for captured pipeline segments, concatenated in order/
+            /Stage-0 is indexed as "ctx_compound_stage_zero"/
         );
         assert.match(
             result.content[0].text,
@@ -1683,7 +1819,7 @@ void describe("pipe-nerf registration", () => {
             .map((part) => part.text)
             .join("\n");
         assert.equal(body, remnant, "the capture must be returned as-is");
-        assert.match(note, /Captured 9000 lines; all are retained/);
+        assert.match(note, /Captured 9000 lines/);
         assert.match(
             note,
             /View caveat: your pipe asked for the first 3 lines/
@@ -1737,7 +1873,7 @@ void describe("pipe-nerf registration", () => {
             !/Captured 7 lines/.test(note),
             `the note counted the receipt's lines: ${note}`
         );
-        assert.match(note, /Captured 60 lines; all are retained/);
+        assert.match(note, /Captured 60 lines/);
     });
 
     void it("leaves a filter command alone and adds no note", () => {
