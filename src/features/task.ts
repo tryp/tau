@@ -576,7 +576,8 @@ export function registerTask(pi: ExtensionAPI, state: TauState): void {
             "Actions: list, add (title, parent?, status?), update (id, title?, " +
             "description?, status?), remove (id, cascade?), move (id, parent?), " +
             "link (from, to, type), unlink (from, to). " +
-            "Nonexistent add/move parent IDs error without changing tasks. Links require existing IDs; " +
+            "Parent must be an existing task ID; re-list before reusing an ID from an earlier session, as it may no longer exist. " +
+            "A missing add/move parent returns an error without changing tasks. Links require existing IDs; " +
             "add with a missing linkWith target rolls back the new task.",
         parameters: TaskParams,
 

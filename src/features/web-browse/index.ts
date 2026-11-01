@@ -207,8 +207,8 @@ const BROWSER_PARAM = StringEnum(
 const TAB_ID_PARAM = Type.Optional(
     Type.Number({
         description:
-            "Tab ID from chrome_list output. Tab IDs are specific to the browser mode — " +
-            "a tab ID from bridge mode will NOT work in CDP mode and vice versa. " +
+            "Tab ID from chrome_list output. Tab IDs are specific to the browser mode; " +
+            "using one from another mode may fail or select a different tab. " +
             "Always use chrome_list with the same browser mode you plan to use for the subsequent operation. " +
             "Required for browser: 'cdp' and browser: 'applescript'.",
     })
@@ -732,7 +732,7 @@ export function registerWebBrowse(pi: ExtensionAPI, state: TauState): void {
         promptSnippet: "List the user's open Chrome tabs",
         promptGuidelines: [
             "Use chrome_list to see what tabs the user has open before operating on a specific tab.",
-            "Tab IDs are mode-specific — a tab ID from bridge mode will NOT work in CDP or applescript mode.",
+            "Tab IDs are mode-specific; using one from another mode may fail or select a different tab.",
             "Always call chrome_list with the same browser mode you will use for subsequent operations on those tabs.",
             "If you get 'Tab ID not found', you likely mixed modes. Re-list with the correct browser mode.",
         ],
@@ -903,10 +903,12 @@ export function registerWebBrowse(pi: ExtensionAPI, state: TauState): void {
             "'text' (plain text from the page), 'markdown' (page converted to Markdown preserving " +
             "headings, links, lists, tables, code blocks), and 'structure' (structured JSON with " +
             "title, headings tree, sections, content blocks, and links). " +
-            "Four browser modes: 'bridge' (Chrome extension, no prompts), 'isolated' (fresh headless Chromium, default), " +
-            "'cdp' (user's Chrome via DevTools Protocol), 'applescript' (read-only macOS Chrome). " +
-            "Use browser: 'cdp' with tabId to read a specific open tab. Use this instead of " +
-            "curl/wget when pages need JavaScript to render.",
+            "Browser ladder: default 'isolated' (fresh headless Chromium); for the user's Chrome try 'bridge' " +
+            "(extension, no prompts), then 'cdp' (DevTools connection; call chrome_list with browser: 'cdp' first " +
+            "to get an open tab ID), then 'applescript' (read-only, macOS). Tab IDs are mode-specific: mixing " +
+            "modes may fail or select the wrong tab, so list and use the same mode. For forms, clicks, scrolling, " +
+            "navigation waits, or console/evaluate inspection, use web_interact and include a wait after navigation " +
+            "or submission. Use this instead of curl/wget when pages need JavaScript to render.",
         promptSnippet: "Browse web pages to read online content",
         promptGuidelines: [
             "Use web_browse instead of bash with curl/wget when the page requires JavaScript rendering.",
