@@ -919,6 +919,83 @@ export function handleTmuxCompletion(
     killTmuxJob(job);
 }
 
+/** Restore the newest persisted background-job snapshot and resume tmux polling. */
+export function restoreBackgroundJobs(
+    entries: Array<{ type: string; customType?: string; data?: unknown }>,
+    state: TauState,
+    pi: ExtensionAPI,
+    ctx: UiContext
+): void {
+    const entry = entries
+        .filter(
+            (candidate) =>
+                candidate.type === "custom" &&
+                candidate.customType === "background-tasks-state"
+        )
+        .at(-1);
+    if (!entry || !entry.data || typeof entry.data !== "object") return;
+
+    const data = entry.data as {
+        jobs?: Array<[
+            string,
+            Omit<BackgroundJob, "proc" | "donePromise" | "resolveDone">
+        ]>;
+        jobCounter?: number;
+    };
+    for (const [id, jobData] of data.jobs ?? []) {
+        if (jobData.status === "running") {
+            const tmux = (jobData as BackgroundJob & { tmux?: unknown }).tmux;
+            if (
+                typeof tmux === "object" &&
+                tmux !== null &&
+                "exitCodeFile" in tmux
+            ) {
+                const tmuxContext = tmux as import("./bash-tmux.js").TmuxJobContext;
+                attachTmuxContext(jobData, tmuxContext);
+                state.backgroundJobs.set(id, jobData);
+                let timer: ReturnType<typeof setInterval> | undefined;
+                const poll = (): boolean => {
+                    const result = pollTmuxCompletion(jobData);
+                    if (!result.completed) return false;
+                    if (timer) clearInterval(timer);
+                    markJobTerminal(
+                        jobData,
+                        result.vanished
+                            ? "failed"
+                            : result.exitCode === 0 || result.exitCode === null
+                              ? "completed"
+                              : "failed",
+                        result.vanished ? undefined : (result.exitCode ?? 0)
+                    );
+                    clearPendingDecision(state, jobData);
+                    void trackJobOutputIndex(jobData, ctx, "bash_bg");
+                    handleTmuxCompletion(jobData, state, pi, ctx, true);
+                    updateWidget(state, ctx);
+                    return true;
+                };
+                // A sentinel may already exist when the session is restored.
+                // Finalize synchronously; otherwise resume the same poller used
+                // for jobs started in this process, including liveness checks.
+                if (!poll()) {
+                    timer = setInterval(poll, 500);
+                    timer.unref?.();
+                }
+                continue;
+            }
+            // A direct-spawn job cannot be reattached to its child process.
+            try {
+                process.kill(jobData.pid, 0);
+            } catch {
+                jobData.status = "completed";
+            }
+        }
+        state.backgroundJobs.set(id, jobData);
+    }
+    if (typeof data.jobCounter === "number") {
+        state.jobCounter = Math.max(state.jobCounter, data.jobCounter);
+    }
+}
+
 // ─── Job output formatting (grep/tail/head) ──────────────────────────
 
 /**
