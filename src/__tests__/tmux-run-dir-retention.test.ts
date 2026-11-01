@@ -87,6 +87,7 @@ function cleanup(
         isAlive: () => "dead",
         retentionMs: RUN_DIR_RETENTION_MS,
         runTmux: () => "",
+        wrapperLiveness: () => "dead",
         ...overrides,
     });
 }
@@ -119,6 +120,32 @@ void describe("stale run dir cleanup", () => {
         });
         assert.equal(existsSync(dir), true);
         assert.equal(stats.keptUnknown, 1);
+        assert.equal(stats.removed, 0);
+    });
+
+    void it("preserves a run directory whose wrapper identity is unverifiable", () => {
+        const dir = makeRunDir("pi-tmux-224", 48 * HOUR_MS, "legacy output");
+        const stats = cleanup({
+            retentionMs: 0,
+            wrapperLiveness: () => "unknown",
+        });
+        assert.equal(existsSync(dir), true);
+        assert.equal(stats.keptUnknown, 1);
+        assert.equal(stats.removed, 0);
+    });
+
+    void it("preserves an old run directory while its recorded wrapper is still live", () => {
+        const dir = makeRunDir(
+            "pi-tmux-223",
+            48 * HOUR_MS,
+            "still-running output"
+        );
+        const stats = cleanup({
+            retentionMs: 0,
+            wrapperLiveness: () => "alive",
+        });
+        assert.equal(existsSync(dir), true);
+        assert.equal(stats.keptAlive, 1);
         assert.equal(stats.removed, 0);
     });
 
@@ -244,6 +271,7 @@ void describe("stale run dir cleanup", () => {
                 rootDir: root,
                 now: () => NOW_MS,
                 isAlive: () => "dead",
+                wrapperLiveness: () => "dead",
                 runTmux: () => "",
             });
             assert.equal(existsSync(dir), false);
@@ -266,6 +294,17 @@ void describe("periodic stale run-dir sweep", () => {
         let calls = 0;
         const lines: string[] = [];
         const timer = schedulePeriodicTmuxRunDirCleanup({
+            reapOrphans: async () => ({
+                examined: 0,
+                orphaned: 0,
+                killed: 0,
+                keptLive: 0,
+                keptUnverified: 0,
+                skippedBootMismatch: 0,
+                killEscalated: 0,
+                wouldKill: [],
+                wouldKillOmitted: 0,
+            }),
             cleanup: () => {
                 calls++;
                 return {
@@ -284,12 +323,17 @@ void describe("periodic stale run-dir sweep", () => {
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS - 1);
         assert.equal(calls, 0);
         mock.timers.tick(1);
-        await Promise.resolve();
-        await Promise.resolve();
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve();
         assert.equal(calls, 1);
-        assert.deepEqual(lines, [
-            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1 kept-unknown=0",
-        ]);
+        assert.equal(lines.length, 2);
+        assert.equal(
+            lines[0],
+            "[tau] tmux-orphan-reaper dry-run=false examined=0 orphaned=0 killed=0 kept-live=0 kept-unverified=0 skipped-boot-mismatch=0 kill-escalated=0 would-kill=-"
+        );
+        assert.equal(
+            lines[1],
+            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1 kept-unknown=0"
+        );
     });
 
     void it("skips an interval callback while a previous sweep is in flight", async () => {
@@ -303,6 +347,17 @@ void describe("periodic stale run-dir sweep", () => {
               }) => void)
             | undefined;
         schedulePeriodicTmuxRunDirCleanup({
+            reapOrphans: async () => ({
+                examined: 0,
+                orphaned: 0,
+                killed: 0,
+                keptLive: 0,
+                keptUnverified: 0,
+                skippedBootMismatch: 0,
+                killEscalated: 0,
+                wouldKill: [],
+                wouldKillOmitted: 0,
+            }),
             cleanup: () => {
                 calls++;
                 return new Promise((resolve) => {
@@ -313,7 +368,7 @@ void describe("periodic stale run-dir sweep", () => {
             isTestRunner: false,
         });
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
-        await Promise.resolve();
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve();
         assert.equal(calls, 1);
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
         assert.equal(calls, 1);
@@ -323,9 +378,9 @@ void describe("periodic stale run-dir sweep", () => {
             keptAlive: 0,
             keptUnknown: 0,
         });
-        for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve();
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
-        for (let turn = 0; turn < 3; turn++) await Promise.resolve();
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve();
         assert.equal(calls, 2);
         resolveSweep?.({
             examined: 0,

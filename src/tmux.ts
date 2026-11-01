@@ -20,6 +20,10 @@ import {
     writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import {
+    captureOwnerIdentity,
+    ORPHAN_REAPER_METADATA_SUFFIX,
+} from "./features/tmux-orphan-reaper.ts";
 
 // ─── Availability ───────────────────────────────────────────────────
 
@@ -192,7 +196,12 @@ export function createBashScript(
     runDir: string,
     session: string,
     command: string,
-    paths: { id: string; outputFile: string; exitCodeFile: string }
+    paths: {
+        id: string;
+        outputFile: string;
+        exitCodeFile: string;
+        owner?: ReturnType<typeof captureOwnerIdentity>;
+    }
 ): { scriptPath: string } {
     const scriptDir = join(runDir, "s");
     mkdirSync(scriptDir, { recursive: true, mode: 0o700 });
@@ -201,12 +210,25 @@ export function createBashScript(
     const scriptPath = join(scriptDir, `${session}.${paths.id}.sh`);
 
     const { exitCodeFile, outputFile } = paths;
+    const ownershipPath = join(
+        runDir,
+        `${session}.${paths.id}${ORPHAN_REAPER_METADATA_SUFFIX}`
+    );
+    const ownerJson = JSON.stringify(paths.owner ?? captureOwnerIdentity());
+    const metadataFormat =
+        '{"schemaVersion":1,"owner":%s,"wrapper":{"pid":%s,"bootId":"%s","startTicks":"%s","ppid":%s},"outputFile":%s,"exitCodeFile":%s}';
 
     writeFileSync(
         scriptPath,
         `#!/usr/bin/env bash
 __output_file=${shellQuote(outputFile)}
 __exit_code_file=${shellQuote(exitCodeFile)}
+__owner_json=${shellQuote(ownerJson)}
+__metadata_path=${shellQuote(ownershipPath)}
+__wrapper_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+__wrapper_start_ticks=$(sed 's/^.*) //' /proc/$$/stat 2>/dev/null | awk '{print $20}')
+printf ${shellQuote(metadataFormat)} "$__owner_json" "$$" "$__wrapper_boot_id" "$__wrapper_start_ticks" "$PPID" ${shellQuote(JSON.stringify(outputFile))} ${shellQuote(JSON.stringify(exitCodeFile))} > "$__metadata_path.tmp"
+mv "$__metadata_path.tmp" "$__metadata_path"
 (
 ${command}
 ) >> "$__output_file" 2>&1
@@ -245,6 +267,7 @@ export function spawnInTmux(
         id,
         outputFile,
         exitCodeFile,
+        owner: captureOwnerIdentity(),
     });
 
     const windowId = exec(
