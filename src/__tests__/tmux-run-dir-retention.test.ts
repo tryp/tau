@@ -17,7 +17,7 @@
  * The retention tests below fail against the previous eager `rmSync` cleanup.
  */
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import {
     existsSync,
@@ -34,8 +34,13 @@ import {
     MAX_RUN_DIR_RETENTION_MS,
     RUN_DIR_RETENTION_MS,
     type StaleRunDirCleanupOptions,
+    type StaleRunDirCleanupStats,
     cleanupStaleTmuxRunDirs,
+    formatTmuxRunDirSweepLog,
+    isNodeTestRunner,
     resolveRunDirRetentionMs,
+    schedulePeriodicTmuxRunDirCleanup,
+    TMUX_RUN_DIR_SWEEP_INTERVAL_MS,
 } from "../features/bash-tmux.ts";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -73,8 +78,10 @@ function makeRunDir(name: string, ageMs: number, output?: string): string {
 }
 
 /** Run the cleanup against the temp root with test defaults. */
-function cleanup(overrides: Partial<StaleRunDirCleanupOptions> = {}): void {
-    cleanupStaleTmuxRunDirs({
+function cleanup(
+    overrides: Partial<StaleRunDirCleanupOptions> = {}
+): StaleRunDirCleanupStats {
+    return cleanupStaleTmuxRunDirs({
         rootDir: root,
         now: () => NOW_MS,
         isAlive: () => false,
@@ -179,6 +186,24 @@ void describe("stale run dir cleanup", () => {
         });
     });
 
+    void it("returns examined, removed, and kept-alive sweep counts", () => {
+        const live = makeRunDir("pi-tmux-778", 48 * HOUR_MS);
+        const stale = makeRunDir("pi-tmux-779", 48 * HOUR_MS);
+        const recent = makeRunDir("pi-tmux-780", HOUR_MS);
+        const stats = cleanup({
+            isAlive: (pid) => pid === 778,
+            runTmux: () => "",
+        });
+        assert.equal(existsSync(live), true);
+        assert.equal(existsSync(stale), false);
+        assert.equal(existsSync(recent), true);
+        assert.deepEqual(stats, { examined: 3, removed: 1, keptAlive: 1 });
+        assert.equal(
+            formatTmuxRunDirSweepLog("startup", stats),
+            "[tau] tmux-run-dir-sweep source=startup examined=3 removed=1 kept-alive=1"
+        );
+    });
+
     void it("uses the env-resolved retention when the option is omitted", () => {
         process.env[RETENTION_ENV] = "0";
         try {
@@ -193,6 +218,73 @@ void describe("stale run dir cleanup", () => {
         } finally {
             delete process.env[RETENTION_ENV];
         }
+    });
+});
+
+void describe("periodic stale run-dir sweep", () => {
+    void beforeEach(() => mock.timers.enable({ apis: ["setInterval"] }));
+    void afterEach(() => mock.timers.reset());
+
+    void it("does not schedule a timer under the Node test runner", () => {
+        assert.equal(isNodeTestRunner(), true);
+        assert.equal(schedulePeriodicTmuxRunDirCleanup(), undefined);
+    });
+
+    void it("waits one interval, logs counters, and unrefs the timer", async () => {
+        let calls = 0;
+        const lines: string[] = [];
+        const timer = schedulePeriodicTmuxRunDirCleanup({
+            cleanup: () => {
+                calls++;
+                return { examined: 4, removed: 2, keptAlive: 1 };
+            },
+            log: (line) => lines.push(line),
+            isTestRunner: false,
+        });
+        assert.ok(timer);
+        assert.equal(typeof timer.unref, "function");
+        assert.equal(calls, 0);
+        mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS - 1);
+        assert.equal(calls, 0);
+        mock.timers.tick(1);
+        await Promise.resolve();
+        await Promise.resolve();
+        assert.equal(calls, 1);
+        assert.deepEqual(lines, [
+            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1",
+        ]);
+    });
+
+    void it("skips an interval callback while a previous sweep is in flight", async () => {
+        let calls = 0;
+        let resolveSweep:
+            | ((stats: {
+                  examined: number;
+                  removed: number;
+                  keptAlive: number;
+              }) => void)
+            | undefined;
+        schedulePeriodicTmuxRunDirCleanup({
+            cleanup: () => {
+                calls++;
+                return new Promise((resolve) => {
+                    resolveSweep = resolve;
+                });
+            },
+            log: () => {},
+            isTestRunner: false,
+        });
+        mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
+        await Promise.resolve();
+        assert.equal(calls, 1);
+        mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
+        assert.equal(calls, 1);
+        resolveSweep?.({ examined: 0, removed: 0, keptAlive: 0 });
+        for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+        mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
+        for (let turn = 0; turn < 3; turn++) await Promise.resolve();
+        assert.equal(calls, 2);
+        resolveSweep?.({ examined: 0, removed: 0, keptAlive: 0 });
     });
 });
 

@@ -228,21 +228,35 @@ function reapOrphanedTmuxSessions(
  * Pass `retentionMs: 0` (or set `PI_TAU_TMUX_RUN_DIR_RETENTION_MS=0`) for the
  * previous delete-immediately behavior.
  */
+export interface StaleRunDirCleanupStats {
+    /** PID-stamped run directories considered by the sweep. */
+    examined: number;
+    /** Directories successfully removed. */
+    removed: number;
+    /** Directories preserved because their embedded PID is still alive. */
+    keptAlive: number;
+}
+
 export function cleanupStaleTmuxRunDirs(
     options: StaleRunDirCleanupOptions = {}
-): void {
+): StaleRunDirCleanupStats {
     const rootDir = options.rootDir ?? "/tmp";
     const now = options.now ?? Date.now;
     const isAlive = options.isAlive ?? processAlive;
     const retentionMs = options.retentionMs ?? resolveRunDirRetentionMs();
     const runTmux = options.runTmux ?? execTmux;
 
+    const stats: StaleRunDirCleanupStats = {
+        examined: 0,
+        removed: 0,
+        keptAlive: 0,
+    };
     let entries: string[];
     try {
         entries = readdirSync(rootDir);
     } catch {
         // Unreadable root (missing, or not a directory): nothing to reap.
-        return;
+        return stats;
     }
     const nowMs = now();
 
@@ -255,17 +269,83 @@ export function cleanupStaleTmuxRunDirs(
         const pid = Number(suffix);
         if (!Number.isSafeInteger(pid) || pid <= 0) continue;
         if (pid === process.pid) continue;
-        if (isAlive(pid)) continue; // still running — never touch
+        stats.examined++;
+        if (isAlive(pid)) {
+            stats.keptAlive++;
+            continue; // still running — never touch
+        }
         const dir = join(rootDir, entry);
         if (!isReapable(dir, nowMs, retentionMs)) continue;
         try {
             rmSync(dir, { recursive: true, force: true });
+            stats.removed++;
         } catch {
             /* permission error or concurrent cleanup */
         }
     }
 
     reapOrphanedTmuxSessions(runTmux, isAlive);
+    return stats;
+}
+
+/** Run-directory retention is also enforced during long-lived pi sessions. */
+export const TMUX_RUN_DIR_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
+export function isNodeTestRunner(): boolean {
+    return (
+        process.env.NODE_TEST_CONTEXT !== undefined ||
+        process.argv.includes("--test")
+    );
+}
+
+export function formatTmuxRunDirSweepLog(
+    source: "startup" | "periodic",
+    stats: StaleRunDirCleanupStats
+): string {
+    return `[tau] tmux-run-dir-sweep source=${source} examined=${stats.examined} removed=${stats.removed} kept-alive=${stats.keptAlive}`;
+}
+
+/**
+ * Schedule the same conservative sweep used at startup. It deliberately waits
+ * one full interval before its first run; the caller already performs startup
+ * cleanup. The timer is unref'd so it cannot keep pi alive on its own.
+ */
+export function schedulePeriodicTmuxRunDirCleanup(
+    options: {
+        intervalMs?: number;
+        cleanup?: () =>
+            | StaleRunDirCleanupStats
+            | Promise<StaleRunDirCleanupStats>;
+        log?: (line: string) => void;
+        /** Test seam; production defaults to the Node test-runner detector. */
+        isTestRunner?: boolean;
+    } = {}
+): ReturnType<typeof setInterval> | undefined {
+    if (options.isTestRunner ?? isNodeTestRunner()) return undefined;
+
+    const intervalMs = options.intervalMs ?? TMUX_RUN_DIR_SWEEP_INTERVAL_MS;
+    const cleanup = options.cleanup ?? cleanupStaleTmuxRunDirs;
+    const log = options.log ?? ((line: string) => console.error(line));
+    let inFlight = false;
+    const timer = setInterval(() => {
+        if (inFlight) return;
+        inFlight = true;
+        void Promise.resolve()
+            .then(() => cleanup())
+            .then((stats) => log(formatTmuxRunDirSweepLog("periodic", stats)))
+            .catch((error: unknown) => {
+                const detail =
+                    error instanceof Error ? error.message : String(error);
+                log(
+                    `[tau] tmux-run-dir-sweep source=periodic error=${JSON.stringify(detail)}`
+                );
+            })
+            .finally(() => {
+                inFlight = false;
+            });
+    }, intervalMs);
+    timer.unref?.();
+    return timer;
 }
 
 /**

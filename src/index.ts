@@ -93,10 +93,16 @@ import { registerTauCommand } from "./features/features-register.ts";
 import { registerWakeup } from "./features/wakeup.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
 import { isTmuxAvailable } from "./tmux.ts";
-import { cleanupTmuxRunDir, cleanupStaleTmuxRunDirs } from "./features/bash-tmux.ts";
+import {
+    cleanupTmuxRunDir,
+    cleanupStaleTmuxRunDirs,
+    formatTmuxRunDirSweepLog,
+    schedulePeriodicTmuxRunDirCleanup,
+} from "./features/bash-tmux.ts";
 
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
+    let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
 
     // ── Compact renderer for job-completion messages ──────────────────
 
@@ -548,9 +554,15 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             Boolean(process.stdin.isTTY)
         );
 
-        // Clean up run directories and tmux sessions from dead pi processes
+        // Clean up run directories and tmux sessions from dead pi processes.
+        // Long-lived sessions repeat this sweep hourly; test runners do not
+        // create a background interval (the scheduler has its own guard).
         if (state.tmuxAvailable) {
-            cleanupStaleTmuxRunDirs();
+            const stats = cleanupStaleTmuxRunDirs();
+            console.error(formatTmuxRunDirSweepLog("startup", stats));
+            if (!tmuxRunDirSweepTimer) {
+                tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup();
+            }
         }
 
         // Restore the latest background-tasks snapshot and resume completion
