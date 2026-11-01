@@ -95,6 +95,7 @@ import type {
     BackgroundJob,
     JobOutputIndex,
     JobResultDetails,
+    JobStatus,
     RunningProcess,
     TerminationRequester,
     UiContext,
@@ -116,7 +117,7 @@ import {
     logPathForJob,
     MIN_STALL_CHECK_INTERVAL_MS,
     looksLikePrompt,
-    markJobTerminal,
+    markJobTerminal as markJobTerminalBase,
     readOutputTail,
     readOutputTailSync,
     resolveBackgroundAfterMs,
@@ -136,6 +137,50 @@ import {
     spawnForegroundTmux,
 } from "./bash-tmux.ts";
 import { captureOutput } from "../tmux.ts";
+import {
+    BACKGROUND_JOB_LIVENESS_ENTRY_TYPE,
+    startBackgroundJobLiveness,
+    type BackgroundJobLivenessTracker,
+} from "./background-job-liveness.ts";
+
+const backgroundJobLivenessTrackers = new Map<
+    BackgroundJob,
+    BackgroundJobLivenessTracker
+>();
+
+function startJobLiveness(job: BackgroundJob, pi: ExtensionAPI): void {
+    if (backgroundJobLivenessTrackers.has(job)) return;
+    const tracker = startBackgroundJobLiveness(job, (customType, data) =>
+        pi.appendEntry(customType, data)
+    );
+    backgroundJobLivenessTrackers.set(job, tracker);
+}
+
+function finishJobLiveness(
+    job: BackgroundJob,
+    status: Exclude<JobStatus, "running">,
+    exitCode?: number
+): void {
+    const tracker = backgroundJobLivenessTrackers.get(job);
+    if (!tracker) return;
+    tracker.finish(status, exitCode);
+    backgroundJobLivenessTrackers.delete(job);
+}
+
+function stopAllJobLiveness(): void {
+    for (const tracker of backgroundJobLivenessTrackers.values())
+        tracker.stop();
+    backgroundJobLivenessTrackers.clear();
+}
+
+function markJobTerminal(
+    job: BackgroundJob,
+    status: Exclude<JobStatus, "running">,
+    exitCode?: number
+): void {
+    markJobTerminalBase(job, status, exitCode);
+    finishJobLiveness(job, status, exitCode);
+}
 
 class PossiblyStuckError extends Error {
     constructor(message: string) {
@@ -974,6 +1019,9 @@ export function handleTmuxCompletion(
     shouldNotify: boolean,
     trigger: CompletionTrigger = "poller-observed"
 ): void {
+    if (job.status !== "running") {
+        finishJobLiveness(job, job.status, job.exitCode);
+    }
     // A terminal tmux result supersedes any queued warning for this job.
     cancelQueuedBackgroundNotification(pi, job.id, "timeout");
     cancelQueuedBackgroundNotification(pi, job.id, "stall");
@@ -1007,6 +1055,26 @@ export function restoreBackgroundJobs(
         .at(-1);
     if (!entry || !entry.data || typeof entry.data !== "object") return;
 
+    const recordedTerminalJobIds = new Set(
+        entries.flatMap((candidate) => {
+            if (
+                candidate.type !== "custom" ||
+                candidate.customType !== BACKGROUND_JOB_LIVENESS_ENTRY_TYPE ||
+                !candidate.data ||
+                typeof candidate.data !== "object"
+            ) {
+                return [];
+            }
+            const record = candidate.data as {
+                event?: unknown;
+                jobId?: unknown;
+            };
+            return record.event === "terminal" &&
+                typeof record.jobId === "string"
+                ? [record.jobId]
+                : [];
+        })
+    );
     const data = entry.data as {
         jobs?: Array<
             [
@@ -1028,6 +1096,7 @@ export function restoreBackgroundJobs(
                     tmux as import("./bash-tmux.js").TmuxJobContext;
                 attachTmuxContext(jobData, tmuxContext);
                 state.backgroundJobs.set(id, jobData);
+                startJobLiveness(jobData, pi);
                 let timer: ReturnType<typeof setInterval> | undefined;
                 const poll = (trigger: CompletionTrigger): boolean => {
                     const result = pollTmuxCompletion(jobData);
@@ -1072,6 +1141,14 @@ export function restoreBackgroundJobs(
             }
         }
         state.backgroundJobs.set(id, jobData);
+        if (jobData.status === "running") {
+            startJobLiveness(jobData, pi);
+        } else if (!recordedTerminalJobIds.has(id)) {
+            // Backfill one terminal artifact for older snapshots (and direct
+            // jobs found dead during restore) without duplicating newer records.
+            startJobLiveness(jobData, pi);
+            finishJobLiveness(jobData, jobData.status, jobData.exitCode);
+        }
     }
     if (typeof data.jobCounter === "number") {
         state.jobCounter = Math.max(state.jobCounter, data.jobCounter);
@@ -2527,6 +2604,7 @@ export function registerBackgroundJob(
     } else {
         state.backgroundJobs.set(jobId, job);
     }
+    startJobLiveness(existingJob ?? job, pi);
     // Only release ownership this call actually holds: a concurrent tool call
     // may have overwritten the global owner, and clearing it would break
     // Ctrl+B targeting for the newer call.
@@ -2713,6 +2791,7 @@ export function registerBackgroundJobs(
         }
         pendingCompletionDeliveries.length = 0;
         clearAllCompletionBatches();
+        stopAllJobLiveness();
     });
 
     // ── Override bash tool ─────────────────────────────────────────────
@@ -3374,6 +3453,7 @@ export function registerBackgroundJobs(
                     createRunningJobsWidgetRefresh(state, ctx)
                 );
 
+                startJobLiveness(job, pi);
                 updateWidget(state, ctx);
 
                 // Requested policies are armed identically on both backends
@@ -3450,6 +3530,7 @@ export function registerBackgroundJobs(
             };
             createJobDonePromise(job);
             state.backgroundJobs.set(jobId, job);
+            startJobLiveness(job, pi);
 
             const cancelStall = startStallWatchdog(
                 jobId,
@@ -4666,6 +4747,7 @@ async function executeTmuxForeground(
             // Mark as backgrounded — the completion poller in bash-tmux will handle notification.
             // Start the background completion poller.
             job.isBackgrounded = true;
+            startJobLiveness(job, pi);
             if (state.currentlyRunningToolCallId === toolCallId) {
                 state.currentlyRunningToolCallId = null;
             }
