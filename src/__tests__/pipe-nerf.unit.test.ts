@@ -14,7 +14,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -37,6 +44,10 @@ import {
 import { classifyLine, countLines } from "../features/log-classify.ts";
 import type { TauState } from "../state.ts";
 import { stageZeroDirectory, stageZeroPathFor } from "../features/pipe-nerf/stage0-path.ts";
+import {
+    markStage0CaptureIndexed,
+    sweepStage0Captures,
+} from "../features/pipe-nerf/stage0-retention.ts";
 
 interface CorpusExpected {
     kind: string;
@@ -586,6 +597,104 @@ void describe("pipe-nerf compound pipelines", () => {
             const result = plan(command);
             assert.equal(result.action, "skip", command);
             assert.equal(result.rewritten, command);
+        }
+    });
+});
+
+void describe("pipe-nerf stage-0 retention", () => {
+    function tempDir(): string {
+        return mkdtempSync(join(tmpdir(), "pipe-nerf-retention-"));
+    }
+
+    void it("deletes oldest indexed captures under budget pressure", () => {
+        const dir = tempDir();
+        const oldPath = join(dir, "pi-pipe-stage0-old.log");
+        const newPath = join(dir, "pi-pipe-stage0-new.log");
+        try {
+            writeFileSync(oldPath, "old!");
+            writeFileSync(newPath, "new!");
+            utimesSync(oldPath, 1, 1);
+            utimesSync(newPath, 2, 2);
+            markStage0CaptureIndexed(oldPath, "source-old", 1, dir);
+            markStage0CaptureIndexed(newPath, "source-new", 2, dir);
+            const result = sweepStage0Captures({
+                directories: [dir],
+                budgetBytes: 4,
+            });
+            assert.deepEqual(result.deletedPaths, [oldPath]);
+            assert.equal(existsSync(oldPath), false);
+            assert.equal(existsSync(newPath), true);
+            assert.equal(result.observedBytes, 4);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("retains unindexed captures even when over budget", () => {
+        const dir = tempDir();
+        const unindexed = join(dir, "pi-pipe-stage0-unindexed.log");
+        try {
+            writeFileSync(unindexed, "too large");
+            const result = sweepStage0Captures({
+                directories: [dir],
+                budgetBytes: 1,
+            });
+            assert.deepEqual(result.deletedPaths, []);
+            assert.equal(existsSync(unindexed), true);
+            assert.equal(result.observedBytes, 9);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("bounds each sweep by its file limit", () => {
+        const dir = tempDir();
+        try {
+            for (let i = 0; i < 6; i++) {
+                const path = join(dir, `pi-pipe-stage0-${i}.log`);
+                writeFileSync(path, "data");
+            }
+            const options = {
+                directories: [dir],
+                budgetBytes: 1,
+                maxFiles: 2,
+            };
+            const first = sweepStage0Captures(options);
+            const second = sweepStage0Captures(options);
+            const third = sweepStage0Captures(options);
+            assert.equal(first.filesVisited, 2);
+            assert.equal(second.filesVisited, 2);
+            assert.equal(first.complete, false);
+            assert.equal(second.complete, false);
+            assert.equal(third.complete, true);
+            assert.equal(third.deletedPaths.length, 0);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("sweeps both current and legacy capture locations", () => {
+        const current = tempDir();
+        const legacy = tempDir();
+        const currentPath = join(current, "pi-pipe-stage0-current.log");
+        const legacyPath = join(legacy, "pi-pipe-stage0-legacy.log");
+        try {
+            writeFileSync(currentPath, "curr");
+            writeFileSync(legacyPath, "old!");
+            markStage0CaptureIndexed(currentPath, "source-current", Date.now(), current);
+            markStage0CaptureIndexed(legacyPath, "source-legacy", Date.now(), current);
+            const result = sweepStage0Captures({
+                directories: [current, legacy],
+                budgetBytes: 1,
+            });
+            assert.deepEqual(
+                new Set(result.deletedPaths),
+                new Set([currentPath, legacyPath])
+            );
+            assert.equal(result.observedBytes, 0);
+        } finally {
+            rmSync(current, { recursive: true, force: true });
+            rmSync(legacy, { recursive: true, force: true });
         }
     });
 });

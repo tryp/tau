@@ -26,6 +26,12 @@ import { dirname, resolve as resolvePath } from "node:path";
 
 // ─── Context sidecar integration ────────────────────────────────────
 
+import { stageZeroDirectory } from "./pipe-nerf/stage0-path.ts";
+import {
+    legacyStage0Directory,
+    markStage0CaptureIndexed,
+    sweepStage0Captures,
+} from "./pipe-nerf/stage0-retention.ts";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
@@ -1503,7 +1509,17 @@ async function indexStageZeroCapture(
             "bash",
             { force: true, useExternalApi: false }
         );
-        return outcome.source?.sourceId ?? null;
+        const sourceId = outcome.source?.sourceId ?? null;
+        if (sourceId) {
+            markStage0CaptureIndexed(capture.path, sourceId);
+            sweepStage0Captures({
+                directories: [
+                    stageZeroDirectory(),
+                    legacyStage0Directory(homedir()),
+                ],
+            });
+        }
+        return sourceId;
     } catch {
         // A capture write that could not be indexed is still a file on disk; the
         // note falls back to naming the path.
