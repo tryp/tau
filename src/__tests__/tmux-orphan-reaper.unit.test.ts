@@ -14,16 +14,33 @@ const ROOT = "/fake/tmp";
 
 class FakeProc implements ReaperProcReader {
     identities = new Map<number, ProcessIdentity>();
+    listedPids: number[] = [];
     files = new Map<string, string>();
     directories = new Set<string>([ROOT]);
     bytes = new Map<string, number>();
     signals: Array<[number, "SIGTERM" | "SIGKILL"]> = [];
+    cpus = new Map<number, number>([
+        [20, 1],
+        [21, 2],
+    ]);
+    pipeProof = new Map<number, boolean | null>([
+        [20, true],
+        [21, false],
+    ]);
     boot = BOOT;
     pids(): number[] {
-        return [...this.identities.keys()];
+        return this.listedPids.length
+            ? [...this.listedPids]
+            : [...this.identities.keys()];
     }
     identity(pid: number): ProcessIdentity | null {
         return this.identities.get(pid) ?? null;
+    }
+    cpuTime(pid: number): number | null {
+        return this.cpus.get(pid) ?? null;
+    }
+    pipeBlockedWithoutPeer(pid: number): boolean | null {
+        return this.pipeProof.has(pid) ? this.pipeProof.get(pid)! : false;
     }
     bootId(): string | null {
         return this.boot;
@@ -135,6 +152,9 @@ void describe("tmux orphan process reaper", () => {
             orphaned: 1,
             killed: 2,
             keptLive: 0,
+            keptFinished: 0,
+            keptGrowing: 0,
+            keptQuiet: 0,
             keptUnverified: 0,
             skippedBootMismatch: 0,
             killEscalated: 1,
@@ -146,7 +166,11 @@ void describe("tmux orphan process reaper", () => {
     void it("does not exceed the per-sweep process cap", async () => {
         const { reader } = fixture();
         await reapOrphanedTmuxProcesses({ rootDir: ROOT, reader });
-        const stats = await reapOrphanedTmuxProcesses({ rootDir: ROOT, reader, maxProcesses: 1 });
+        const stats = await reapOrphanedTmuxProcesses({
+            rootDir: ROOT,
+            reader,
+            maxProcesses: 1,
+        });
         assert.deepEqual(reader.signals, []);
         assert.equal(stats.orphaned, 1);
         assert.equal(stats.keptUnverified, 1);
@@ -164,10 +188,39 @@ void describe("tmux orphan process reaper", () => {
         const { reader, outputFile } = fixture();
         await reapOrphanedTmuxProcesses({ rootDir: ROOT, reader });
         reader.bytes.set(outputFile, 124);
-        const stats = await reapOrphanedTmuxProcesses({ rootDir: ROOT, reader });
+        const stats = await reapOrphanedTmuxProcesses({
+            rootDir: ROOT,
+            reader,
+        });
         assert.deepEqual(reader.signals, []);
         assert.equal(stats.orphaned, 0);
-        assert.equal(stats.keptLive, 1);
+        assert.equal(stats.keptGrowing, 1);
+    });
+
+    void it("keeps a quiet CPU-idle non-pipe-blocked chain when its owner exits", async () => {
+        const { reader } = fixture();
+        reader.pipeProof.set(20, false);
+        const stats = await twoObservations(reader);
+        assert.deepEqual(reader.signals, []);
+        assert.equal(stats.keptQuiet, 1);
+    });
+
+    void it("keeps a pipe-blocked chain when a live peer still holds the pipe", async () => {
+        const { reader } = fixture();
+        reader.pipeProof.set(20, false);
+        reader.pipeProof.set(21, null);
+        const stats = await twoObservations(reader);
+        assert.deepEqual(reader.signals, []);
+        assert.equal(stats.keptUnverified, 1);
+    });
+
+    void it("keeps the whole chain when any process identity is unreadable", async () => {
+        const { reader } = fixture();
+        reader.identities.delete(21);
+        reader.listedPids = [10, 20, 21];
+        const stats = await twoObservations(reader);
+        assert.deepEqual(reader.signals, []);
+        assert.equal(stats.keptUnverified, 1);
     });
 
     void it("skips an owner boot-id mismatch", async () => {
@@ -190,7 +243,10 @@ void describe("tmux orphan process reaper", () => {
     void it("counts a legacy run without ownership metadata as unverified", async () => {
         const reader = new FakeProc();
         reader.directories.add(`${ROOT}/pi-tmux-legacy`);
-        const stats = await reapOrphanedTmuxProcesses({ rootDir: ROOT, reader });
+        const stats = await reapOrphanedTmuxProcesses({
+            rootDir: ROOT,
+            reader,
+        });
         assert.deepEqual(reader.signals, []);
         assert.equal(stats.examined, 1);
         assert.equal(stats.keptUnverified, 1);
@@ -200,7 +256,7 @@ void describe("tmux orphan process reaper", () => {
         const { reader } = fixture({ exit: true });
         const stats = await twoObservations(reader);
         assert.deepEqual(reader.signals, []);
-        assert.equal(stats.keptLive, 1);
+        assert.equal(stats.keptFinished, 1);
     });
 
     void it("dry-run reports orphan but signals nothing", async () => {
@@ -208,7 +264,9 @@ void describe("tmux orphan process reaper", () => {
         const stats = await twoObservations(reader, { dryRun: true });
         assert.deepEqual(reader.signals, []);
         assert.equal(stats.orphaned, 1);
-        assert.deepEqual(stats.wouldKill, ["pi-tmux-1/job.owner.json:wrapper=20"]);
+        assert.deepEqual(stats.wouldKill, [
+            "pi-tmux-1/job.owner.json:wrapper=20",
+        ]);
         assert.equal(stats.killed, 0);
     });
 

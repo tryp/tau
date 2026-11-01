@@ -2,6 +2,7 @@ import {
     readFileSync,
     readdirSync,
     statSync,
+    readlinkSync,
     writeFileSync,
     renameSync,
 } from "node:fs";
@@ -33,6 +34,8 @@ export interface ReaperProcReader {
     bootId(): string | null;
     pids(): number[];
     identity(pid: number): ProcessIdentity | null;
+    cpuTime(pid: number): number | null;
+    pipeBlockedWithoutPeer(pid: number): boolean | null;
     signal(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean;
     sleep(ms: number): Promise<void>;
     outputBytes(path: string): number | null;
@@ -57,6 +60,9 @@ export interface OrphanReaperStats {
     orphaned: number;
     killed: number;
     keptLive: number;
+    keptFinished: number;
+    keptGrowing: number;
+    keptQuiet: number;
     keptUnverified: number;
     skippedBootMismatch: number;
     killEscalated: number;
@@ -122,6 +128,59 @@ const defaultReader: ReaperProcReader = {
         }
     },
     identity: readLinuxProcessIdentity,
+    cpuTime: (pid) => {
+        try {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            const fields = stat
+                .slice(stat.lastIndexOf(")") + 1)
+                .trim()
+                .split(/\s+/);
+            const ticks = Number(fields[11]) + Number(fields[12]);
+            return Number.isFinite(ticks) ? ticks : null;
+        } catch {
+            return null;
+        }
+    },
+    pipeBlockedWithoutPeer: (pid) => {
+        try {
+            const wchan = readFileSync(`/proc/${pid}/wchan`, "utf8").trim();
+            if (!/pipe_(read|write|wait)|wait_for_partner/.test(wchan))
+                return false;
+            const syscall = readFileSync(`/proc/${pid}/syscall`, "utf8")
+                .trim()
+                .split(/\s+/);
+            const fd = Number(syscall[1]);
+            if (!Number.isSafeInteger(fd)) return null;
+            const link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+            const match = /^pipe:\[(\d+)\]$/.exec(link);
+            if (!match) return null;
+            const inode = match[1];
+            for (const otherPid of readdirSync("/proc").filter(
+                (x) => /^\d+$/.test(x) && Number(x) !== pid
+            )) {
+                let fds: string[];
+                try {
+                    fds = readdirSync(`/proc/${otherPid}/fd`);
+                } catch {
+                    return null;
+                }
+                for (const otherFd of fds) {
+                    try {
+                        if (
+                            readlinkSync(`/proc/${otherPid}/fd/${otherFd}`) ===
+                            `pipe:[${inode}]`
+                        )
+                            return false;
+                    } catch {
+                        return null;
+                    }
+                }
+            }
+            return true;
+        } catch {
+            return null;
+        }
+    },
     signal: (pid, signal) => {
         try {
             process.kill(pid, signal);
@@ -251,12 +310,17 @@ function descendants(
 function loadState(
     reader: ReaperProcReader,
     path: string
-): { bytes: number; observedAt: number } | null {
+): { bytes: number; cpuTime: number; observedAt: number } | null {
     const raw = reader.readText(path);
     if (!raw) return null;
     try {
-        const state = JSON.parse(raw) as { bytes: number; observedAt: number };
+        const state = JSON.parse(raw) as {
+            bytes: number;
+            cpuTime: number;
+            observedAt: number;
+        };
         return Number.isSafeInteger(state.bytes) &&
+            Number.isFinite(state.cpuTime) &&
             Number.isFinite(state.observedAt)
             ? state
             : null;
@@ -269,10 +333,11 @@ function saveState(
     reader: ReaperProcReader,
     path: string,
     bytes: number,
+    cpuTime: number,
     observedAt: number
 ): void {
     const temp = `${path}.tmp-${process.pid}`;
-    reader.writeText(temp, JSON.stringify({ bytes, observedAt }));
+    reader.writeText(temp, JSON.stringify({ bytes, cpuTime, observedAt }));
     reader.rename(temp, path);
 }
 
@@ -285,6 +350,9 @@ export async function reapOrphanedTmuxProcesses(
         orphaned: 0,
         killed: 0,
         keptLive: 0,
+        keptFinished: 0,
+        keptGrowing: 0,
+        keptQuiet: 0,
         keptUnverified: 0,
         skippedBootMismatch: 0,
         killEscalated: 0,
@@ -346,7 +414,7 @@ export async function reapOrphanedTmuxProcesses(
                 continue;
             }
             if (reader.exists(ownership.exitCodeFile)) {
-                stats.keptLive++;
+                stats.keptFinished++;
                 continue;
             }
             const bytes = reader.outputBytes(ownership.outputFile);
@@ -358,10 +426,36 @@ export async function reapOrphanedTmuxProcesses(
                 ORPHAN_REAPER_METADATA_SUFFIX,
                 ORPHAN_REAPER_STATE_SUFFIX
             );
+            const chain = descendants(currentWrapper, reader);
+            if (!chain) {
+                stats.keptUnverified++;
+                continue;
+            }
+            const cpuValues = chain.map((proc) => reader.cpuTime(proc.pid));
+            if (cpuValues.some((value) => value === null)) {
+                stats.keptUnverified++;
+                continue;
+            }
+            const cpuTime = (cpuValues as number[]).reduce(
+                (sum, value) => sum + value,
+                0
+            );
             const previous = loadState(reader, statePath);
-            saveState(reader, statePath, bytes, Date.now());
+            saveState(reader, statePath, bytes, cpuTime, Date.now());
             if (!previous || previous.bytes !== bytes) {
+                stats.keptGrowing++;
+                continue;
+            }
+            if (previous.cpuTime !== cpuTime) {
                 stats.keptLive++;
+                continue;
+            }
+            const pipeResults = chain.map((proc) =>
+                reader.pipeBlockedWithoutPeer(proc.pid)
+            );
+            if (!pipeResults.includes(true)) {
+                if (pipeResults.includes(null)) stats.keptUnverified++;
+                else stats.keptQuiet++;
                 continue;
             }
             stats.orphaned++;
@@ -372,11 +466,6 @@ export async function reapOrphanedTmuxProcesses(
                 const target = `${runName}/${name}:wrapper=${wrapper.pid}`;
                 if (stats.wouldKill.length < 8) stats.wouldKill.push(target);
                 else stats.wouldKillOmitted++;
-                continue;
-            }
-            const chain = descendants(currentWrapper, reader);
-            if (!chain) {
-                stats.keptUnverified++;
                 continue;
             }
             // Recheck the owner immediately before signalling; never act on a
@@ -392,7 +481,7 @@ export async function reapOrphanedTmuxProcesses(
             }
             // The command may have completed while /proc was being enumerated.
             if (reader.exists(ownership.exitCodeFile)) {
-                stats.keptLive++;
+                stats.keptFinished++;
                 continue;
             }
             const maxProcesses =
@@ -448,5 +537,5 @@ export function formatOrphanReaperLog(
     const targets = stats.wouldKill.length
         ? `${stats.wouldKill.join(",")}${stats.wouldKillOmitted ? `,+${stats.wouldKillOmitted}` : ""}`
         : "-";
-    return `[tau] tmux-orphan-reaper dry-run=${dryRun || process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1"} examined=${stats.examined} orphaned=${stats.orphaned} killed=${stats.killed} kept-live=${stats.keptLive} kept-unverified=${stats.keptUnverified} skipped-boot-mismatch=${stats.skippedBootMismatch} kill-escalated=${stats.killEscalated} would-kill=${targets}`;
+    return `[tau] tmux-orphan-reaper dry-run=${dryRun || process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1"} examined=${stats.examined} orphaned=${stats.orphaned} killed=${stats.killed} kept-live=${stats.keptLive} kept-finished=${stats.keptFinished} kept-growing=${stats.keptGrowing} kept-quiet=${stats.keptQuiet} kept-unverified=${stats.keptUnverified} skipped-boot-mismatch=${stats.skippedBootMismatch} kill-escalated=${stats.killEscalated} would-kill=${targets}`;
 }

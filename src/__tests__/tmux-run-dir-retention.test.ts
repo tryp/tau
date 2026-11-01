@@ -299,6 +299,9 @@ void describe("periodic stale run-dir sweep", () => {
                 orphaned: 0,
                 killed: 0,
                 keptLive: 0,
+                keptFinished: 0,
+                keptGrowing: 0,
+                keptQuiet: 0,
                 keptUnverified: 0,
                 skippedBootMismatch: 0,
                 killEscalated: 0,
@@ -328,7 +331,7 @@ void describe("periodic stale run-dir sweep", () => {
         assert.equal(lines.length, 2);
         assert.equal(
             lines[0],
-            "[tau] tmux-orphan-reaper dry-run=false examined=0 orphaned=0 killed=0 kept-live=0 kept-unverified=0 skipped-boot-mismatch=0 kill-escalated=0 would-kill=-"
+            "[tau] tmux-orphan-reaper dry-run=false examined=0 orphaned=0 killed=0 kept-live=0 kept-finished=0 kept-growing=0 kept-quiet=0 kept-unverified=0 skipped-boot-mismatch=0 kill-escalated=0 would-kill=-"
         );
         assert.equal(
             lines[1],
@@ -352,6 +355,9 @@ void describe("periodic stale run-dir sweep", () => {
                 orphaned: 0,
                 killed: 0,
                 keptLive: 0,
+                keptFinished: 0,
+                keptGrowing: 0,
+                keptQuiet: 0,
                 keptUnverified: 0,
                 skippedBootMismatch: 0,
                 killEscalated: 0,
