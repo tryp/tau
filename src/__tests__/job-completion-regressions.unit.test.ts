@@ -1,12 +1,19 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import {
+    mkdtempSync,
+    writeFileSync,
+    rmSync,
+    readFileSync,
+    existsSync,
+} from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     clearAllCompletionBatches,
     flushCompletionBatch,
+    handleTmuxCompletion,
     notifyCompletion,
     registerBackgroundJobs,
 } from "../features/background.ts";
@@ -168,7 +175,11 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(job, state, pi as never, notificationContext());
         flushCompletionBatch();
 
-        assert.deepEqual(appendedEntries, []);
+        assert.deepEqual(
+            appendedEntries.map((entry) => entry.data.event),
+            ["notify-called"],
+            "the suppressed/stale delivery still records the notify attempt"
+        );
         state.cancelCompletionBatchForJob?.(job.id);
         assert.deepEqual(
             cancelledQueueKeys.filter((key) =>
@@ -196,7 +207,9 @@ void describe("job completion regression coverage", () => {
             healthy.appendedEntries
                 .filter(
                     (entry) =>
-                        entry.customType === "background-completion-telemetry"
+                        entry.customType ===
+                            "background-completion-telemetry" &&
+                        entry.data.event !== "notify-called"
                 )
                 .map((entry) => ({
                     event: entry.data.event,
@@ -549,7 +562,8 @@ void describe("job completion regression coverage", () => {
                             entry.customType ===
                             "background-completion-telemetry"
                     )
-                    .map((entry) => entry.data.event),
+                    .map((entry) => entry.data.event)
+                    .filter((event) => event !== "notify-called"),
                 ["queued", "cancelled"]
             );
         } finally {
@@ -652,7 +666,8 @@ void describe("job completion regression coverage", () => {
         flushCompletionBatch();
         assert.equal(queuedMessages.length, 1);
         assert.deepEqual(
-            (queuedMessages[0]?.message as { details: { jobIds: string[] } }).details.jobIds,
+            (queuedMessages[0]?.message as { details: { jobIds: string[] } })
+                .details.jobIds,
             [known.id, unseen.id]
         );
         const originalQueueKey = queuedMessages[0]?.options.queueKey;
@@ -688,7 +703,9 @@ void describe("job completion regression coverage", () => {
         const { pi, queuedMessages, processQueuedMessages, appendedEntries } =
             registerTestTools(state, { holdFollowUps: true });
         let wakeCount = 0;
-        state.wakeupEvaluate = () => { wakeCount++; };
+        state.wakeupEvaluate = () => {
+            wakeCount++;
+        };
         const job = makeJob({ id: "job-cancel-miss", status: "failed" });
         state.backgroundJobs.set(job.id, job);
         notifyCompletion(job, state, pi as never, notificationContext());
@@ -698,7 +715,11 @@ void describe("job completion regression coverage", () => {
         clearAllCompletionBatches();
         assert.equal(job.completionNotified, false);
         assert.ok(wakeCount > 0);
-        assert.ok(appendedEntries.some(({ data }) => data.event === "cancel-miss-retained"));
+        assert.ok(
+            appendedEntries.some(
+                ({ data }) => data.event === "cancel-miss-retained"
+            )
+        );
     });
 
     void it("suppresses old acknowledged completions with telemetry", () => {
@@ -714,7 +735,11 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(job, state, pi as never, notificationContext());
         flushCompletionBatch();
         assert.equal(sentMessages.length, 0);
-        assert.ok(appendedEntries.some(({ data }) => data.event === "suppressed-stale"));
+        assert.ok(
+            appendedEntries.some(
+                ({ data }) => data.event === "suppressed-stale"
+            )
+        );
     });
 
     void it("keeps independent queue keys through agent_start and cancels only the acknowledged job", async () => {
@@ -819,11 +844,131 @@ void describe("job completion regression coverage", () => {
                     (entry) =>
                         entry.customType === "background-completion-telemetry"
                 )
-                .map((entry) => entry.data.event),
+                .map((entry) => entry.data.event)
+                .filter((event) => event !== "notify-called"),
             ["queued", "cancel-miss"]
         );
         await invoke("agent_settled");
         await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    void it("attributes a re-armed duplicate notice to its trigger and generation", () => {
+        const state = new TauState();
+        const {
+            pi,
+            sentMessages,
+            queuedMessages,
+            processQueuedMessages,
+            appendedEntries,
+        } = registerTestTools(state, { holdFollowUps: true });
+        const job = makeJob({
+            id: "job-cancel-miss-rearmed",
+            status: "failed",
+            exitCode: 1,
+        });
+        handleTmuxCompletion(
+            job,
+            state,
+            pi as never,
+            notificationContext(),
+            true
+        );
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 1);
+        processQueuedMessages(); // The first notice was already delivered.
+
+        // Cancellation misses because the queue item is beyond the delivery
+        // boundary; this deliberately re-arms the same object for a re-offer.
+        clearAllCompletionBatches();
+        handleTmuxCompletion(
+            job,
+            state,
+            pi as never,
+            notificationContext(),
+            true
+        );
+        flushCompletionBatch();
+        processQueuedMessages();
+
+        const killed = makeJob({ id: "job-kill-trigger", status: "killed" });
+        notifyCompletion(
+            killed,
+            state,
+            pi as never,
+            notificationContext(),
+            "kill"
+        );
+        flushCompletionBatch();
+        notifyCompletion(
+            killed,
+            state,
+            pi as never,
+            notificationContext(),
+            "kill"
+        );
+        processQueuedMessages();
+
+        const telemetry = appendedEntries
+            .filter(
+                (entry) =>
+                    entry.customType === "background-completion-telemetry"
+            )
+            .map((entry) => entry.data)
+            .filter((data) => data.event === "notify-called");
+        const jobRecords = telemetry.filter((data) => data.jobId === job.id);
+        assert.equal(jobRecords.length, 2);
+        assert.ok(
+            Number(jobRecords[1]?.generation) >
+                Number(jobRecords[0]?.generation)
+        );
+        assert.deepEqual(
+            jobRecords.map((data) => data.trigger),
+            ["poller-observed", "cancel-miss-rearm"]
+        );
+        assert.equal(jobRecords[1]?.observedBy, "poller-observed");
+        assert.equal(jobRecords[0]?.delivery, "deferred-batch");
+        assert.equal(jobRecords[0]?.outstandingJobs, 0);
+
+        const generationFor = (message: unknown, id: string) => {
+            const details = (
+                message as {
+                    details?: {
+                        jobId?: string;
+                        generation?: number;
+                        batch?: { jobId: string; generation: number }[];
+                    };
+                }
+            ).details;
+            return (
+                details?.batch?.find((item) => item.jobId === id)?.generation ??
+                (details?.jobId === id ? details.generation : undefined)
+            );
+        };
+        const notices = sentMessages.filter(
+            (message) =>
+                (message as { customType?: string }).customType ===
+                "job-completion"
+        );
+        const jobNotices = notices.filter((message) =>
+            (message as { content: string }).content.includes(job.id)
+        );
+        assert.equal(jobNotices.length, 2);
+        assert.deepEqual(
+            jobNotices.map((message) => generationFor(message, job.id)),
+            jobRecords.map((data) => data.generation)
+        );
+        assert.ok(
+            telemetry.some(
+                (data) => data.jobId === killed.id && data.trigger === "kill"
+            )
+        );
+        assert.ok(
+            telemetry.some(
+                (data) =>
+                    data.jobId === killed.id && data.delivery === "suppressed"
+            ),
+            "a guard-suppressed notify call must still be recorded"
+        );
     });
 
     void it("does not deliver duplicate notifications for one terminal job", async () => {

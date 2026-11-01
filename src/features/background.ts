@@ -900,7 +900,8 @@ export function handleTmuxCompletion(
     state: TauState,
     pi: ExtensionAPI,
     ctx: UiContext,
-    shouldNotify: boolean
+    shouldNotify: boolean,
+    trigger: CompletionTrigger = "poller-observed"
 ): void {
     // A terminal tmux result supersedes any queued warning for this job.
     cancelQueuedBackgroundNotification(pi, job.id, "timeout");
@@ -911,7 +912,7 @@ export function handleTmuxCompletion(
         // suppression check; otherwise successful tmux jobs are silently
         // dropped even though notify defaults to true.
         job.wantsCompletionNotification = true;
-        notifyCompletion(job, state, pi, ctx);
+        notifyCompletion(job, state, pi, ctx, trigger);
     } else {
         job.suppressAutonomousWake = true;
         removeJob(state, job);
@@ -936,10 +937,12 @@ export function restoreBackgroundJobs(
     if (!entry || !entry.data || typeof entry.data !== "object") return;
 
     const data = entry.data as {
-        jobs?: Array<[
-            string,
-            Omit<BackgroundJob, "proc" | "donePromise" | "resolveDone">
-        ]>;
+        jobs?: Array<
+            [
+                string,
+                Omit<BackgroundJob, "proc" | "donePromise" | "resolveDone">,
+            ]
+        >;
         jobCounter?: number;
     };
     for (const [id, jobData] of data.jobs ?? []) {
@@ -950,11 +953,12 @@ export function restoreBackgroundJobs(
                 tmux !== null &&
                 "exitCodeFile" in tmux
             ) {
-                const tmuxContext = tmux as import("./bash-tmux.js").TmuxJobContext;
+                const tmuxContext =
+                    tmux as import("./bash-tmux.js").TmuxJobContext;
                 attachTmuxContext(jobData, tmuxContext);
                 state.backgroundJobs.set(id, jobData);
                 let timer: ReturnType<typeof setInterval> | undefined;
-                const poll = (): boolean => {
+                const poll = (trigger: CompletionTrigger): boolean => {
                     const result = pollTmuxCompletion(jobData);
                     if (!result.completed) return false;
                     if (timer) clearInterval(timer);
@@ -969,15 +973,22 @@ export function restoreBackgroundJobs(
                     );
                     clearPendingDecision(state, jobData);
                     void trackJobOutputIndex(jobData, ctx, "bash_bg");
-                    handleTmuxCompletion(jobData, state, pi, ctx, true);
+                    handleTmuxCompletion(
+                        jobData,
+                        state,
+                        pi,
+                        ctx,
+                        true,
+                        trigger
+                    );
                     updateWidget(state, ctx);
                     return true;
                 };
                 // A sentinel may already exist when the session is restored.
                 // Finalize synchronously; otherwise resume the same poller used
                 // for jobs started in this process, including liveness checks.
-                if (!poll()) {
-                    timer = setInterval(poll, 500);
+                if (!poll("restore")) {
+                    timer = setInterval(() => poll("poller-observed"), 500);
                     timer.unref?.();
                 }
                 continue;
@@ -1510,10 +1521,20 @@ const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job i
 const INLINE_ATTACH_WINDOW_MS = 30_000;
 const ACKNOWLEDGED_STALE_MAX_AGE_MS = 5 * 60 * 1000;
 
+type CompletionTrigger =
+    | "poller-observed"
+    | "kill"
+    | "deadline"
+    | "cancel-miss-rearm"
+    | "flush-suppressed-rearm"
+    | "restore"
+    | "other";
+
 type CompletionBatchItem = {
     job: BackgroundJob;
     duration: string;
     emoji: string;
+    generation: number;
     /**
      * Jobs still running when THIS job completed, captured here because
      * delivery can be deferred by an agent-busy window for minutes. Counting
@@ -1579,7 +1600,16 @@ function pruneQueuedCompletionDeliveryMetadata(state: TauState): void {
 function recordCompletionTelemetry(
     pi: ExtensionAPI,
     event: string,
-    fields: { queueKey?: string; jobIds?: string[] } = {}
+    fields: {
+        queueKey?: string;
+        jobIds?: string[];
+        jobId?: string;
+        generation?: number;
+        trigger?: CompletionTrigger;
+        observedBy?: CompletionTrigger;
+        outstandingJobs?: number;
+        delivery?: "immediate" | "deferred-batch" | "suppressed";
+    } = {}
 ): void {
     const appendEntry = (
         pi as ExtensionAPI & {
@@ -1603,6 +1633,16 @@ function recordCompletionTelemetry(
             at: Date.now(),
             ...(fields.queueKey ? { queueKey: fields.queueKey } : {}),
             ...(fields.jobIds ? { jobIds: fields.jobIds } : {}),
+            ...(fields.jobId ? { jobId: fields.jobId } : {}),
+            ...(fields.generation !== undefined
+                ? { generation: fields.generation }
+                : {}),
+            ...(fields.trigger ? { trigger: fields.trigger } : {}),
+            ...(fields.observedBy ? { observedBy: fields.observedBy } : {}),
+            ...(fields.outstandingJobs !== undefined
+                ? { outstandingJobs: fields.outstandingJobs }
+                : {}),
+            ...(fields.delivery ? { delivery: fields.delivery } : {}),
         });
     } catch {
         // Telemetry must never interfere with completion delivery or cancellation.
@@ -1630,6 +1670,7 @@ const deliveringCompletionJobIds = new Set<string>();
 // Per-job generations invalidate asynchronous indexing callbacks after a
 // completion is cancelled and then potentially re-notified.
 const completionJobGenerations = new Map<string, number>();
+const completionRearmTriggers = new WeakMap<BackgroundJob, CompletionTrigger>();
 // Invalidates asynchronous indexing callbacks after a batch is cleared.
 let completionBatchGeneration = 0;
 
@@ -1641,10 +1682,7 @@ let completionBatchGeneration = 0;
  * exists but cannot be signalled; other kill errors (notably ESRCH) mean it is
  * not live. Job status remains authoritative for excluding terminal jobs.
  */
-function countOutstandingJobs(
-    state: TauState,
-    excludeJobId?: string
-): number {
+function countOutstandingJobs(state: TauState, excludeJobId?: string): number {
     return Array.from(state.backgroundJobs.values()).filter((job) => {
         if (job.id === excludeJobId || job.status !== "running") return false;
         if (job.pid === undefined) return true;
@@ -1705,6 +1743,7 @@ export function flushCompletionBatch(): void {
             for (const item of freshBatch) {
                 item.job.completionNotified = false;
                 completionNotifiedJobs.delete(item.job);
+                completionRearmTriggers.set(item.job, "flush-suppressed-rearm");
                 pendingCompletionJobs.delete(item.job.id);
             }
             state.wakeupEvaluate?.();
@@ -1734,11 +1773,13 @@ function completionNeedsDelivery(jobs: CompletionBatchItem[]): boolean {
 function restoreCompletionForWake(
     job: BackgroundJob,
     wakeStates: Set<TauState>,
-    state?: TauState
+    state?: TauState,
+    trigger: CompletionTrigger = "flush-suppressed-rearm"
 ): void {
     if (deliveringCompletionJobIds.has(job.id)) return;
     pendingCompletionJobs.delete(job.id);
     completionNotifiedJobs.delete(job);
+    completionRearmTriggers.set(job, trigger);
     job.completionNotified = false;
     completionJobGenerations.set(
         job.id,
@@ -1907,6 +1948,7 @@ function deliverCompletionNotification(
                 display: true,
                 details: {
                     jobId: job.id,
+                    generation: batch[0].generation,
                     status: job.status,
                     exitCode: job.exitCode,
                     duration,
@@ -1995,6 +2037,7 @@ function deliverCompletionNotification(
                 jobIds: batch.map(({ job }) => job.id),
                 batch: batch.map((b) => ({
                     jobId: b.job.id,
+                    generation: b.generation,
                     status: b.job.status,
                     exitCode: b.job.exitCode,
                     duration: b.duration,
@@ -2209,7 +2252,12 @@ export function clearAllCompletionBatches(): void {
                 jobIds: delivery.jobs.map(({ job }) => job.id),
             });
             for (const { job } of delivery.jobs) {
-                restoreCompletionForWake(job, wakeStates, delivery.state);
+                restoreCompletionForWake(
+                    job,
+                    wakeStates,
+                    delivery.state,
+                    "cancel-miss-rearm"
+                );
             }
         }
     }
@@ -2217,6 +2265,7 @@ export function clearAllCompletionBatches(): void {
     for (const [jobId, job] of pendingCompletionJobs) {
         if (deliveringCompletionJobIds.has(jobId)) continue;
         completionNotifiedJobs.delete(job);
+        completionRearmTriggers.set(job, "flush-suppressed-rearm");
         job.completionNotified = false;
         completionJobGenerations.set(
             jobId,
@@ -2248,19 +2297,35 @@ export function notifyCompletion(
     job: BackgroundJob,
     state: TauState,
     pi: ExtensionAPI,
-    ctx: UiContext
+    ctx: UiContext,
+    observedBy: CompletionTrigger = "other"
 ): void {
     // A terminal result supersedes any queued timeout/stall warning for the
     // same job. This is deterministic cancellation, not a time-based expiry.
     cancelQueuedBackgroundNotification(pi, job.id, "timeout");
     cancelQueuedBackgroundNotification(pi, job.id, "stall");
 
-    // If the job was already silenced (killed by watchdog, tool, etc.),
-    // skip notification entirely — the killing path already sent one.
-    if (job.outputConsumed || completionNotifiedJobs.has(job)) return;
+    // Record every observation, including one suppressed by the object-identity
+    // guard. A re-arm cause takes precedence over the observer because it is the
+    // information needed to explain a repeated notice.
+    const suppressed = job.outputConsumed || completionNotifiedJobs.has(job);
+    const previousGeneration = completionJobGenerations.get(job.id) ?? 0;
+    const jobGeneration = suppressed
+        ? previousGeneration
+        : previousGeneration + 1;
+    const rearmTrigger = completionRearmTriggers.get(job);
+    recordCompletionTelemetry(pi, "notify-called", {
+        jobId: job.id,
+        generation: jobGeneration,
+        trigger: rearmTrigger ?? observedBy,
+        ...(rearmTrigger ? { observedBy } : {}),
+        outstandingJobs: countOutstandingJobs(state, job.id),
+        delivery: suppressed ? "suppressed" : "deferred-batch",
+    });
+    if (suppressed) return;
+    completionRearmTriggers.delete(job);
     completionNotifiedJobs.add(job);
     job.completionNotified = true;
-    const jobGeneration = (completionJobGenerations.get(job.id) ?? 0) + 1;
     completionJobGenerations.set(job.id, jobGeneration);
     pendingCompletionJobs.set(job.id, job);
 
@@ -2312,6 +2377,7 @@ export function notifyCompletion(
             job,
             duration,
             emoji,
+            generation: jobGeneration,
             outstandingJobs: countOutstandingJobs(state, job.id),
         });
         completionBatch.pi = pi;
@@ -3355,7 +3421,18 @@ export function registerBackgroundJobs(
                 );
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
-                if (shouldNotify) notifyCompletion(job, state, pi, ctx);
+                if (shouldNotify)
+                    notifyCompletion(
+                        job,
+                        state,
+                        pi,
+                        ctx,
+                        terminationWasRequested && signalDeath
+                            ? "kill"
+                            : job.deadlineFiredAt !== undefined
+                              ? "deadline"
+                              : "other"
+                    );
                 else {
                     job.suppressAutonomousWake = true;
                     removeJob(state, job);
@@ -3370,7 +3447,14 @@ export function registerBackgroundJobs(
                 markJobTerminal(job, "failed");
                 void trackJobOutputIndex(job, ctx);
                 clearPendingDecision(state, job);
-                if (shouldNotify) notifyCompletion(job, state, pi, ctx);
+                if (shouldNotify)
+                    notifyCompletion(
+                        job,
+                        state,
+                        pi,
+                        ctx,
+                        job.deadlineFiredAt !== undefined ? "deadline" : "other"
+                    );
                 else {
                     job.suppressAutonomousWake = true;
                     removeJob(state, job);
