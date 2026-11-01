@@ -575,7 +575,9 @@ export function registerTask(pi: ExtensionAPI, state: TauState): void {
             "Manage tasks with nesting, relationships, and status tracking. " +
             "Actions: list, add (title, parent?, status?), update (id, title?, " +
             "description?, status?), remove (id, cascade?), move (id, parent?), " +
-            "link (from, to, type), unlink (from, to)",
+            "link (from, to, type), unlink (from, to). " +
+            "Nonexistent add/move parent IDs error without changing tasks. Links require existing IDs; " +
+            "add with a missing linkWith target rolls back the new task.",
         parameters: TaskParams,
 
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
