@@ -1,5 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1258,6 +1260,153 @@ void describe(
             // the unref'd debounce timer never fires between fast tests, so drain
             // it explicitly to avoid cross-test contamination.
             clearAllCompletionBatches();
+        });
+
+        void it("omits stale dead processes from the completion outstanding count", async () => {
+            const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], {
+                stdio: "ignore",
+            });
+            await once(deadChild, "exit");
+            const deadPid = deadChild.pid;
+            assert.ok(deadPid, "spawned child must have a pid");
+            assert.throws(
+                () => process.kill(deadPid, 0),
+                (error: NodeJS.ErrnoException) => error.code === "ESRCH",
+                "child exit event must mean the pid is no longer live"
+            );
+
+            const state = new TauState();
+            registerBackgroundJobs(
+                {
+                    registerTool() {},
+                    registerCommand() {},
+                    registerMessageRenderer() {},
+                    createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                    registerToolPromptGuidelines() {},
+                    sendMessage() {},
+                } as never,
+                state
+            );
+            const sentMessages: unknown[] = [];
+            const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
+            const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
+            state.backgroundJobs.set("stale-running-job", makeJob({
+                id: "stale-running-job",
+                pid: deadPid,
+                status: "running",
+            }));
+            const completed = makeJob({
+                id: "completion-after-stale-job",
+                status: "failed",
+                exitCode: 1,
+            });
+            state.backgroundJobs.set(completed.id, completed);
+
+            notifyCompletion(completed, state, pi, ctx);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            state._flushCompletionBatch?.();
+
+            const message = sentMessages[0] as { content: string; details: { outstandingJobs: number } };
+            assert.equal(message.details.outstandingJobs, 0);
+            assert.doesNotMatch(message.content, /jobs outstanding/);
+        });
+
+        void it("counts a live process in the completion outstanding count", async () => {
+            const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+                stdio: "ignore",
+            });
+            await once(liveChild, "spawn");
+            const livePid = liveChild.pid;
+            assert.ok(livePid, "spawned child must have a pid");
+            try {
+                const state = new TauState();
+                registerBackgroundJobs(
+                    {
+                        registerTool() {},
+                        registerCommand() {},
+                        registerMessageRenderer() {},
+                        createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                        registerToolPromptGuidelines() {},
+                        sendMessage() {},
+                    } as never,
+                    state
+                );
+                const sentMessages: unknown[] = [];
+                const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
+                const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
+                state.backgroundJobs.set("live-running-job", makeJob({
+                    id: "live-running-job",
+                    pid: livePid,
+                    status: "running",
+                }));
+                const completed = makeJob({
+                    id: "completion-with-live-job",
+                    status: "failed",
+                    exitCode: 1,
+                });
+                state.backgroundJobs.set(completed.id, completed);
+
+                notifyCompletion(completed, state, pi, ctx);
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                state._flushCompletionBatch?.();
+
+                const message = sentMessages[0] as { content: string; details: { outstandingJobs: number } };
+                assert.equal(message.details.outstandingJobs, 1);
+                assert.match(message.content, /\(1 jobs outstanding\)/);
+            } finally {
+                liveChild.kill("SIGTERM");
+                await once(liveChild, "exit");
+            }
+        });
+
+        void it("preserves the outstanding count in a batched completion notice", async () => {
+            const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+                stdio: "ignore",
+            });
+            await once(liveChild, "spawn");
+            const livePid = liveChild.pid;
+            assert.ok(livePid, "spawned child must have a pid");
+            try {
+                const state = new TauState();
+                registerBackgroundJobs(
+                    {
+                        registerTool() {},
+                        registerCommand() {},
+                        registerMessageRenderer() {},
+                        createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                        registerToolPromptGuidelines() {},
+                        sendMessage() {},
+                    } as never,
+                    state
+                );
+                const sentMessages: unknown[] = [];
+                const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
+                const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
+                state.backgroundJobs.set("batch-live-running-job", makeJob({
+                    id: "batch-live-running-job",
+                    pid: livePid,
+                    status: "running",
+                }));
+                for (const id of ["batch-completion-one", "batch-completion-two"]) {
+                    const completed = makeJob({ id, status: "failed", exitCode: 1 });
+                    state.backgroundJobs.set(id, completed);
+                    notifyCompletion(completed, state, pi, ctx);
+                }
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                state._flushCompletionBatch?.();
+
+                const message = sentMessages[0] as {
+                    content: string;
+                    details: { outstandingJobs: number; batch: unknown[] };
+                };
+                assert.equal(sentMessages.length, 1);
+                assert.match(message.content, /2 failed \(1 jobs outstanding\)/);
+                assert.equal(message.details.outstandingJobs, 1);
+                assert.equal(message.details.batch.length, 2);
+            } finally {
+                liveChild.kill("SIGTERM");
+                await once(liveChild, "exit");
+            }
         });
 
         void it("removes job from backgroundJobs map when process exits", async () => {

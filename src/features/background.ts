@@ -1415,17 +1415,7 @@ function preparedOutputDetails(
  * correctness is managed via the close handler.
  */
 function outstandingJobsSuffix(state: TauState, excludeJobId: string): string {
-    const count = Array.from(state.backgroundJobs.values()).filter((j) => {
-        if (j.id === excludeJobId) return false;
-        if (j.status !== "running") return false;
-        try {
-            if (j.pid) process.kill(j.pid, 0);
-            return true;
-        } catch {
-            // ESRCH = no such process, EACCES/EPERM = exists but can't signal
-            return false;
-        }
-    }).length;
+    const count = countOutstandingJobs(state, excludeJobId);
     return count > 0 ? ` (${count} jobs outstanding)` : "";
 }
 
@@ -1551,11 +1541,29 @@ const completionJobGenerations = new Map<string, number>();
 // Invalidates asynchronous indexing callbacks after a batch is cleared.
 let completionBatchGeneration = 0;
 
-/** Count currently running background jobs (excluding any completed/failed/killed). */
-function countOutstandingJobs(state: TauState): number {
-    return Array.from(state.backgroundJobs.values()).filter(
-        (j) => j.status === "running"
-    ).length;
+/**
+ * Count live running jobs for completion-notice suffixes.
+ *
+ * A missing pid is treated as outstanding because there is no process handle
+ * with which to prove the job is dead. EACCES/EPERM likewise means the process
+ * exists but cannot be signalled; other kill errors (notably ESRCH) mean it is
+ * not live. Job status remains authoritative for excluding terminal jobs.
+ */
+function countOutstandingJobs(
+    state: TauState,
+    excludeJobId?: string
+): number {
+    return Array.from(state.backgroundJobs.values()).filter((job) => {
+        if (job.id === excludeJobId || job.status !== "running") return false;
+        if (job.pid === undefined) return true;
+        try {
+            process.kill(job.pid, 0);
+            return true;
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            return code === "EACCES" || code === "EPERM";
+        }
+    }).length;
 }
 
 export function flushCompletionBatch(): void {
