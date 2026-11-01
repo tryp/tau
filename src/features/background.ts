@@ -1437,6 +1437,14 @@ type CompletionBatchItem = {
     job: BackgroundJob;
     duration: string;
     emoji: string;
+    /**
+     * Jobs still running when THIS job completed, captured here because
+     * delivery can be deferred by an agent-busy window for minutes. Counting
+     * at delivery time made a notice report a world minutes newer than the
+     * `duration` beside it, and after a session restore the captured state
+     * no longer held the live siblings at all.
+     */
+    outstandingJobs: number;
 };
 
 const completionBatch: {
@@ -1530,6 +1538,13 @@ let settledCompletionFlushTimer: NodeJS.Timeout | undefined;
 // Prevent duplicate notifications when both error and close handlers fire.
 // A Set (rather than WeakSet) lets cancellation restore a completion that was
 // marked before asynchronous indexing/enqueueing finished.
+//
+// Deliberately keyed by object identity, not by job id: job ids are
+// `tmux-<pid>-<counter>` and the counter restarts with each TauState, so a
+// second job in the same process can legitimately reuse an id. Keying by id
+// suppresses that job's completion notice (two bg-deadline-wake tests catch
+// it). The cost is that a session-restored object for an already-notified job
+// is not deduplicated here.
 const completionNotifiedJobs = new Set<BackgroundJob>();
 // Jobs marked for completion notification but not yet delivered. Cancellation
 // removes them here so autonomous wake evaluation can expose them again.
@@ -1759,8 +1774,14 @@ function deliverCompletionNotification(
         return;
     }
 
-    const { pi, state } = delivery;
-    const outstandingCount = countOutstandingJobs(state);
+    const { pi } = delivery;
+    // Use the count captured when each job completed, not a fresh count: the
+    // delivery may be minutes later (agent-busy deferral), and the notice's
+    // own `duration` describes the completion instant.
+    const outstandingCount = Math.max(
+        0,
+        ...batch.map((item) => item.outstandingJobs)
+    );
     const suffix =
         outstandingCount > 0 ? ` (${outstandingCount} jobs outstanding)` : "";
     const completionEvidenceById = new Map<
@@ -2210,7 +2231,12 @@ export function notifyCompletion(
                 )
             );
         }
-        completionBatch.jobs.push({ job, duration, emoji });
+        completionBatch.jobs.push({
+            job,
+            duration,
+            emoji,
+            outstandingJobs: countOutstandingJobs(state, job.id),
+        });
         completionBatch.pi = pi;
         completionBatch.state = state;
 

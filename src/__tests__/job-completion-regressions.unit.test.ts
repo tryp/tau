@@ -1,6 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +11,7 @@ import {
     registerBackgroundJobs,
 } from "../features/background.ts";
 import { TauState } from "../state.ts";
+import { createBashScript } from "../tmux.ts";
 import type { BackgroundJob } from "../types.ts";
 import { createJobDonePromise, markJobTerminal } from "../utils.ts";
 
@@ -845,5 +847,87 @@ void describe("job completion regression coverage", () => {
             1,
             "a terminal job must appear once in completion output"
         );
+    });
+
+    void it("reports the outstanding count from completion time, not delivery time", () => {
+        const state = new TauState();
+        const { pi, sentMessages } = registerTestTools(state);
+        const sibling = makeJob({
+            id: "job-live-sibling",
+            status: "running",
+            pid: process.pid,
+        });
+        state.backgroundJobs.set(sibling.id, sibling);
+        const job = makeJob({
+            id: "job-count-captured",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+        state.backgroundJobs.set(job.id, job);
+
+        notifyCompletion(job, state, pi as never, notificationContext());
+        // Delivery can be deferred for minutes by an agent-busy window. A
+        // sibling that finishes first must not rewrite the count that
+        // describes the moment this job completed.
+        markJobTerminal(sibling, "completed", 0);
+        flushCompletionBatch();
+
+        const content = (sentMessages[0] as { content: string }).content;
+        assert.match(content, /\(1 jobs outstanding\)/);
+        assert.equal(
+            (sentMessages[0] as { details?: { outstandingJobs?: number } })
+                .details?.outstandingJobs,
+            1,
+            "notice details must carry the same count as its text"
+        );
+    });
+
+    // Guard, not a failing repro: the wrapper was suspected of writing the
+    // exit sentinel while a slow producer still held the output file, which
+    // would finalize a job early with partial evidence. It does not — bash
+    // waits for every pipeline element — so this pins the invariant rather
+    // than demonstrating a defect. It fails if the wrapper is ever changed to
+    // report completion ahead of its pipeline.
+    void it("writes the exit sentinel only after the wrapper's pipeline finishes", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "pi-tau-wrapper-sentinel-"));
+        try {
+            const outputFile = join(dir, "job.out");
+            const exitCodeFile = join(dir, "job.exit");
+            const script = createBashScript(
+                dir,
+                "test-session",
+                `(echo first; sleep 0.4; echo second) | tee -a ${join(dir, "tee.log")} | tail -2`,
+                { id: "guard", outputFile, exitCodeFile }
+            );
+
+            const child = spawn(script.scriptPath, { stdio: "ignore" });
+            const started = Date.now();
+            while (!existsSync(exitCodeFile) && Date.now() - started < 5000) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            const elapsed = Date.now() - started;
+            const outputAtSentinel = existsSync(outputFile)
+                ? readFileSync(outputFile, "utf-8").trim()
+                : "";
+            // The child may already have exited while the sentinel was polled;
+            // awaiting an event that already fired would hang the test.
+            if (child.exitCode === null && child.signalCode === null) {
+                await new Promise((resolve) => child.once("exit", resolve));
+            }
+
+            assert.ok(
+                elapsed >= 300,
+                `sentinel appeared after ${elapsed}ms, before the 400ms producer finished`
+            );
+            assert.equal(
+                outputAtSentinel,
+                "first\nsecond",
+                "both producer lines must be in the output file when the sentinel appears"
+            );
+            assert.equal(readFileSync(exitCodeFile, "utf-8").trim(), "0");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
