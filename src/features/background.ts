@@ -2726,6 +2726,10 @@ export function registerBackgroundJobs(
             "Execute bash commands with streaming output. Commands that run longer than the auto-background delay " +
             "(15 seconds by default, PI_TAU_BACKGROUND_AFTER_MS to override, backgroundAfter per call) " +
             "are automatically backgrounded and the agent is asked whether to kill or let them continue. " +
+            "For waits of about 2 seconds or more, avoid a bare leading sleep (it is blocked): use bash_bg " +
+            "for deliberate backgrounding, optionally with timeout (wakes you to inspect/decide; never kills) " +
+            "and/or remindDelay (auto-cancels when the job completes), or poll with a loop that sleeps under 2 " +
+            "seconds and checks output/state each iteration. " +
             "Use Ctrl+Shift+B to manually background a running process. " +
             "Background job output is written to per-session log files. " +
             "Set backgroundAfter to auto-background after a specific number of seconds.",

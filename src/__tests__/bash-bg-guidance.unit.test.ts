@@ -15,6 +15,30 @@ type RegisteredTool = {
 };
 
 void describe("bash_bg decision-deadline guidance", () => {
+    void it("surfaces the blocked-sleep and safe wait/poll patterns in bash guidance", () => {
+        let bashTool: RegisteredTool | undefined;
+        const pi = {
+            registerTool(tool: RegisteredTool) {
+                if (tool.name === "bash") bashTool = tool;
+            },
+            registerCommand() {},
+            registerMessageRenderer() {},
+            registerToolPromptGuidelines() {},
+            createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+            on() {},
+            sendMessage() {},
+        } as never;
+        registerBackgroundJobs(pi, new TauState());
+        assert.ok(bashTool, "bash tool must be registered");
+
+        const guidance = bashTool.description ?? "";
+        assert.match(guidance, /waits of about 2 seconds or more/i);
+        assert.match(guidance, /leading sleep \(it is blocked\)/i);
+        assert.match(guidance, /bash_bg.*timeout.*never kills/i);
+        assert.match(guidance, /remindDelay.*auto-cancels/i);
+        assert.match(guidance, /loop.*under 2 seconds.*checks output\/state/i);
+    });
+
     void it("contains no kill semantics in schema or standing guidance", () => {
         let bashBg: RegisteredTool | undefined;
         const pi = {
