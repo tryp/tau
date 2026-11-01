@@ -8,10 +8,20 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+/**
+ * This detector only kills when a chain is stable and pipe-blocked with no
+ * peer; peer-alive wedges are reported, not reaped. Numeric signalling follows
+ * identity checks, but the TOCTOU window is bounded rather than eliminated:
+ * Node does not expose pidfd-bound signalling.
+ */
 export const ORPHAN_REAPER_METADATA_SUFFIX = ".owner.json";
 export const ORPHAN_REAPER_STATE_SUFFIX = ".reaper.json";
 export const ORPHAN_REAPER_DISABLE_ENV = "PI_TAU_DISABLE_ORPHAN_REAPER";
+export const ORPHAN_REAPER_ENABLE_ENV = "PI_TAU_ENABLE_ORPHAN_REAPER";
 export const ORPHAN_REAPER_DRY_RUN_ENV = "PI_TAU_ORPHAN_REAPER_DRY_RUN";
+export const ORPHAN_REAPER_MIN_INTERVAL_ENV =
+    "PI_TAU_ORPHAN_REAPER_MIN_INTERVAL_MS";
+export const ORPHAN_REAPER_MIN_INTERVAL_MS = 10 * 60 * 1000;
 export const ORPHAN_REAPER_MAX_PROCESSES_PER_SWEEP = 64;
 export const ORPHAN_REAPER_TERM_GRACE_MS = 2_000;
 
@@ -35,7 +45,9 @@ export interface ReaperProcReader {
     pids(): number[];
     identity(pid: number): ProcessIdentity | null;
     cpuTime(pid: number): number | null;
-    pipeBlockedWithoutPeer(pid: number): boolean | null;
+    pipeState(
+        pid: number
+    ): "not-blocked" | "blocked-no-peer" | "blocked-peer" | null;
     signal(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean;
     sleep(ms: number): Promise<void>;
     outputBytes(path: string): number | null;
@@ -53,6 +65,7 @@ export interface OrphanReaperOptions {
     disabled?: boolean;
     maxProcesses?: number;
     graceMs?: number;
+    minimumObservationIntervalMs?: number;
 }
 
 export interface OrphanReaperStats {
@@ -68,6 +81,10 @@ export interface OrphanReaperStats {
     killEscalated: number;
     wouldKill: string[];
     wouldKillOmitted: number;
+    intervalNotElapsed: number;
+    chainAbandoned: number;
+    stuckChainCount: number;
+    stuckChains: string[];
 }
 
 function processStartTicks(
@@ -141,11 +158,11 @@ const defaultReader: ReaperProcReader = {
             return null;
         }
     },
-    pipeBlockedWithoutPeer: (pid) => {
+    pipeState: (pid) => {
         try {
             const wchan = readFileSync(`/proc/${pid}/wchan`, "utf8").trim();
             if (!/pipe_(read|write|wait)|wait_for_partner/.test(wchan))
-                return false;
+                return "not-blocked";
             const syscall = readFileSync(`/proc/${pid}/syscall`, "utf8")
                 .trim()
                 .split(/\s+/);
@@ -170,13 +187,13 @@ const defaultReader: ReaperProcReader = {
                             readlinkSync(`/proc/${otherPid}/fd/${otherFd}`) ===
                             `pipe:[${inode}]`
                         )
-                            return false;
+                            return "blocked-peer";
                     } catch {
                         return null;
                     }
                 }
             }
-            return true;
+            return "blocked-no-peer";
         } catch {
             return null;
         }
@@ -341,6 +358,28 @@ function saveState(
     reader.rename(temp, path);
 }
 
+function signalVerifiedChain(
+    chain: ProcessIdentity[],
+    signal: "SIGTERM" | "SIGKILL",
+    currentBoot: string,
+    reader: ReaperProcReader
+): { sent: number; verified: boolean } {
+    // Verify the entire attributed tree before signalling any member. In
+    // particular, a recycled wrapper PID invalidates every descendant link.
+    for (const proc of chain) {
+        if (
+            proc.bootId !== currentBoot ||
+            !identityMatches(proc, reader.identity(proc.pid), currentBoot)
+        )
+            return { sent: 0, verified: false };
+    }
+    let sent = 0;
+    for (const proc of chain) {
+        if (reader.signal(proc.pid, signal)) sent++;
+    }
+    return { sent, verified: true };
+}
+
 export async function reapOrphanedTmuxProcesses(
     options: OrphanReaperOptions
 ): Promise<OrphanReaperStats> {
@@ -358,6 +397,10 @@ export async function reapOrphanedTmuxProcesses(
         killEscalated: 0,
         wouldKill: [],
         wouldKillOmitted: 0,
+        intervalNotElapsed: 0,
+        chainAbandoned: 0,
+        stuckChainCount: 0,
+        stuckChains: [],
     };
     if (options.disabled || process.env[ORPHAN_REAPER_DISABLE_ENV] === "1")
         return stats;
@@ -441,19 +484,40 @@ export async function reapOrphanedTmuxProcesses(
                 0
             );
             const previous = loadState(reader, statePath);
-            saveState(reader, statePath, bytes, cpuTime, Date.now());
+            const now = Date.now();
             if (!previous || previous.bytes !== bytes) {
+                saveState(reader, statePath, bytes, cpuTime, now);
                 stats.keptGrowing++;
                 continue;
             }
             if (previous.cpuTime !== cpuTime) {
+                saveState(reader, statePath, bytes, cpuTime, now);
                 stats.keptLive++;
                 continue;
             }
-            const pipeResults = chain.map((proc) =>
-                reader.pipeBlockedWithoutPeer(proc.pid)
+            const stableForMs = Math.max(0, now - previous.observedAt);
+            saveState(reader, statePath, bytes, cpuTime, previous.observedAt);
+            const configuredInterval = Number(
+                process.env[ORPHAN_REAPER_MIN_INTERVAL_ENV]
             );
-            if (!pipeResults.includes(true)) {
+            const minimumInterval =
+                options.minimumObservationIntervalMs ??
+                (Number.isFinite(configuredInterval) && configuredInterval >= 0
+                    ? configuredInterval
+                    : ORPHAN_REAPER_MIN_INTERVAL_MS);
+            if (stableForMs < minimumInterval) {
+                stats.intervalNotElapsed++;
+                continue;
+            }
+            const pipeResults = chain.map((proc) => reader.pipeState(proc.pid));
+            if (pipeResults.includes("blocked-peer")) {
+                stats.stuckChainCount++;
+                stats.stuckChains.push(
+                    `${runDir}:wrapper=${wrapper.pid}:chain=${chain.length}:stable-ms=${stableForMs}`
+                );
+                continue;
+            }
+            if (!pipeResults.includes("blocked-no-peer")) {
                 if (pipeResults.includes(null)) stats.keptUnverified++;
                 else stats.keptQuiet++;
                 continue;
@@ -461,7 +525,8 @@ export async function reapOrphanedTmuxProcesses(
             stats.orphaned++;
             if (
                 options.dryRun ||
-                process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1"
+                process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1" ||
+                process.env[ORPHAN_REAPER_ENABLE_ENV] !== "1"
             ) {
                 const target = `${runName}/${name}:wrapper=${wrapper.pid}`;
                 if (stats.wouldKill.length < 8) stats.wouldKill.push(target);
@@ -490,44 +555,50 @@ export async function reapOrphanedTmuxProcesses(
                 stats.keptUnverified++;
                 continue;
             }
-            let sent = 0;
-            for (const proc of chain) {
-                if (proc.bootId !== currentBoot) {
-                    stats.keptUnverified++;
-                    continue;
-                }
-                const check = reader.identity(proc.pid);
-                if (!identityMatches(proc, check, currentBoot)) {
-                    stats.keptUnverified++;
-                    continue;
-                }
-                if (reader.signal(proc.pid, "SIGTERM")) {
-                    sent++;
-                    killedThisSweep++;
-                } else stats.keptUnverified++;
+            const termResult = signalVerifiedChain(
+                chain,
+                "SIGTERM",
+                currentBoot,
+                reader
+            );
+            if (!termResult.verified) {
+                stats.chainAbandoned++;
+                stats.keptUnverified++;
+                continue;
             }
+            const sent = termResult.sent;
+            killedThisSweep += sent;
             if (sent === 0) {
                 stats.keptUnverified++;
                 continue;
             }
             await reader.sleep(options.graceMs ?? ORPHAN_REAPER_TERM_GRACE_MS);
-            let escalated = false;
-            for (const proc of chain) {
-                const check = reader.identity(proc.pid);
-                if (!identityMatches(proc, check, currentBoot)) {
-                    if (!reader.pids().includes(proc.pid)) stats.killed++;
-                    else stats.keptUnverified++;
-                    continue;
-                }
-                if (reader.signal(proc.pid, "SIGKILL")) {
-                    escalated = true;
-                    stats.killed++;
-                } else stats.keptUnverified++;
+            const killResult = signalVerifiedChain(
+                chain,
+                "SIGKILL",
+                currentBoot,
+                reader
+            );
+            if (!killResult.verified) {
+                stats.chainAbandoned++;
+                stats.keptUnverified++;
+                continue;
             }
-            if (escalated) stats.killEscalated++;
+            if (killResult.sent > 0) {
+                stats.killed += killResult.sent;
+                stats.killEscalated++;
+            } else stats.keptUnverified++;
         }
     }
     return stats;
+}
+
+export function startOrphanReaper(
+    options: OrphanReaperOptions,
+    onComplete: (stats: OrphanReaperStats) => void,
+    onError: (error: unknown) => void
+): void {
+    void reapOrphanedTmuxProcesses(options).then(onComplete).catch(onError);
 }
 
 export function formatOrphanReaperLog(
@@ -537,5 +608,5 @@ export function formatOrphanReaperLog(
     const targets = stats.wouldKill.length
         ? `${stats.wouldKill.join(",")}${stats.wouldKillOmitted ? `,+${stats.wouldKillOmitted}` : ""}`
         : "-";
-    return `[tau] tmux-orphan-reaper dry-run=${dryRun || process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1"} examined=${stats.examined} orphaned=${stats.orphaned} killed=${stats.killed} kept-live=${stats.keptLive} kept-finished=${stats.keptFinished} kept-growing=${stats.keptGrowing} kept-quiet=${stats.keptQuiet} kept-unverified=${stats.keptUnverified} skipped-boot-mismatch=${stats.skippedBootMismatch} kill-escalated=${stats.killEscalated} would-kill=${targets}`;
+    return `[tau] tmux-orphan-reaper dry-run=${dryRun || process.env[ORPHAN_REAPER_DRY_RUN_ENV] === "1" || process.env[ORPHAN_REAPER_ENABLE_ENV] !== "1"} examined=${stats.examined} orphaned=${stats.orphaned} killed=${stats.killed} kept-live=${stats.keptLive} kept-finished=${stats.keptFinished} kept-growing=${stats.keptGrowing} kept-quiet=${stats.keptQuiet} kept-unverified=${stats.keptUnverified} interval-not-elapsed=${stats.intervalNotElapsed} chain-abandoned=${stats.chainAbandoned} stuck-chains=${stats.stuckChainCount} stuck-findings=${stats.stuckChains.join(";") || "-"} skipped-boot-mismatch=${stats.skippedBootMismatch} kill-escalated=${stats.killEscalated} would-kill=${targets}`;
 }
