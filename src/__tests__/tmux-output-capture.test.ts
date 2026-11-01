@@ -53,6 +53,27 @@ void describe("createBashScript output capture", () => {
         );
     });
 
+    void it("records owner and wrapper boot-id/start-tick identity for orphan reaping", () => {
+        const paths = {
+            id: "owner-test",
+            outputFile: `${RUN_DIR}/${SESSION}.owner-test.out`,
+            exitCodeFile: `${RUN_DIR}/${SESSION}.owner-test.exit`,
+            owner: { pid: 123, ppid: 1, bootId: "boot-id", startTicks: "456" },
+        };
+        const { scriptPath } = createBashScript(
+            RUN_DIR,
+            SESSION,
+            "echo hello",
+            paths
+        );
+        const script = readFileSync(scriptPath, "utf-8");
+        assert.ok(script.includes('"pid":123'));
+        assert.ok(script.includes('"bootId":"boot-id"'));
+        assert.ok(script.includes("/proc/$$/stat"));
+        assert.ok(script.includes("/proc/sys/kernel/random/boot_id"));
+        assert.ok(script.includes(`${SESSION}.owner-test.owner.json`));
+    });
+
     void it("captures both stdout and stderr", () => {
         const paths = {
             id: "test-id",

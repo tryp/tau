@@ -17,6 +17,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
 import type { BackgroundJob, JobStatus, UiContext } from "../types.ts";
 import {
+    formatOrphanReaperLog,
+    reapOrphanedTmuxProcesses,
+    inspectRunDirWrapperLiveness,
+    type OrphanReaperStats,
+} from "./tmux-orphan-reaper.ts";
+import {
     createJobDonePromise,
     markJobTerminal,
     readOutputTail,
@@ -104,6 +110,8 @@ export interface StaleRunDirCleanupOptions {
     retentionMs?: number;
     /** tmux command runner; returns stdout, throws on failure. */
     runTmux?: (command: string) => string;
+    /** Probe for an active wrapper stored in a run directory. */
+    wrapperLiveness?: (dir: string) => ProcessLiveness;
 }
 
 type ProcessLiveness = "alive" | "dead" | "unknown";
@@ -255,6 +263,8 @@ export function cleanupStaleTmuxRunDirs(
     const isAlive = options.isAlive ?? processAlive;
     const retentionMs = options.retentionMs ?? resolveRunDirRetentionMs();
     const runTmux = options.runTmux ?? execTmux;
+    const wrapperLiveness =
+        options.wrapperLiveness ?? inspectRunDirWrapperLiveness;
 
     const stats: StaleRunDirCleanupStats = {
         examined: 0,
@@ -291,6 +301,15 @@ export function cleanupStaleTmuxRunDirs(
             continue; // uncertain identity is not proof of death
         }
         const dir = join(rootDir, entry);
+        const wrapperState = wrapperLiveness(dir);
+        if (wrapperState === "alive") {
+            stats.keptAlive++;
+            continue;
+        }
+        if (wrapperState === "unknown") {
+            stats.keptUnknown++;
+            continue;
+        }
         if (!isReapable(dir, nowMs, retentionMs)) continue;
         try {
             rmSync(dir, { recursive: true, force: true });
@@ -335,6 +354,8 @@ export function schedulePeriodicTmuxRunDirCleanup(
         log?: (line: string) => void;
         /** Test seam; production defaults to the Node test-runner detector. */
         isTestRunner?: boolean;
+        /** Orphan process-chain reaper; invoked before directory cleanup. */
+        reapOrphans?: () => Promise<OrphanReaperStats>;
     } = {}
 ): ReturnType<typeof setInterval> | undefined {
     if (options.isTestRunner ?? isNodeTestRunner()) return undefined;
@@ -342,11 +363,16 @@ export function schedulePeriodicTmuxRunDirCleanup(
     const intervalMs = options.intervalMs ?? TMUX_RUN_DIR_SWEEP_INTERVAL_MS;
     const cleanup = options.cleanup ?? cleanupStaleTmuxRunDirs;
     const log = options.log ?? ((line: string) => console.error(line));
+    const reapOrphans =
+        options.reapOrphans ??
+        (() => reapOrphanedTmuxProcesses({ rootDir: "/tmp" }));
     let inFlight = false;
     const timer = setInterval(() => {
         if (inFlight) return;
         inFlight = true;
         void Promise.resolve()
+            .then(() => reapOrphans())
+            .then((stats) => log(formatOrphanReaperLog(stats)))
             .then(() => cleanup())
             .then((stats) => log(formatTmuxRunDirSweepLog("periodic", stats)))
             .catch((error: unknown) => {
