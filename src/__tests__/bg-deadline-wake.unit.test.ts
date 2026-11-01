@@ -22,7 +22,7 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
     flushCompletionBatch,
     registerBackgroundJobs,
@@ -251,13 +251,28 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
     void it("termination request followed by a clean exit reports completed, not killed", async () => {
         const started = await h.bashBg.execute(
             "tc-4",
-            { command: "trap 'exit 0' TERM; while :; do sleep 1; done" },
+            {
+                command: "trap 'exit 0' TERM; echo READY; while :; do sleep 1; done",
+            },
             undefined,
             undefined,
             ctxFor()
         );
         const jobId = (started.details as JobResultDetails).jobId!;
         const job = h.state.backgroundJobs.get(jobId)!;
+        const readyDeadline = Date.now() + 3_000;
+        while (true) {
+            try {
+                if (readFileSync(job.logPath, "utf8").includes("READY")) break;
+            } catch {
+                // The child has not created its output log yet.
+            }
+            assert.ok(
+                Date.now() < readyDeadline,
+                "child did not install its TERM trap"
+            );
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
         // Let this case deliver the explicit signal; other tests keep the
         // process.kill spy to assert that the deadline itself never signals.
         killSpy?.mock.restore();

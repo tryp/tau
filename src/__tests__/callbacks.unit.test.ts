@@ -3,7 +3,7 @@
  * linked callback lifecycle, and completion notification flag.
  */
 
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -112,6 +112,24 @@ void describe("callback formatRelative", () => {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+const harnessCleanups: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+    for (const cleanup of harnessCleanups.splice(0)) await cleanup();
+});
+
+async function waitForCondition(
+    condition: () => boolean,
+    message: string,
+    timeoutMs = 1_000
+): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+        if (Date.now() >= deadline) throw new Error(message);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+}
+
 /** Create a minimal BackgroundJob for testing. */
 function makeJob(
     overrides: Partial<BackgroundJob> & { id: string }
@@ -185,7 +203,8 @@ function createCallbackHarness() {
         },
     };
 
-    return {
+    let sessionStarted = false;
+    const harness = {
         pi,
         ctx,
         sentUserMessages,
@@ -198,9 +217,17 @@ function createCallbackHarness() {
         async invoke(eventName: string, event: unknown = {}) {
             const handler = handlers.get(eventName);
             assert.ok(handler, `missing handler for ${eventName}`);
-            return await handler(event, ctx);
+            const result = await handler(event, ctx);
+            if (eventName === "session_start") sessionStarted = true;
+            if (eventName === "session_shutdown") sessionStarted = false;
+            return result;
+        },
+        async cleanup() {
+            if (sessionStarted) await harness.invoke("session_shutdown");
         },
     };
+    harnessCleanups.push(() => harness.cleanup());
+    return harness;
 }
 
 // ─── Callback delivery while agent is busy ───────────────────────────
@@ -230,7 +257,10 @@ void describe("callback delivery while agent is busy", () => {
         );
 
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await waitForCondition(
+            () => h.sentUserMessages.length === 1,
+            "callback was not delivered after agent_end"
+        );
 
         assert.equal(h.sentUserMessages.length, 1);
         assert.match(
@@ -261,7 +291,10 @@ void describe("callback delivery while agent is busy", () => {
         // that observes the next turn's busy state.
         await h.invoke("agent_end", { type: "agent_end", messages: [] });
         await h.invoke("agent_start", { type: "agent_start" });
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await waitForCondition(
+            () => h.sentUserMessages.length === 1,
+            "callback was not delivered before the chained agent_start"
+        );
 
         assert.equal(h.sentUserMessages.length, 1);
         assert.match(
@@ -297,7 +330,10 @@ void describe("callback delivery while agent is busy", () => {
                 null,
                 null
             );
-            await new Promise((resolve) => setTimeout(resolve, 20));
+            await waitForCondition(
+                () => h.sentUserMessages.length > 0,
+                "linked reminder did not fire"
+            );
             const delivered = h.sentUserMessages[0]?.content;
             const message =
                 typeof delivered === "string"
@@ -467,7 +503,10 @@ void describe("hasLinkedCallbacksForJob", () => {
         );
 
         // Wait for the timer to fire
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await waitForCondition(
+            () => !hasLinkedCallbacksForJob("job-1-1"),
+            "linked callback did not fire"
+        );
 
         // The callback has fired (cb.fired = true), so hasLinkedCallbacksForJob
         // should return false — this is the condition that led to silent
@@ -510,7 +549,10 @@ void describe("wantsCompletionNotification flag", () => {
         );
 
         // Wait for the timer to fire — fireCallback should set the flag
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await waitForCondition(
+            () => job.wantsCompletionNotification === true,
+            "linked callback did not fire"
+        );
 
         assert.equal(
             job.wantsCompletionNotification,

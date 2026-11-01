@@ -4,3 +4,4 @@ pnpm-lock.yaml
 .eslintcache
 bridge/debug.log
 tmp/
+.pi-subagents/
