@@ -63,6 +63,7 @@ export interface PipeObservation {
         truncated: boolean;
         bytesWritten: number;
         reason: "cap" | "epipe" | null;
+        tail: { bytes: number; dropped: number } | null;
     } | null;
     /** PIPESTATUS entries for each rewritten pipeline segment, when recorded. */
     pipelineExitLines?: string[];
@@ -158,13 +159,19 @@ export function pipeNoteSections(
             );
         }
         if (observed.stageZeroStatus?.truncated) {
-            const mib = (
-                observed.stageZeroStatus.bytesWritten /
-                (1024 * 1024)
-            ).toFixed(1);
-            noticeLines.push(
-                `Stage-0 capture truncated at ${mib} MiB (reason ${observed.stageZeroStatus.reason ?? "cap"}); only this captured prefix is available.`
-            );
+            const status = observed.stageZeroStatus;
+            if (status.tail) {
+                const headMiB = (status.bytesWritten / (1024 * 1024)).toFixed(1);
+                const tailMiB = (status.tail.bytes / (1024 * 1024)).toFixed(1);
+                noticeLines.push(
+                    `Stage-0 capture truncated: first ${headMiB} MiB at ${observed.pipeStageZero.path}, last ${tailMiB} MiB at ${observed.pipeStageZero.path}.tail (sed/grep it — the end of the output is often the useful part); ${status.tail.dropped} bytes in between are unavailable.`
+                );
+            } else {
+                const mib = (status.bytesWritten / (1024 * 1024)).toFixed(1);
+                noticeLines.push(
+                    `Stage-0 capture truncated at ${mib} MiB (reason ${status.reason ?? "cap"}); only this captured prefix is available.`
+                );
+            }
         }
     }
     noticeLines.push(...(observed.pipelineExitLines ?? []));
@@ -235,7 +242,7 @@ export function pipeNote(plan: PipePlan, observed: PipeObservation): string {
 export function bashGuidelines(): string[] {
     return [
         "Do not truncate a command's output with a shell pipe. A trailing `| tail -N`, `| head -N`, `| wc -l`, or `| grep -c` is removed before execution: output is captured up to the stage-0 byte cap (and indexed when available) while your result stays bounded to the N lines you asked for. A stage-0 truncation notice means only the captured prefix is available; do not assume the omitted suffix can be recovered.",
-        "The removal note tells you the captured line count and the err/warn mix over the captured output, and reports exit codes for each rewritten pipeline process when available. Read it before re-running anything. A truncated stage-0 capture is only a prefix, so its count and diagnostics do not describe the omitted suffix.",
+        "The removal note tells you the captured line count and the err/warn mix over the captured output, and reports exit codes for each rewritten pipeline process when available. Read it before re-running anything. When a stage-0 capture is truncated, the last output is available in its `.tail` file — inspect that instead of re-running just to see the end. A truncated stage-0 capture's count and diagnostics do not describe the omitted suffix.",
         "Filtering is fine and is left alone. `| grep pattern`, `| sed`, and `| awk` change which lines and what text the command produces, so they are NOT removed; they return a different answer, not more of the same one.",
         'To read more of an output you just produced, never re-run the command with a narrower pipe. If the removal note gave you a source id: context_search query:"..." source_id:"...", then context_get source_id:"..." chunk_id:"...", then context_export source_id:"...". If it gave you a file path, grep or sed that path.',
     ];

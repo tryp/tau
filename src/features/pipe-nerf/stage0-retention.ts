@@ -28,6 +28,7 @@ export interface Stage0SweepResult {
     filesVisited: number;
     complete: boolean;
     deletedPaths: string[];
+    removedSiblings: number;
 }
 
 interface IndexedEvidence {
@@ -181,6 +182,7 @@ export function sweepStage0Captures(
     const complete =
         listingComplete && currentPaths.every((path) => Boolean(state.files[path]));
     const deletedPaths: string[] = [];
+    let removedSiblings = 0;
     let observedBytes = Object.values(state.files).reduce(
         (total, file) => total + file.size,
         0
@@ -206,6 +208,14 @@ export function sweepStage0Captures(
                 } catch {
                     // Orphan metadata is harmless and never authorizes deletion.
                 }
+                for (const suffix of [".status.json", ".exits", ".tail"]) {
+                    try {
+                        unlinkSync(`${candidate.path}${suffix}`);
+                        removedSiblings++;
+                    } catch {
+                        // Exact siblings are auxiliary; absence is expected.
+                    }
+                }
                 observedBytes -= candidate.size;
                 delete state.files[candidate.path];
                 deletedPaths.push(candidate.path);
@@ -223,7 +233,7 @@ export function sweepStage0Captures(
         // unindexed content. A later pass can rebuild the inventory.
     }
 
-    return { observedBytes, filesVisited, complete, deletedPaths };
+    return { observedBytes, filesVisited, complete, deletedPaths, removedSiblings };
 }
 
 export function resolveStage0BudgetBytes(

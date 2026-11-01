@@ -101,10 +101,11 @@ function visibleSeverity(text: string): {
  * The retrieval lines for a sidecar source, in the same wording as
  * `sidecar.formatSidecarReceipt`, so the agent sees one consistent vocabulary.
  */
-function stageZeroStatus(path: string | undefined): {
+export function stageZeroStatus(path: string | undefined): {
     truncated: boolean;
     bytesWritten: number;
     reason: "cap" | "epipe" | null;
+    tail: { bytes: number; dropped: number } | null;
 } | null {
     if (!path) return null;
     try {
@@ -116,19 +117,40 @@ function stageZeroStatus(path: string | undefined): {
             truncated?: unknown;
             bytesWritten?: unknown;
             reason?: unknown;
+            tail?: unknown;
         };
         if (
             typeof status.truncated !== "boolean" ||
             !Number.isSafeInteger(status.bytesWritten) ||
+            (status.bytesWritten as number) < 0 ||
             (status.reason !== null &&
                 status.reason !== "cap" &&
-                status.reason !== "epipe")
+                status.reason !== "epipe") ||
+            (status.tail !== undefined &&
+                status.tail !== null &&
+                typeof status.tail !== "object")
         )
             return null;
+        let tail: { bytes: number; dropped: number } | null = null;
+        if (status.tail !== undefined && status.tail !== null) {
+            const candidate = status.tail as { bytes?: unknown; dropped?: unknown };
+            if (
+                !Number.isSafeInteger(candidate.bytes) ||
+                !Number.isSafeInteger(candidate.dropped) ||
+                (candidate.bytes as number) < 0 ||
+                (candidate.dropped as number) < 0
+            )
+                return null;
+            tail = {
+                bytes: candidate.bytes as number,
+                dropped: candidate.dropped as number,
+            };
+        }
         return {
             truncated: status.truncated,
             bytesWritten: status.bytesWritten as number,
             reason: status.reason,
+            tail,
         };
     } catch {
         return null;
@@ -372,7 +394,9 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                   ? ` Stage-0 file: ${capture.path}; inspect it with sed -n 'START,ENDp' or grep; it is subject to the stage-0 capture retention budget.`
                   : "";
             const truncated = status?.truncated
-                ? ` Stage-0 capture truncated at ${(status.bytesWritten / (1024 * 1024)).toFixed(1)} MiB (reason ${status.reason ?? "cap"}); only this captured prefix is available.`
+                ? status.tail
+                    ? ` Stage-0 capture truncated: first ${(status.bytesWritten / (1024 * 1024)).toFixed(1)} MiB at ${capture?.path}, last ${(status.tail.bytes / (1024 * 1024)).toFixed(1)} MiB at ${capture?.path}.tail (sed/grep it — the end of the output is often the useful part); ${status.tail.dropped} bytes in between are unavailable.`
+                    : ` Stage-0 capture truncated at ${(status.bytesWritten / (1024 * 1024)).toFixed(1)} MiB (reason ${status.reason ?? "cap"}); only this captured prefix is available.`
                 : "";
             return {
                 content: [

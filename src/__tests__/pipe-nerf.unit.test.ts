@@ -34,6 +34,7 @@ import {
     pipeNoteSections,
     planPipeNerf,
     registerPipeNerf,
+    stageZeroStatus,
     type PipeObservation,
     type PipePlan,
 } from "../features/pipe-nerf/index.ts";
@@ -620,6 +621,10 @@ void describe("pipe-nerf stage-0 retention", () => {
             utimesSync(newPath, 2, 2);
             markStage0CaptureIndexed(oldPath, "source-old", 1, dir);
             markStage0CaptureIndexed(newPath, "source-new", 2, dir);
+            for (const suffix of [".status.json", ".exits", ".tail"]) {
+                writeFileSync(`${oldPath}${suffix}`, "old auxiliary");
+                writeFileSync(`${newPath}${suffix}`, "new auxiliary");
+            }
             const result = sweepStage0Captures({
                 directories: [dir],
                 budgetBytes: 4,
@@ -627,6 +632,11 @@ void describe("pipe-nerf stage-0 retention", () => {
             assert.deepEqual(result.deletedPaths, [oldPath]);
             assert.equal(existsSync(oldPath), false);
             assert.equal(existsSync(newPath), true);
+            assert.equal(result.removedSiblings, 3);
+            for (const suffix of [".status.json", ".exits", ".tail"]) {
+                assert.equal(existsSync(`${oldPath}${suffix}`), false);
+                assert.equal(existsSync(`${newPath}${suffix}`), true);
+            }
             assert.equal(result.observedBytes, 4);
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -638,12 +648,19 @@ void describe("pipe-nerf stage-0 retention", () => {
         const unindexed = join(dir, "pi-pipe-stage0-unindexed.log");
         try {
             writeFileSync(unindexed, "too large");
+            for (const suffix of [".status.json", ".exits", ".tail"]) {
+                writeFileSync(`${unindexed}${suffix}`, "keep with capture");
+            }
             const result = sweepStage0Captures({
                 directories: [dir],
                 budgetBytes: 1,
             });
             assert.deepEqual(result.deletedPaths, []);
             assert.equal(existsSync(unindexed), true);
+            assert.equal(result.removedSiblings, 0);
+            for (const suffix of [".status.json", ".exits", ".tail"]) {
+                assert.equal(existsSync(`${unindexed}${suffix}`), true);
+            }
             assert.equal(result.observedBytes, 9);
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -758,6 +775,33 @@ void describe("pipe-nerf stage-0 capture", () => {
         assert.equal(p.stageZero?.path, PATH_0);
     });
 
+    void it("accepts v1 status without tail and rejects malformed tail status", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-status-"));
+        const capture = join(dir, "stage-zero.log");
+        try {
+            writeFileSync(`${capture}.status.json`, JSON.stringify({
+                truncated: true,
+                bytesWritten: 4096,
+                reason: "cap",
+            }));
+            assert.deepEqual(stageZeroStatus(capture), {
+                truncated: true,
+                bytesWritten: 4096,
+                reason: "cap",
+                tail: null,
+            });
+            writeFileSync(`${capture}.status.json`, JSON.stringify({
+                truncated: true,
+                bytesWritten: 4096,
+                reason: "cap",
+                tail: { bytes: "bad", dropped: 10 },
+            }));
+            assert.equal(stageZeroStatus(capture), null);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     void it("creates the cache directory on first capture use", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-cache-"));
         const capture = join(dir, "nested", "stage-zero.log");
@@ -782,8 +826,10 @@ void describe("pipe-nerf stage-0 capture", () => {
                     truncated: false,
                     bytesWritten: Buffer.byteLength("cache output\\n"),
                     reason: null,
+                    tail: null,
                 }
             );
+            assert.equal(existsSync(`${capture}.tail`), false);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -796,7 +842,9 @@ void describe("pipe-nerf stage-0 capture", () => {
             "../features/pipe-nerf/stage0-capture.mjs",
             import.meta.url
         );
-        const input = Buffer.alloc(1024 * 1024, 0x61);
+        const input = Buffer.from(
+            Array.from({ length: 1024 * 1024 }, (_, index) => index % 251)
+        );
         try {
             const result = spawnSync(
                 process.execPath,
@@ -816,9 +864,26 @@ void describe("pipe-nerf stage-0 capture", () => {
             );
             const status = JSON.parse(
                 readFileSync(`${capture}.status.json`, "utf8")
-            ) as { truncated: boolean; reason: string | null };
+            ) as {
+                truncated: boolean;
+                reason: string | null;
+                tail: { bytes: number; dropped: number } | null;
+            };
             assert.equal(status.truncated, true);
             assert.equal(status.reason, "cap");
+            assert.deepEqual(status.tail, {
+                bytes: 4096,
+                dropped:
+                    input.length -
+                    (4096 - Buffer.byteLength("\n[stage-0 capture truncated at byte cap]\n")) -
+                    4096,
+            });
+            assert.deepEqual(
+                readFileSync(`${capture}.tail`).subarray(
+                    Buffer.byteLength("[stage-0 tail capture: earlier bytes omitted]\n")
+                ),
+                input.subarray(-4096)
+            );
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -850,9 +915,61 @@ void describe("pipe-nerf stage-0 capture", () => {
             assert.ok(!result.error || !/ETIMEDOUT/.test(result.error.message));
             const status = JSON.parse(
                 readFileSync(`${capture}.status.json`, "utf8")
-            ) as { truncated: boolean; reason: string | null };
+            ) as {
+                truncated: boolean;
+                reason: string | null;
+                tail: { bytes: number; dropped: number } | null;
+            };
             assert.equal(status.truncated, true);
             assert.equal(status.reason, "epipe");
+            assert.equal(status.tail, null);
+            assert.equal(readFileSync(capture).length, 50 * 1024 * 1024);
+            assert.equal(existsSync(`${capture}.tail`), false);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("retains a rolling tail after EPIPE when the head cap is exceeded", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-epipe-tail-"));
+        const capture = join(dir, "stage-zero.log");
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        );
+        try {
+            const result = spawnSync(
+                "bash",
+                [
+                    "-c",
+                    `dd if=/dev/zero bs=1M count=10 status=none | ${JSON.stringify(process.execPath)} ${JSON.stringify(helper.pathname)} ${JSON.stringify(capture)} | head -c 1 >/dev/null`,
+                ],
+                {
+                    encoding: "utf8",
+                    timeout: 5000,
+                    env: {
+                        ...process.env,
+                        PI_TAU_STAGE0_MAX_BYTES: "4096",
+                    },
+                }
+            );
+            assert.ok(!result.error || !/ETIMEDOUT/.test(result.error.message));
+            const status = JSON.parse(
+                readFileSync(`${capture}.status.json`, "utf8")
+            ) as {
+                truncated: boolean;
+                reason: string | null;
+                tail: { bytes: number; dropped: number } | null;
+            };
+            assert.equal(status.reason, "epipe");
+            assert.ok(
+                readFileSync(capture)
+                    .toString()
+                    .endsWith("\n[stage-0 capture truncated at byte cap]\n")
+            );
+            assert.equal(status.tail?.bytes, 4096);
+            assert.ok((status.tail?.dropped ?? 0) > 0);
+            assert.ok(existsSync(`${capture}.tail`));
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
@@ -1295,6 +1412,10 @@ void describe("pipe-nerf note", () => {
                     truncated: true,
                     bytesWritten: 1024 * 1024,
                     reason: "cap",
+                    tail: {
+                        bytes: 2 * 1024 * 1024,
+                        dropped: 1024,
+                    },
                 },
                 pipelineExitLines: [
                     'Pipeline exits (segment 1): stage 1 "make test 2>&1"=0, stage 2 pipe-hoist capture=0, stage 3 "grep FAILED"=0.',
@@ -1316,13 +1437,34 @@ void describe("pipe-nerf note", () => {
         );
         assert.match(
             captured,
-            /Stage-0 capture truncated at 1\.0 MiB.*only this captured prefix/
+            /Stage-0 capture truncated: first 1\.0 MiB at .*last 2\.0 MiB at .*\.tail.*1024 bytes in between are unavailable/
         );
         assert.match(captured, /Pipeline exits \(segment 1\)/);
         assert.match(
             captured,
             /Inspect stage-0 with context_search\/context_get\/context_export/
         );
+    });
+
+    void it("uses the prefix-only truncation notice when no tail status is available", () => {
+        const captured = pipeNote(
+            plan("make test 2>&1 | grep FAILED | tail -10"),
+            observation({
+                pipeStageZero: {
+                    path: "/tmp/stage0-legacy.log",
+                    command: "make test 2>&1",
+                    sourceId: null,
+                },
+                stageZeroStatus: {
+                    truncated: true,
+                    bytesWritten: 4096,
+                    reason: "cap",
+                    tail: null,
+                },
+            })
+        );
+        assert.match(captured, /only this captured prefix is available/);
+        assert.doesNotMatch(captured, /\\.tail/);
     });
 
     void it("falls back to the path when the pre-filter capture is not indexed", () => {

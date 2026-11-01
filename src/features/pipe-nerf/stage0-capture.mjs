@@ -13,7 +13,11 @@ if (!path) process.exit(2);
 
 let fd;
 let size = 0;
+let totalBytes = 0;
+const tailChunks = [];
+let tailLength = 0;
 let truncated = false;
+let capTruncated = false;
 let reason;
 let stdoutClosed = false;
 process.stdout.on("error", (error) => {
@@ -47,7 +51,23 @@ async function writeStdout(chunk) {
 
 try {
     for await (const chunk of process.stdin) {
-        if (fd !== undefined && !stdoutClosed && size < cap) {
+        totalBytes += chunk.length;
+        if (chunk.length > 0) {
+            tailChunks.push(chunk);
+            tailLength += chunk.length;
+            while (tailLength > cap) {
+                const excess = tailLength - cap;
+                const first = tailChunks[0];
+                if (first.length <= excess) {
+                    tailChunks.shift();
+                    tailLength -= first.length;
+                } else {
+                    tailChunks[0] = first.subarray(excess);
+                    tailLength -= excess;
+                }
+            }
+        }
+        if (fd !== undefined && size < cap) {
             const remaining = Math.max(0, cap - marker.length - size);
             const keep = Math.min(remaining, chunk.length);
             if (keep > 0) {
@@ -56,11 +76,13 @@ try {
             }
             if (keep < chunk.length) {
                 truncated = true;
-                reason = "cap";
+                capTruncated = true;
+                if (reason !== "epipe") reason = "cap";
             }
-        } else if (fd !== undefined && !stdoutClosed && chunk.length > 0) {
+        } else if (fd !== undefined && chunk.length > 0) {
             truncated = true;
-            reason = "cap";
+            capTruncated = true;
+            if (reason !== "epipe") reason = "cap";
         }
         await writeStdout(chunk);
     }
@@ -74,17 +96,37 @@ try {
     }
 } finally {
     if (fd !== undefined) {
-        if (truncated && reason === "cap" && size + marker.length <= cap) {
+        if (capTruncated && size + marker.length <= cap) {
             fs.writeSync(fd, marker);
         }
         fs.closeSync(fd);
     }
+    let tail = null;
+    if (totalBytes > cap) {
+        const tailMarker = Buffer.from(
+            "[stage-0 tail capture: earlier bytes omitted]\n"
+        );
+        const tailBuffer = Buffer.concat(tailChunks, tailLength);
+        try {
+            fs.writeFileSync(`${path}.tail`, Buffer.concat([tailMarker, tailBuffer]));
+            tail = {
+                bytes: tailBuffer.length,
+                dropped: Math.max(0, totalBytes - size - tailBuffer.length),
+            };
+        } catch {
+            // Tail capture is auxiliary; the head remains authoritative.
+        }
+    }
     try {
-        fs.writeFileSync(`${path}.status.json`, JSON.stringify({
-            truncated,
-            bytesWritten: size,
-            reason: truncated ? reason ?? "cap" : null,
-        }));
+        fs.writeFileSync(
+            `${path}.status.json`,
+            JSON.stringify({
+                truncated,
+                bytesWritten: size,
+                reason: truncated ? reason ?? "cap" : null,
+                tail,
+            })
+        );
     } catch {
         // Status is auxiliary; the original command remains authoritative.
     }
