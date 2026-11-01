@@ -175,10 +175,25 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(job, state, pi as never, notificationContext());
         flushCompletionBatch();
 
-        assert.deepEqual(
-            appendedEntries.map((entry) => entry.data.event),
-            ["notify-called"],
-            "the suppressed/stale delivery still records the notify attempt"
+        const staleEvents = appendedEntries.map((entry) => entry.data);
+        assert.ok(staleEvents.some((data) => data.event === "notify-called"));
+        assert.ok(
+            staleEvents.some(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "cancelled"
+            )
+        );
+        assert.ok(
+            staleEvents.some(
+                (data) =>
+                    data.event === "stale-context-skipped" && data.count === 1
+            )
+        );
+        assert.equal(
+            staleEvents.some((data) => data.event === "queued"),
+            false,
+            "a stale host context must not be recorded as queued"
         );
         state.cancelCompletionBatchForJob?.(job.id);
         assert.deepEqual(
@@ -203,22 +218,15 @@ void describe("job completion regression coverage", () => {
             notificationContext()
         );
         flushCompletionBatch();
-        assert.deepEqual(
-            healthy.appendedEntries
-                .filter(
-                    (entry) =>
-                        entry.customType ===
-                            "background-completion-telemetry" &&
-                        entry.data.event !== "notify-called"
-                )
-                .map((entry) => ({
-                    event: entry.data.event,
-                    count: entry.data.count,
-                })),
-            [
-                { event: "stale-context-skipped", count: 1 },
-                { event: "queued", count: undefined },
-            ]
+        assert.ok(
+            healthy.appendedEntries.some(({ data }) => data.event === "queued")
+        );
+        assert.equal(
+            healthy.appendedEntries.some(
+                ({ data }) => data.event === "stale-context-skipped"
+            ),
+            false,
+            "the stale-send counter is persisted at the failed delivery attempt"
         );
     });
 
@@ -555,16 +563,23 @@ void describe("job completion regression coverage", () => {
                 0,
                 "known result must not be processed later"
             );
-            assert.deepEqual(
-                appendedEntries
-                    .filter(
-                        (entry) =>
-                            entry.customType ===
-                            "background-completion-telemetry"
-                    )
-                    .map((entry) => entry.data.event)
-                    .filter((event) => event !== "notify-called"),
-                ["queued", "cancelled"]
+            const completionEvents = appendedEntries
+                .filter(
+                    (entry) =>
+                        entry.customType === "background-completion-telemetry"
+                )
+                .map((entry) => entry.data);
+            assert.ok(completionEvents.some((data) => data.event === "queued"));
+            assert.ok(
+                completionEvents.some((data) => data.event === "cancelled")
+            );
+            assert.ok(
+                completionEvents.some(
+                    (data) =>
+                        data.event === "delivery-terminal" &&
+                        data.reason === "suppressed-acknowledged" &&
+                        data.jobId === job.id
+                )
             );
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -728,6 +743,8 @@ void describe("job completion regression coverage", () => {
         const job = makeJob({
             id: "job-stale-ack",
             status: "failed",
+            exitCode: 1,
+            outputConsumed: true,
             endTime: Date.now() - 10 * 60 * 1000,
         });
         state.backgroundJobs.set(job.id, job);
@@ -737,7 +754,12 @@ void describe("job completion regression coverage", () => {
         assert.equal(sentMessages.length, 0);
         assert.ok(
             appendedEntries.some(
-                ({ data }) => data.event === "suppressed-stale"
+                ({ data }) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "suppressed-acknowledged" &&
+                    data.status === "failed" &&
+                    data.exitCode === 1 &&
+                    data.jobId === job.id
             )
         );
     });
@@ -838,15 +860,22 @@ void describe("job completion regression coverage", () => {
                 sibling.id
             )
         );
-        assert.deepEqual(
-            appendedEntries
-                .filter(
-                    (entry) =>
-                        entry.customType === "background-completion-telemetry"
-                )
-                .map((entry) => entry.data.event)
-                .filter((event) => event !== "notify-called"),
-            ["queued", "cancel-miss"]
+        const queueTelemetry = appendedEntries
+            .filter(
+                (entry) =>
+                    entry.customType === "background-completion-telemetry"
+            )
+            .map((entry) => entry.data);
+        assert.ok(queueTelemetry.some((data) => data.event === "queued"));
+        assert.ok(queueTelemetry.some((data) => data.event === "cancel-miss"));
+        assert.equal(
+            queueTelemetry.filter(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered"
+            ).length,
+            2,
+            "the initial combined notice persists one delivered terminal record per job"
         );
         await invoke("agent_settled");
         await new Promise((resolve) => setTimeout(resolve, 0));

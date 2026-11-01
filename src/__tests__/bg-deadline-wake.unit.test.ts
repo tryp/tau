@@ -24,6 +24,7 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
+    clearAllCompletionBatches,
     flushCompletionBatch,
     registerBackgroundJobs,
 } from "../features/background.ts";
@@ -57,8 +58,13 @@ interface Harness {
     pi: never;
 }
 
+let harnessSequence = 0;
+
 function makeHarness(tmuxAvailable: boolean): Harness {
     const state = new TauState();
+    // Completion bookkeeping is module-global; give each harness distinct IDs
+    // so one test's job cannot alias another test's job after state reset.
+    state.jobCounter = ++harnessSequence * 1_000_000;
     state.tmuxAvailable = tmuxAvailable;
     let bashBg: Tool | undefined;
     let jobs: Tool | undefined;
@@ -132,6 +138,7 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
     });
 
     afterEach(() => {
+        clearAllCompletionBatches();
         mock.timers.reset();
         mock.restoreAll();
         killSpy = undefined;
@@ -252,7 +259,8 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         const started = await h.bashBg.execute(
             "tc-4",
             {
-                command: "trap 'exit 0' TERM; echo READY; while :; do sleep 1; done",
+                command:
+                    "trap 'exit 0' TERM; echo READY; while :; do sleep 1; done",
             },
             undefined,
             undefined,
@@ -435,7 +443,8 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         await job.outputIndexPromise;
         flushCompletionBatch();
         assert.equal(
-            h.sent.message.filter((m) => m.customType === "job-completion").length,
+            h.sent.message.filter((m) => m.customType === "job-completion")
+                .length,
             1
         );
         killGroup(job);
@@ -464,7 +473,8 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         await job.outputIndexPromise;
         flushCompletionBatch();
         assert.equal(
-            h.sent.message.filter((m) => m.customType === "job-completion").length,
+            h.sent.message.filter((m) => m.customType === "job-completion")
+                .length,
             0
         );
         killGroup(job);

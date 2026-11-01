@@ -182,6 +182,14 @@ export interface BackgroundJob {
     outputConsumed?: boolean;
     /** True once the normal completion notification has been queued. */
     completionNotified?: boolean;
+    /** Monotonic TauState job counter captured at creation; stable across restore. */
+    generation?: number;
+    /** Session which owns this job's completion identity. */
+    completionSessionId?: string;
+    /** Persisted marker that this job's completion was handed to the host queue. */
+    completionDeliveredAt?: number;
+    /** Monotonic notification attempt generation, persisted with job snapshots. */
+    completionNotificationGeneration?: number;
     /** True when notify:false suppresses both completion delivery and autonomous wake. */
     suppressAutonomousWake?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
