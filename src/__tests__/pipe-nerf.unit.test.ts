@@ -193,6 +193,28 @@ void describe("pipe-nerf parser", () => {
         assert.equal(findPipeInvocation("ls | wc -l")?.limit, null);
     });
 
+    void it("recognizes only the wc -l form its bounded view can reproduce", () => {
+        assert.equal(findPipeInvocation("seq 1 3 | wc -l")?.kind, "wc");
+        for (const args of ["-c", "-w", "-m", "", "-lc", "-cl", "-l file"]) {
+            const command = `seq 1 3 | wc${args ? ` ${args}` : ""}`;
+            assert.equal(findPipeInvocation(command), null, command);
+            assert.equal(plan(command).rewritten, command, command);
+        }
+    });
+
+    void it("does not treat byte-oriented head/tail as line limiters", () => {
+        for (const command of [
+            "printf data | head -c 2",
+            "printf data | head -c2",
+            "printf data | head --bytes=2",
+            "printf data | tail -c 2",
+            "printf data | tail --bytes 2",
+        ]) {
+            assert.equal(findPipeInvocation(command), null, command);
+            assert.equal(plan(command).rewritten, command, command);
+        }
+    });
+
     void it("reports a limiter in a trailing comment without calling it no-pipe", () => {
         const command = "printf output\n# | tail -5";
         const result = plan(command);
@@ -1752,6 +1774,36 @@ void describe("pipe-nerf registration", () => {
         assert.match(notice, /Captured 900 lines \(0 err, 1 warn\)/);
         assert.match(notice, /sed -n 'START,ENDp' \/tmp\/out\.log/);
         assert.doesNotMatch(notice, /re-running/);
+    });
+
+    void it("leaves wc -c untouched and preserves its actual output", () => {
+        const command = "echo hi | tee /dev/null | wc -c";
+        const { original, rewritten } = superset(command);
+        assert.equal(original, "3\n");
+        assert.equal(rewritten, original);
+
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        const input: { command: string } = { command };
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "wc-bytes",
+            input,
+        });
+        assert.equal(input.command, command);
+
+        const originalResult = {
+            content: [{ type: "text", text: original }],
+        };
+        assert.equal(
+            fire(handlers, "tool_result", {
+                toolName: "bash",
+                toolCallId: "wc-bytes",
+                ...originalResult,
+            }),
+            undefined
+        );
+        assert.equal(originalResult.content[0].text, "3\n");
     });
 
     void it("rewrites bash_bg too, which is where the log is the only record", () => {

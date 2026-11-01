@@ -256,6 +256,10 @@ const SED_RANGE_P_RE = /(\d+)\s*p/;
 // is not a limiter.
 const COUNT_SHORT_RE = /(?:^|\s)-[A-Za-z]*c(?:\s|$)/;
 const COUNT_LONG_RE = /(?:^|\s)--count(?:\s|=|$)/;
+// The view layer slices lines, so byte-count modes of head/tail cannot be
+// reconstructed from it and must remain in the shell.
+const BYTE_COUNT_RE =
+    /(?:^|\s)(?:--bytes(?:\s|=|$)|-[A-Za-z]*c[A-Za-z]*(?:\s|=|[+-]?\d|$))/;
 // `sed` selects lines only with `-n`; without it the `p` command duplicates
 // them, which does not bound output.
 const SED_AN_RE = /(?:^|\s)-[A-Za-z]*n(?:\s|$)/;
@@ -841,8 +845,12 @@ function stageBindsOutput(kind: LimiterKind, args: string): boolean {
     switch (kind) {
         case "tail":
         case "head":
+            return !BYTE_COUNT_RE.test(args);
         case "wc":
-            return true;
+            // The bounded view only reconstructs `wc -l`'s stdin result.
+            // Other options change the metric (`-c`, `-w`, `-m`) or the output
+            // shape; combined flags and operands are not modeled either.
+            return args.trim() === "-l";
         case "grep":
         case "rg":
             return COUNT_SHORT_RE.test(args) || COUNT_LONG_RE.test(args);
