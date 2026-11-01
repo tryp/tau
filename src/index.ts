@@ -101,7 +101,7 @@ import {
 } from "./features/bash-tmux.ts";
 import {
     formatOrphanReaperLog,
-    reapOrphanedTmuxProcesses,
+    startOrphanReaper,
 } from "./features/tmux-orphan-reaper.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -562,21 +562,23 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         // Long-lived sessions repeat this sweep hourly; test runners do not
         // create a background interval (the scheduler has its own guard).
         if (state.tmuxAvailable) {
-            void reapOrphanedTmuxProcesses({ rootDir: "/tmp" })
-                .then((stats) => {
+            startOrphanReaper(
+                { rootDir: "/tmp" },
+                (stats) => {
                     console.error(formatOrphanReaperLog(stats));
                     const cleanupStats = cleanupStaleTmuxRunDirs();
                     console.error(
                         formatTmuxRunDirSweepLog("startup", cleanupStats)
                     );
-                })
-                .catch((error: unknown) => {
+                },
+                (error: unknown) => {
                     const detail =
                         error instanceof Error ? error.message : String(error);
                     console.error(
                         `[tau] tmux-orphan-reaper error=${JSON.stringify(detail)}`
                     );
-                });
+                }
+            );
             if (!tmuxRunDirSweepTimer) {
                 tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup();
             }
