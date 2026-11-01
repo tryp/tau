@@ -13,7 +13,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -599,10 +599,55 @@ void describe("pipe-nerf stage-0 capture", () => {
         const p = planPipeNerf("seq 1 60 | grep -E '1|3' | tail -3", {
             stageZeroPath: PATH_0,
         });
-        assert.equal(p.rewritten, `seq 1 60 | tee ${PATH_0} | grep -E '1|3'`);
+        assert.match(p.rewritten, /seq 1 60 \| .*stage0-capture\.mjs.* \| grep -E '1\|3'/);
         assert.ok(p.stageZero);
         assert.equal(p.stageZero?.command, "seq 1 60");
         assert.equal(p.stageZero?.path, PATH_0);
+    });
+
+    void it("caps stage-0 disk bytes while forwarding the complete pipeline stream", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-cap-"));
+        const capture = join(dir, "stage-zero.log");
+        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        const input = Buffer.alloc(1024 * 1024, 0x61);
+        try {
+            const result = spawnSync(process.execPath, [helper.pathname, capture], {
+                input,
+                env: { ...process.env, PI_TAU_STAGE0_MAX_BYTES: "4096" },
+            });
+            assert.equal(result.status, 0);
+            assert.equal(result.stdout.length, input.length);
+            const saved = readFileSync(capture);
+            assert.ok(saved.length <= 4096);
+            assert.match(saved.toString(), /\[stage-0 capture truncated at byte cap\]/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("bounds a self-reading stage-0 feedback loop", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-feedback-"));
+        const capture = join(dir, "stage-zero.log");
+        writeFileSync(capture, "");
+        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+        const producer = `import os,sys\np=${JSON.stringify(capture)}\nwhile os.path.getsize(p) < 4000:\n data=open(p,'rb').read()\n sys.stdout.buffer.write(data or b'seed\\n')`;
+        try {
+            const output = execFileSync(
+                "bash",
+                ["-c", `python3 -c ${quote(producer)} | ${quote(process.execPath)} ${quote(helper.pathname)} ${quote(capture)} | wc -c`],
+                {
+                    encoding: "utf8",
+                    env: { ...process.env, PI_TAU_STAGE0_MAX_BYTES: "4096" },
+                }
+            );
+            const saved = readFileSync(capture);
+            assert.ok(Number(output.trim()) > 0);
+            assert.ok(saved.length <= 4096);
+            assert.match(saved.toString(), /\[stage-0 capture truncated at byte cap\]/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     void it("does NOT tee when removing the limiter already leaves one command", () => {
@@ -991,7 +1036,8 @@ void describe("pipe-nerf note", () => {
             /Stage-0 contains the inputs for captured pipeline segments/
         );
         assert.match(captured, /sed -n 'START,ENDp' \/tmp\/pi-bg-job\.log/);
-        assert.doesNotMatch(captured, /pre-filter:|re-filter/);
+        assert.match(captured, /Pre-filter stage-0 capture: context source "ctx_bg_stage0"/);
+        assert.match(captured, /default 64 MiB.*end marker means that capture was truncated/);
     });
 
     void it("falls back to the path when the pre-filter capture is not indexed", () => {
@@ -1006,7 +1052,8 @@ void describe("pipe-nerf note", () => {
             })
         );
         assert.match(captured, /No retrieval handle is available/);
-        assert.doesNotMatch(captured, /pi-pipe-stage0|re-filter/);
+        assert.match(captured, /Pre-filter stage-0 capture: file \/home\/dev\/tmp\/pi-pipe-stage0-call_00_y\.log/);
+        assert.match(captured, /default 64 MiB.*end marker means that capture was truncated/);
     });
 
     void it("offers the log path on the sidecar route too", () => {

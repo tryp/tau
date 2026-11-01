@@ -44,6 +44,16 @@
  * willing to rewrite it are separate decisions.
  */
 
+import { fileURLToPath } from "node:url";
+
+const stageZeroCaptureScript = fileURLToPath(
+    new URL("./stage0-capture.mjs", import.meta.url)
+);
+
+function stageZeroCaptureCommand(path: string): string {
+    return `${JSON.stringify(process.execPath)} ${JSON.stringify(stageZeroCaptureScript)} ${JSON.stringify(path)}`;
+}
+
 /** A filter stage that bounds how much output reaches the tool. */
 export type LimiterKind =
     | "tail"
@@ -868,8 +878,7 @@ export function planPipeNerf(
                 const after = segment.text
                     .slice(pipeAt + 1)
                     .replace(/^\s+/, "");
-                const teePath = JSON.stringify(options.stageZeroPath);
-                const text = `${before} | tee -a ${teePath} | ${after}`;
+                const text = `${before} | ${stageZeroCaptureCommand(options.stageZeroPath!)} | ${after}`;
                 if (firstOperatorAt === null) {
                     firstOperatorAt = currentOffset + pipeAt;
                 }
@@ -1043,13 +1052,10 @@ export function planPipeNerf(
     const final = stageZero
         ? [
               rewritten.slice(0, stageZero.operatorAt).replace(/\s+$/, ""),
-              "| tee",
-              stageZero.path,
+              `| ${stageZeroCaptureCommand(stageZero.path)}`,
               "|",
               rewritten.slice(stageZero.operatorAt + 1).replace(/^\s+/, ""),
-          ]
-              .join(" ")
-              .replace(/\s*\|\s*(\|\s+tee)/, "|$1")
+          ].join(" ")
         : rewritten;
 
     return {

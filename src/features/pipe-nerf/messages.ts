@@ -135,6 +135,14 @@ export function pipeNoteSections(
     const receipt = `Effective command: ${JSON.stringify(preview(plan.rewritten))}.`;
     const noticeLines: string[] = [];
     if (observed.caveat) noticeLines.push(`View caveat: ${observed.caveat}`);
+    if (observed.pipeStageZero) {
+        const captureHandle = observed.pipeStageZero.sourceId
+            ? `context source ${JSON.stringify(observed.pipeStageZero.sourceId)}`
+            : `file ${observed.pipeStageZero.path}`;
+        noticeLines.push(
+            `Pre-filter stage-0 capture: ${captureHandle}. It is capped by PI_TAU_STAGE0_MAX_BYTES (default 64 MiB); an end marker means that capture was truncated.`
+        );
+    }
     // A handle, not a size. "Retained" means retrievable somewhere the agent can
     // reach; zero lines is the one capture not worth indexing, and is excluded
     // here so it is not mistaken for retained-but-hidden output.

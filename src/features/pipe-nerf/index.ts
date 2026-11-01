@@ -276,7 +276,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 )
                 .join("; ");
             const captureDescription = captureSegments
-                ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}.`
+                ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}. Each stage-0 capture is capped by PI_TAU_STAGE0_MAX_BYTES (default 64 MiB); an end marker means the capture was truncated.`
                 : "";
             const retrieval = capture?.sourceId
                 ? ` It is indexed as ${JSON.stringify(capture.sourceId)}.`
