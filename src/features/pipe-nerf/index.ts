@@ -389,7 +389,7 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
                 ? ` Stage-0 contains the inputs for captured pipeline segments, concatenated in order; the call segments are: ${captureSegments}.`
                 : "";
             const retrieval = capture?.sourceId
-                ? ` Stage-0 is indexed as ${JSON.stringify(capture.sourceId)}; inspect with context_search query:"pattern" source_id:${JSON.stringify(capture.sourceId)}, then context_get or context_export.`
+                ? ` Stage-0 is indexed as ${JSON.stringify(capture.sourceId)}${status?.truncated ? ` (capture truncated: reason ${status.reason ?? "cap"})` : ""}; inspect with context_search query:"pattern" source_id:${JSON.stringify(capture.sourceId)}, then context_get or context_export.`
                 : capture?.path
                   ? ` Stage-0 file: ${capture.path}; inspect it with sed -n 'START,ENDp' or grep; it is subject to the stage-0 capture retention budget.`
                   : "";

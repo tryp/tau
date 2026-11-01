@@ -9,7 +9,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
@@ -617,6 +617,8 @@ async function tryIndexViaExternalApi(
 export interface SidecarIndexOptions {
     classify?: (text: string) => LogCounts;
     useExternalApi?: boolean;
+    /** Override log reads for deterministic transient-I/O tests. */
+    readLog?: (path: string) => Promise<string>;
     /**
      * Index this output even when it is under the ordinary inline threshold.
      *
@@ -1051,13 +1053,34 @@ export async function indexJobOutputWithOutcome(
     options: SidecarIndexOptions = {}
 ): Promise<SidecarIndexOutcome> {
     sidecarIndexStats.attempts += 1;
-    let text: string;
-    try {
-        text = await readFile(job.logPath, "utf-8");
-    } catch (error) {
+    let text: string | undefined;
+    let readError: unknown;
+    let readRetryCount = 0;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            text = await (
+                options.readLog ?? ((path) => readFile(path, "utf-8"))
+            )(job.logPath);
+            readError = undefined;
+            break;
+        } catch (error) {
+            readError = error;
+            if (attempt === 0) {
+                readRetryCount += 1;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+        }
+    }
+    if (readError !== undefined || text === undefined) {
         const errorMessage =
-            error instanceof Error ? error.message : String(error);
-        const errorCode = getSqliteErrorCode(error);
+            readError instanceof Error ? readError.message : String(readError);
+        const errorCode = getSqliteErrorCode(readError);
+        let expectedSizeBytes: number | null = null;
+        try {
+            expectedSizeBytes = (await stat(job.logPath)).size;
+        } catch {
+            // Unknown when the path is gone or metadata itself is inaccessible.
+        }
         const outcome: SidecarIndexOutcome = {
             status: "failed",
             eligible: false,
@@ -1065,8 +1088,23 @@ export async function indexJobOutputWithOutcome(
             errorCategory: "io",
             errorMessage,
             ...(errorCode !== undefined ? { errorCode } : {}),
+            retryCount: readRetryCount,
         };
         sidecarIndexStats.failed += 1;
+        try {
+            ctx.appendEntry?.("sidecar-index-failure", {
+                jobId: job.id,
+                reason: "read_failed",
+                category: "io",
+                errno: errorCode,
+                errorMessage,
+                logPath: job.logPath,
+                expectedSizeBytes,
+                retryCount: readRetryCount,
+            });
+        } catch {
+            // Diagnostic persistence must not replace the completed job result.
+        }
         return outcome;
     }
 
@@ -1153,7 +1191,7 @@ export async function indexJobOutputWithOutcome(
             eligible: true,
             reason: "schema_unavailable",
             errorCategory: "schema",
-            retryCount,
+            retryCount: retryCount + readRetryCount,
             waitMs,
         };
         sidecarIndexStats.skipped += 1;
@@ -1173,7 +1211,7 @@ export async function indexJobOutputWithOutcome(
             status: "indexed",
             eligible: true,
             source,
-            retryCount,
+            retryCount: retryCount + readRetryCount,
             waitMs,
         };
         sidecarIndexStats.indexed += 1;

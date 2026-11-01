@@ -541,28 +541,78 @@ void describe("indexJobOutputInSidecar", () => {
         });
     });
 
-    void it("classifies unreadable output as a non-eligible failure", async () => {
-        const job = testJob({
-            id: "job-read-failed",
-            logPath: join(tmpDir, "missing-output.log"),
-        });
-        const outcome = await indexJobOutputWithOutcome(job, {});
+    void it("persists errno, path, expected size, and job id after bounded read retries fail", async () => {
+        const logPath = writeLog("expected output");
+        const entries: { type: string; data: Record<string, unknown> }[] = [];
+        const job = testJob({ id: "job-read-failed", logPath });
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            {
+                appendEntry: (type, data) =>
+                    entries.push({
+                        type,
+                        data: data as Record<string, unknown>,
+                    }),
+            },
+            "bash_bg",
+            {
+                readLog: async () => {
+                    const error = Object.assign(
+                        new Error("permission denied"),
+                        { code: "EACCES" }
+                    );
+                    throw error;
+                },
+            }
+        );
         assert.equal(outcome.status, "failed");
         assert.equal(outcome.eligible, false);
         assert.equal(outcome.reason, "read_failed");
         assert.equal(outcome.errorCategory, "io");
-        assert.match(outcome.errorMessage ?? "", /missing-output\.log/);
-        assert.deepEqual(getSidecarIndexStats(), {
-            attempts: 1,
-            eligible: 0,
-            indexed: 0,
-            skipped: 0,
-            failed: 1,
-            emptySkipped: 0,
-            unavailableSkipped: 0,
-            schemaSkipped: 0,
-            staleSessionIdentity: 0,
-        });
+        assert.equal(outcome.errorCode, "EACCES");
+        assert.equal(outcome.retryCount, 1);
+        assert.match(outcome.errorMessage ?? "", /permission denied/);
+        assert.equal(getSidecarIndexStats().failed, 1);
+        assert.deepEqual(entries, [
+            {
+                type: "sidecar-index-failure",
+                data: {
+                    jobId: "job-read-failed",
+                    reason: "read_failed",
+                    category: "io",
+                    errno: "EACCES",
+                    errorMessage: "permission denied",
+                    logPath,
+                    expectedSizeBytes: Buffer.byteLength("expected output"),
+                    retryCount: 1,
+                },
+            },
+        ]);
+    });
+
+    void it("retries one transient log-read failure and indexes the output", async () => {
+        createDb(tmpDir);
+        let reads = 0;
+        const outcome = await indexJobOutputWithOutcome(
+            testJob({ id: "job-read-retry", logPath: writeLog("ignored") }),
+            {},
+            "bash_bg",
+            {
+                readLog: async () => {
+                    reads += 1;
+                    if (reads === 1) {
+                        throw Object.assign(new Error("transient"), {
+                            code: "ESTALE",
+                        });
+                    }
+                    return "recovered output";
+                },
+            }
+        );
+        assert.equal(reads, 2);
+        assert.equal(outcome.status, "indexed");
+        assert.equal(outcome.retryCount, 1);
+        assert.ok(outcome.source?.sourceId);
     });
 
     void it("keeps the legacy source-only API compatible", async () => {

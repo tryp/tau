@@ -1950,6 +1950,51 @@ void describe("pipe-nerf registration", () => {
         assert.doesNotMatch(result.content[1].text, /1\n2/);
     });
 
+    void it("names the truncation reason in an indexed stage-0 reference", () => {
+        const dir = mkdtempSync(
+            join(tmpdir(), "tau-stage0-indexed-truncated-")
+        );
+        const capturePath = join(dir, "capture.log");
+        writeFileSync(
+            `${capturePath}.status.json`,
+            JSON.stringify({
+                truncated: true,
+                bytesWritten: 1024,
+                reason: "epipe",
+            })
+        );
+        try {
+            const { pi, handlers } = fakePi();
+            registerPipeNerf(pi as never);
+            fire(handlers, "tool_call", {
+                toolName: "bash",
+                toolCallId: "truncated-indexed",
+                input: {
+                    command: "seq 1 10 | tail -2; echo ===; seq 1 10 | wc -l",
+                },
+            });
+            const result = fire(handlers, "tool_result", {
+                toolName: "bash",
+                toolCallId: "truncated-indexed",
+                content: [{ type: "text", text: "9\\n10\\n===\\n10" }],
+                details: {
+                    truncation: { truncated: false, totalLines: 2 },
+                    pipeStageZero: {
+                        path: capturePath,
+                        command: "seq 1 10",
+                        sourceId: "ctx_truncated_stage_zero",
+                    },
+                },
+            }) as { content: { type: string; text: string }[] };
+            assert.match(
+                result.content[0].text,
+                /Stage-0 is indexed as "ctx_truncated_stage_zero" \(capture truncated: reason epipe\)/
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     void it("returns the bounded view, not the whole capture", () => {
         // The load-bearing property: hoisting the filter out of shell execution
         // must preserve the bound. Returning the full capture here is the exact
