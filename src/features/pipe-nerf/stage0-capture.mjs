@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import pathModule from "node:path";
 
 const path = process.argv[2];
 const marker = Buffer.from("\n[stage-0 capture truncated at byte cap]\n");
@@ -14,6 +15,7 @@ let fd;
 let size = 0;
 let truncated = false;
 try {
+    fs.mkdirSync(pathModule.dirname(path), { recursive: true });
     fd = fs.openSync(path, "a");
     size = fs.fstatSync(fd).size;
 } catch {

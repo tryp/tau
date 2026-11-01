@@ -25,8 +25,7 @@ import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
 import { formatSidecarReceipt } from "../sidecar.ts";
 import { bashGuidelines, pipeNoteSections } from "./messages.ts";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { stageZeroPathFor } from "./stage0-path.ts";
 import { applyLimiter, planPipeNerf } from "./parse.ts";
 import type { LimiterView, PipeInvocation } from "./parse.ts";
 import type { PipePlan } from "./parse.ts";
@@ -65,12 +64,6 @@ type PiWithOptionalGuidelines = ExtensionAPI & {
 };
 
 /** The tools this hook rewrites. `bash_bg` is included deliberately. */
-/** Home of the auxiliary stage captures, beside every other job log. */
-function stageZeroPathFor(toolCallId: string): string {
-    const bare = toolCallId.replace(/[^A-Za-z0-9_-]/g, "");
-    return join(homedir(), "tmp", `pi-pipe-stage0-${bare}.log`);
-}
-
 const HOOKED_TOOLS = new Set(["bash", "bash_bg"]);
 
 interface BashInput {

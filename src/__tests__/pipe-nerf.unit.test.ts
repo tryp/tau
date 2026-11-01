@@ -36,6 +36,7 @@ import {
 } from "../features/features-registry.ts";
 import { classifyLine, countLines } from "../features/log-classify.ts";
 import type { TauState } from "../state.ts";
+import { stageZeroDirectory, stageZeroPathFor } from "../features/pipe-nerf/stage0-path.ts";
 
 interface CorpusExpected {
     kind: string;
@@ -592,6 +593,18 @@ void describe("pipe-nerf compound pipelines", () => {
 void describe("pipe-nerf stage-0 capture", () => {
     const PATH_0 = "/tmp/stage0-test.log";
 
+    void it("uses the XDG cache directory, with a hidden home-cache fallback", () => {
+        assert.equal(
+            stageZeroDirectory({ XDG_CACHE_HOME: "/cache" } as NodeJS.ProcessEnv, "/home/test"),
+            "/cache/pi-tau/stage0"
+        );
+        assert.equal(
+            stageZeroDirectory({} as NodeJS.ProcessEnv, "/home/test"),
+            "/home/test/.cache/pi-tau/stage0"
+        );
+        assert.equal(stageZeroPathFor("call/1", "/cache/pi-tau/stage0"), "/cache/pi-tau/stage0/pi-pipe-stage0-call1.log");
+    });
+
     void it("tees stage 0 when the command still filters after the limiter", () => {
         // The point: the result is filtered, so a re-grep has to run against the
         // pre-filter output rather than a fresh execution. `tee` is the standard
@@ -603,6 +616,22 @@ void describe("pipe-nerf stage-0 capture", () => {
         assert.ok(p.stageZero);
         assert.equal(p.stageZero?.command, "seq 1 60");
         assert.equal(p.stageZero?.path, PATH_0);
+    });
+
+    void it("creates the cache directory on first capture use", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-cache-"));
+        const capture = join(dir, "nested", "stage-zero.log");
+        const helper = new URL("../features/pipe-nerf/stage0-capture.mjs", import.meta.url);
+        try {
+            const result = spawnSync(process.execPath, [helper.pathname, capture], {
+                input: "cache output\\n",
+                encoding: "utf8",
+            });
+            assert.equal(result.status, 0, result.stderr);
+            assert.equal(readFileSync(capture, "utf8"), "cache output\\n");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     void it("caps stage-0 disk bytes while forwarding the complete pipeline stream", () => {
@@ -1021,7 +1050,7 @@ void describe("pipe-nerf note", () => {
                 fullOutputPath: "/tmp/pi-bg-job.log",
                 sourceId: "ctx_bg_post",
                 pipeStageZero: {
-                    path: "/home/dev/tmp/pi-pipe-stage0-call_00_x.log",
+                    path: "/home/dev/.cache/pi-tau/stage0/pi-pipe-stage0-call_00_x.log",
                     command: "make test 2>&1",
                     sourceId: "ctx_bg_stage0",
                 },
@@ -1045,14 +1074,14 @@ void describe("pipe-nerf note", () => {
             plan("make test 2>&1 | grep FAILED | tail -10"),
             observation({
                 pipeStageZero: {
-                    path: "/home/dev/tmp/pi-pipe-stage0-call_00_y.log",
+                    path: "/home/dev/.cache/pi-tau/stage0/pi-pipe-stage0-call_00_y.log",
                     command: "make test 2>&1",
                     sourceId: null,
                 },
             })
         );
         assert.match(captured, /No retrieval handle is available/);
-        assert.match(captured, /Pre-filter stage-0 capture: file \/home\/dev\/tmp\/pi-pipe-stage0-call_00_y\.log/);
+        assert.match(captured, /Pre-filter stage-0 capture: file \/home\/dev\/\.cache\/pi-tau\/stage0\/pi-pipe-stage0-call_00_y\.log/);
         assert.match(captured, /default 64 MiB.*end marker means that capture was truncated/);
     });
 
