@@ -196,7 +196,10 @@ const BROWSER_PARAM = StringEnum(
             "Browser mode: 'bridge' (Chrome extension, no prompts), " +
             "'isolated' (fresh headless Chromium, default), " +
             "'cdp' (user's Chrome via DevTools Protocol — requires approval-mode or --remote-debugging-port), " +
-            "'applescript' (read-only access to user's Chrome tabs on macOS — no setup required)",
+            "'applescript' (read-only access to user's Chrome tabs on macOS — no setup required). " +
+            "Prefer bridge for extension-backed Chrome, isolated for a fresh browser, cdp for open Chrome tabs, " +
+            "and applescript only for read-only macOS tabs. Fallback order: read bridge→cdp→applescript→isolated; " +
+            "write bridge→cdp→isolated; list bridge→cdp→applescript.",
         default: "isolated",
     }
 );
