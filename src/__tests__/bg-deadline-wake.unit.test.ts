@@ -24,6 +24,7 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
+    clearAllCompletionBatches,
     flushCompletionBatch,
     registerBackgroundJobs,
 } from "../features/background.ts";
@@ -132,6 +133,7 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
     });
 
     afterEach(() => {
+        clearAllCompletionBatches();
         mock.timers.reset();
         mock.restoreAll();
         killSpy = undefined;

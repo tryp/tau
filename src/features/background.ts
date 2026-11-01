@@ -1096,7 +1096,20 @@ export function restoreBackgroundJobs(
                   stableGeneration
               )
             : undefined;
-        if (stableIdentity && deliveredCompletionIdentities.has(stableIdentity)) {
+        const attemptIdentity =
+            stableIdentity &&
+            typeof jobData.completionNotificationGeneration === "number"
+                ? JSON.stringify([
+                      jobData.completionSessionId,
+                      jobData.id,
+                      stableGeneration,
+                      jobData.completionNotificationGeneration,
+                  ])
+                : stableIdentity;
+        if (
+            attemptIdentity &&
+            deliveredCompletionIdentities.has(attemptIdentity)
+        ) {
             jobData.completionDeliveredAt ??= Date.now();
         }
         if (jobData.status === "running") {
@@ -1752,17 +1765,19 @@ function nextCompletionQueueKey(): string {
     return `tau:bg:completion:${completionDeliveryInstance}:${++completionDeliverySequence}`;
 }
 
-/** Stable generation is the persisted per-session job counter (also in job.id). */
+/** Stable generation is persisted on first observation when legacy jobs lack it. */
+let fallbackJobGenerationCounter = 0;
 function stableJobGeneration(job: BackgroundJob): number {
     if (Number.isSafeInteger(job.generation) && job.generation! >= 0) {
         return job.generation!;
     }
-    const match = /-([0-9]+)$/.exec(job.id);
-    const parsed = match ? Number(match[1]) : undefined;
-    const generation =
-        parsed !== undefined && Number.isSafeInteger(parsed)
-            ? parsed
-            : Math.max(0, Math.trunc(job.startTime));
+    // The visible id counter can restart with TauState and two independently
+    // restored/test-created jobs can share an id. A timestamp-derived sequence
+    // is persisted on the job snapshot, so event identity remains stable.
+    const generation = Math.max(
+        0,
+        Math.trunc(job.startTime * 1_000) + ++fallbackJobGenerationCounter
+    );
     job.generation = generation;
     return generation;
 }
@@ -1776,7 +1791,7 @@ function resolveCompletionSessionId(
 ): string {
     if (job.completionSessionId) return job.completionSessionId;
     try {
-        const sessionId = ctx.sessionManager.getSessionId();
+        const sessionId = ctx.sessionManager?.getSessionId?.();
         if (typeof sessionId === "string" && sessionId.length > 0) {
             job.completionSessionId = sessionId;
             return sessionId;
@@ -1801,6 +1816,15 @@ function stableCompletionIdentity(
     generation: number
 ): string {
     return JSON.stringify([sessionId, jobId, generation]);
+}
+
+function completionAttemptIdentity(item: CompletionBatchItem): string {
+    return JSON.stringify([
+        item.sessionId,
+        item.job.id,
+        item.jobGeneration,
+        item.generation,
+    ]);
 }
 
 const deliveredCompletionIdentities = new Set<string>();
@@ -1835,10 +1859,28 @@ function restoreCompletionDeliveryMarkers(
             data.jobId,
             data.jobGeneration
         );
-        if (data.event === "delivered-to-agent") {
-            deliveredCompletionIdentities.add(identity);
-        } else if (data.event === "delivery-cancelled") {
-            deliveredCompletionIdentities.delete(identity);
+        const notificationGeneration =
+            typeof data.generation === "number" ? data.generation : undefined;
+        const attemptIdentity =
+            notificationGeneration === undefined
+                ? identity
+                : JSON.stringify([
+                      data.sessionId,
+                      data.jobId,
+                      data.jobGeneration,
+                      notificationGeneration,
+                  ]);
+        if (
+            (data.event === "delivery-terminal" &&
+                (data.reason === "delivered" || data.reason === "consumed")) ||
+            data.event === "delivered-to-agent"
+        ) {
+            deliveredCompletionIdentities.add(attemptIdentity);
+        } else if (
+            (data.event === "delivery-terminal" && data.reason === "cancelled") ||
+            data.event === "delivery-cancelled"
+        ) {
+            deliveredCompletionIdentities.delete(attemptIdentity);
         }
     }
 }
@@ -1876,6 +1918,8 @@ function recordCompletionTelemetry(
         sessionId?: string;
         generation?: number;
         jobGeneration?: number;
+        reason?: "delivered" | "suppressed-stale" | "suppressed-acknowledged" | "cancelled";
+        ageSeconds?: number;
         batchSize?: number;
         ageMs?: number;
         durationMs?: number;
@@ -1917,6 +1961,10 @@ function recordCompletionTelemetry(
             ...(fields.sessionId ? { sessionId: fields.sessionId } : {}),
             ...(fields.jobGeneration !== undefined
                 ? { jobGeneration: fields.jobGeneration }
+                : {}),
+            ...(fields.reason ? { reason: fields.reason } : {}),
+            ...(fields.ageSeconds !== undefined
+                ? { ageSeconds: fields.ageSeconds }
                 : {}),
             ...(fields.batchSize !== undefined
                 ? { batchSize: fields.batchSize }
@@ -2011,6 +2059,7 @@ function recordCompletionItemTelemetry(
     recordCompletionTelemetry(pi, event, {
         jobId: item.job.id,
         sessionId: item.sessionId,
+        generation: item.generation,
         jobGeneration: item.jobGeneration,
         status: item.job.status,
         exitCode: item.job.exitCode,
@@ -2028,21 +2077,7 @@ export function flushCompletionBatch(): void {
     completionBatch.state = undefined;
 
     if (batch.length === 0) return;
-    const freshBatch = batch.filter((item) => {
-        if (!item.job.outputConsumed && !isCompletionAcknowledged(item)) {
-            return true;
-        }
-        recordCompletionItemTelemetry(
-            pi,
-            item.job.outputConsumed
-                ? "consumed-suppressed"
-                : "acknowledged-suppressed",
-            item,
-            { batchSize: batch.length, delivery: "suppressed" }
-        );
-        pendingCompletionJobs.delete(item.job.id);
-        return false;
-    });
+    const freshBatch = batch;
     for (const item of freshBatch) {
         recordCompletionItemTelemetry(pi, "batch-flushed", item, {
             batchSize: freshBatch.length,
@@ -2067,9 +2102,14 @@ export function flushCompletionBatch(): void {
         );
         if (!hasLinked) {
             // No normal follow-up is emitted for an unlinked successful
-            // completion. Leave it visible to the optional autonomous wake
-            // evaluator as an unacknowledged terminal result.
+            // completion. Record this terminal outcome and leave it visible
+            // to the optional autonomous wake evaluator.
             for (const item of freshBatch) {
+                recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
+                    reason: "cancelled",
+                    status: item.job.status,
+                    exitCode: item.job.exitCode,
+                });
                 item.job.completionNotified = false;
                 completionNotifiedJobs.delete(item.job);
                 completionRearmTriggers.set(item.job, "flush-suppressed-rearm");
@@ -2109,6 +2149,7 @@ function restoreCompletionForWake(
     pendingCompletionJobs.delete(job.id);
     completionNotifiedJobs.delete(job);
     completionRearmTriggers.set(job, trigger);
+    job.completionDeliveredAt = undefined;
     job.completionNotified = false;
     completionJobGenerations.set(
         job.id,
@@ -2196,12 +2237,20 @@ function completeCompletionDeliveryHandoff(
     delivery: PendingCompletionDelivery,
     sent: boolean
 ): void {
+    const { pi } = delivery;
     if (!sent) {
         pendingStaleCompletionSendCount++;
+        for (const item of delivery.jobs) {
+            recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
+                reason: "cancelled",
+                status: item.job.status,
+                exitCode: item.job.exitCode,
+            });
+        }
         return;
     }
 
-    const { pi, state } = delivery;
+    const { state } = delivery;
     pruneQueuedCompletionDeliveryMetadata(state);
     queuedCompletionDeliveries.set(delivery.queueKey, delivery);
     recordCompletionTelemetry(pi, "queued", {
@@ -2213,10 +2262,9 @@ function completeCompletionDeliveryHandoff(
         const { job } = item;
         pendingCompletionJobs.delete(job.id);
         job.completionDeliveredAt = deliveredAt;
-        deliveredCompletionIdentities.add(
-            stableCompletionIdentity(item.sessionId, job.id, item.jobGeneration)
-        );
-        recordCompletionItemTelemetry(pi, "delivered-to-agent", item, {
+        deliveredCompletionIdentities.add(completionAttemptIdentity(item));
+        recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
+            reason: "delivered",
             batchSize: delivery.jobs.length,
             ageMs:
                 job.endTime === undefined
@@ -2238,21 +2286,45 @@ function deliverCompletionNotification(
     const unconsumed = pruneConsumedCompletions(originalJobs);
     for (const item of originalJobs) {
         if (item.job.outputConsumed) {
+            const now = Date.now();
             recordCompletionItemTelemetry(
                 delivery.pi,
                 "consumed-suppressed",
                 item,
                 { batchSize: delivery.jobs.length, delivery: "suppressed" }
             );
+            recordCompletionItemTelemetry(
+                delivery.pi,
+                "delivery-terminal",
+                item,
+                {
+                    reason: "suppressed-acknowledged",
+                    ageSeconds: Math.max(0, Math.floor((now - (item.job.endTime ?? now)) / 1000)),
+                    status: item.job.status,
+                    exitCode: item.job.exitCode,
+                }
+            );
         }
     }
     const eligible = unconsumed.filter((item) => {
         if (!isCompletionAcknowledged(item)) return true;
+        const now = Date.now();
         recordCompletionItemTelemetry(
             delivery.pi,
             "acknowledged-suppressed",
             item,
             { batchSize: delivery.jobs.length, delivery: "suppressed" }
+        );
+        recordCompletionItemTelemetry(
+            delivery.pi,
+            "delivery-terminal",
+            item,
+            {
+                reason: "suppressed-acknowledged",
+                ageSeconds: Math.max(0, Math.floor((now - (item.job.endTime ?? now)) / 1000)),
+                status: item.job.status,
+                exitCode: item.job.exitCode,
+            }
         );
         return false;
     });
@@ -2288,10 +2360,17 @@ function deliverCompletionNotification(
             )
     );
     for (const item of stale) {
+        const ageSeconds = Math.max(0, Math.floor((now - (item.job.endTime ?? now)) / 1000));
         recordCompletionItemTelemetry(delivery.pi, "suppressed-stale", item, {
             batchSize: eligible.length,
             ageMs: Math.max(0, now - (item.job.endTime ?? now)),
             delivery: "suppressed",
+        });
+        recordCompletionItemTelemetry(delivery.pi, "delivery-terminal", item, {
+            reason: "suppressed-stale",
+            ageSeconds,
+            status: item.job.status,
+            exitCode: item.job.exitCode,
         });
     }
     const olderFailures = stale
@@ -2309,6 +2388,7 @@ function deliverCompletionNotification(
 
     const { pi } = delivery;
     if (batch.length === 0) {
+        delivery.jobs = [];
         const sent = sendQueuedMessage(
             pi,
             {
@@ -2346,6 +2426,7 @@ function deliverCompletionNotification(
         );
     }
 
+    delivery.jobs = batch;
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
         const logEvidence = completionEvidenceById.get(job.id);
@@ -2524,21 +2605,9 @@ function flushPendingCompletionDeliveries(): void {
             group = { ...delivery, jobs: [] };
             groups.push(group);
         }
-        const known = new Set(
-            group.jobs.map((item) =>
-                stableCompletionIdentity(
-                    item.sessionId,
-                    item.job.id,
-                    item.jobGeneration
-                )
-            )
-        );
+        const known = new Set(group.jobs.map(completionAttemptIdentity));
         for (const item of delivery.jobs) {
-            const identity = stableCompletionIdentity(
-                item.sessionId,
-                item.job.id,
-                item.jobGeneration
-            );
+            const identity = completionAttemptIdentity(item);
             if (!known.has(identity)) {
                 group.jobs.push(item);
                 known.add(identity);
@@ -2561,8 +2630,7 @@ function queueCompletionDelivery(
     pi: ExtensionAPI,
     state: TauState
 ): void {
-    const jobsToDeliver = pruneConsumedCompletions(jobs);
-    if (jobsToDeliver.length === 0) return;
+    const jobsToDeliver = jobs;
 
     // Cancel linked callbacks for all delivered jobs — we're about to
     // send the result to the agent, so remind callbacks are now stale. Guard
@@ -2602,7 +2670,6 @@ function queueCompletionDelivery(
  */
 export function clearJobFromCompletionBatch(jobId: string): void {
     const acknowledgedAt = Date.now();
-    acknowledgedCompletionAt.set(`job:${jobId}`, acknowledgedAt);
     const acknowledgedItems = [
         ...completionBatch.jobs,
         ...pendingCompletionDeliveries.flatMap((delivery) => delivery.jobs),
@@ -2611,14 +2678,17 @@ export function clearJobFromCompletionBatch(jobId: string): void {
         ),
     ].filter((item) => item.job.id === jobId);
     for (const item of acknowledgedItems) {
-        acknowledgedCompletionAt.set(
-            stableCompletionIdentity(
-                item.sessionId,
-                item.job.id,
-                item.jobGeneration
-            ),
-            acknowledgedAt
-        );
+        if (item.job.outputConsumed) {
+            acknowledgedCompletionAt.set(`job:${jobId}`, acknowledgedAt);
+            acknowledgedCompletionAt.set(
+                stableCompletionIdentity(
+                    item.sessionId,
+                    item.job.id,
+                    item.jobGeneration
+                ),
+                acknowledgedAt
+            );
+        }
         const telemetryPi =
             Array.from(queuedCompletionDeliveries.values()).find((delivery) =>
                 delivery.jobs.includes(item)
@@ -2627,14 +2697,14 @@ export function clearJobFromCompletionBatch(jobId: string): void {
                 delivery.jobs.includes(item)
             )?.pi ??
             completionBatch.pi;
-        if (telemetryPi) {
+        if (telemetryPi && item.job.outputConsumed) {
             recordCompletionItemTelemetry(
                 telemetryPi,
                 "acknowledged-consumed",
                 item,
                 { batchSize: 1, delivery: "suppressed" }
             );
-        } else {
+        } else if (!telemetryPi) {
             completionTelemetryUnavailableCount++;
         }
     }
@@ -2662,11 +2732,7 @@ export function clearJobFromCompletionBatch(jobId: string): void {
         if (cancelled !== true) continue;
 
         for (const item of delivery.jobs) {
-            const identity = stableCompletionIdentity(
-                item.sessionId,
-                item.job.id,
-                item.jobGeneration
-            );
+            const identity = completionAttemptIdentity(item);
             deliveredCompletionIdentities.delete(identity);
             item.job.completionDeliveredAt = undefined;
             recordCompletionItemTelemetry(
@@ -2674,6 +2740,18 @@ export function clearJobFromCompletionBatch(jobId: string): void {
                 "delivery-cancelled",
                 item,
                 { batchSize: delivery.jobs.length, delivery: "suppressed" }
+            );
+            recordCompletionItemTelemetry(
+                delivery.pi,
+                "delivery-terminal",
+                item,
+                {
+                    reason: item.job.outputConsumed || isCompletionAcknowledged(item)
+                        ? "suppressed-acknowledged"
+                        : "cancelled",
+                    status: item.job.status,
+                    exitCode: item.job.exitCode,
+                }
             );
         }
         delivery.jobs = delivery.jobs.filter((item) => item.job.id !== jobId);
@@ -2787,11 +2865,7 @@ export function clearAllCompletionBatches(): void {
         if (cancelled === true) {
             for (const item of delivery.jobs) {
                 deliveredCompletionIdentities.delete(
-                    stableCompletionIdentity(
-                        item.sessionId,
-                        item.job.id,
-                        item.jobGeneration
-                    )
+                    completionAttemptIdentity(item)
                 );
                 item.job.completionDeliveredAt = undefined;
                 recordCompletionItemTelemetry(
@@ -2799,6 +2873,18 @@ export function clearAllCompletionBatches(): void {
                     "delivery-cancelled",
                     item,
                     { batchSize: delivery.jobs.length, delivery: "suppressed" }
+                );
+                recordCompletionItemTelemetry(
+                    delivery.pi,
+                    "delivery-terminal",
+                    item,
+                    {
+                        reason: item.job.outputConsumed || isCompletionAcknowledged(item)
+                            ? "suppressed-acknowledged"
+                            : "cancelled",
+                        status: item.job.status,
+                        exitCode: item.job.exitCode,
+                    }
                 );
                 restoreCompletionForWake(item.job, wakeStates, delivery.state);
             }
@@ -2867,22 +2953,18 @@ export function notifyCompletion(
     // information needed to explain a repeated notice.
     const sessionId = resolveCompletionSessionId(ctx, job, state);
     const stableGeneration = stableJobGeneration(job);
-    const stableIdentity = stableCompletionIdentity(
+    const previousGeneration = completionJobGenerations.get(job.id) ?? 0;
+    const notifyGeneration = previousGeneration + 1;
+    const attemptIdentity = JSON.stringify([
         sessionId,
         job.id,
-        stableGeneration
-    );
+        stableGeneration,
+        notifyGeneration,
+    ]);
     const alreadyDelivered =
         job.completionDeliveredAt !== undefined ||
-        deliveredCompletionIdentities.has(stableIdentity);
-    const suppressed =
-        job.outputConsumed ||
-        completionNotifiedJobs.has(job) ||
-        alreadyDelivered;
-    const previousGeneration = completionJobGenerations.get(job.id) ?? 0;
-    const notifyGeneration = suppressed
-        ? previousGeneration
-        : previousGeneration + 1;
+        deliveredCompletionIdentities.has(attemptIdentity);
+    const suppressed = completionNotifiedJobs.has(job) || alreadyDelivered;
     const rearmTrigger = completionRearmTriggers.get(job);
     recordCompletionTelemetry(pi, "notify-called", {
         jobId: job.id,
@@ -2907,6 +2989,7 @@ export function notifyCompletion(
     completionNotifiedJobs.add(job);
     job.completionNotified = true;
     completionJobGenerations.set(job.id, notifyGeneration);
+    job.completionNotificationGeneration = notifyGeneration;
     pendingCompletionJobs.set(job.id, job);
 
     // Linked callbacks (remindDelay) are NOT cancelled here — delivery
@@ -2916,6 +2999,7 @@ export function notifyCompletion(
 
     const duration = formatDuration(Date.now() - job.startTime);
     const notificationStartedAt = Date.now();
+    const outstandingJobsAtCompletion = countOutstandingJobs(state, job.id);
     const emoji = job.status === "completed" ? "✅" : "❌";
 
     // Toast notification fires immediately for each job. The toast is the
@@ -2943,8 +3027,7 @@ export function notifyCompletion(
     const enqueue = (): void => {
         if (
             generation !== completionBatchGeneration ||
-            completionJobGenerations.get(job.id) !== notifyGeneration ||
-            job.outputConsumed
+            completionJobGenerations.get(job.id) !== notifyGeneration
         ) {
             // Only clear the pending entry if this callback still owns the
             // current generation. A stale indexing callback must not delete a
@@ -2978,7 +3061,7 @@ export function notifyCompletion(
             generation: notifyGeneration,
             jobGeneration: stableGeneration,
             sessionId,
-            outstandingJobs: countOutstandingJobs(state, job.id),
+            outstandingJobs: outstandingJobsAtCompletion,
         });
         completionBatch.pi = pi;
         completionBatch.state = state;

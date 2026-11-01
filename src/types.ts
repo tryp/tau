@@ -188,6 +188,8 @@ export interface BackgroundJob {
     completionSessionId?: string;
     /** Persisted marker that this job's completion was handed to the host queue. */
     completionDeliveredAt?: number;
+    /** Monotonic notification attempt generation, persisted with job snapshots. */
+    completionNotificationGeneration?: number;
     /** True when notify:false suppresses both completion delivery and autonomous wake. */
     suppressAutonomousWake?: boolean;
     /** True if running in background; false if foreground (not yet backgrounded). */
