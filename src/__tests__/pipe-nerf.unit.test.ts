@@ -605,6 +605,18 @@ void describe("pipe-nerf stage-0 capture", () => {
         assert.equal(stageZeroPathFor("call/1", "/cache/pi-tau/stage0"), "/cache/pi-tau/stage0/pi-pipe-stage0-call1.log");
     });
 
+    void it("skips rewriting when the command references the capture directory", () => {
+        const directory = "/cache/pi-tau/stage0";
+        const p = planPipeNerf(`grep pattern ${directory} | tail -3`, {
+            stageZeroPath: `${directory}/stage0.log`,
+            stageZeroDirectory: directory,
+        });
+        assert.equal(p.action, "skip");
+        assert.equal(p.reason, "capture-directory-reference");
+        assert.equal(p.rewritten, `grep pattern ${directory} | tail -3`);
+        assert.equal(p.captureDirectory, directory);
+    });
+
     void it("tees stage 0 when the command still filters after the limiter", () => {
         // The point: the result is filtered, so a re-grep has to run against the
         // pre-filter output rather than a fresh execution. `tee` is the standard
@@ -1230,6 +1242,28 @@ void describe("pipe-nerf registration", () => {
         for (const h of handlers[name] ?? []) out = h(event) ?? out;
         return out;
     }
+
+    void it("surfaces the self-reference preflight in the tool result", () => {
+        const { pi, handlers } = fakePi();
+        registerPipeNerf(pi as never);
+        const directory = stageZeroDirectory();
+        const command = `grep -r pattern ${directory} | head -3`;
+        fire(handlers, "tool_call", {
+            toolName: "bash",
+            toolCallId: "self-reference",
+            input: { command },
+        });
+        const result = fire(handlers, "tool_result", {
+            toolName: "bash",
+            toolCallId: "self-reference",
+            content: [{ type: "text", text: "original output" }],
+        }) as { content: { type: string; text: string }[] };
+        assert.equal(
+            result.content[0].text,
+            `capture disabled: command references the capture directory (${directory})`
+        );
+        assert.equal(result.content[1].text, "original output");
+    });
 
     void it("keeps the rewrite receipt before a non-empty payload", () => {
         const { pi, handlers } = fakePi();

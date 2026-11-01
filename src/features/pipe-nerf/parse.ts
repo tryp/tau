@@ -103,6 +103,8 @@ export interface PipeOptions {
      * after the limiter is hoisted. Omit to skip the capture.
      */
     stageZeroPath?: string;
+    /** Directory used for stage-0 files; commands that scan it are not hoisted. */
+    stageZeroDirectory?: string;
 }
 
 export type SkipReason =
@@ -126,7 +128,9 @@ export type SkipReason =
     /** A limiter pipe was found in a non-final semicolon/newline segment. */
     | `pipe-outside-scope:segment-${number}`
     /** A shell here-document makes the remaining command text data, not code. */
-    | "heredoc";
+    | "heredoc"
+    /** The command scans the directory where pipe-hoist would write its capture. */
+    | "capture-directory-reference";
 
 export interface PipePlan {
     action: "rewrite" | "skip";
@@ -152,6 +156,8 @@ export interface PipePlan {
         separator: string;
         captured: boolean;
     }[];
+    /** Directory named in the self-reference preflight notice. */
+    captureDirectory?: string;
 }
 
 /**
@@ -826,7 +832,7 @@ function hasHeredocOperator(command: string): boolean {
     return false;
 }
 
-export function planPipeNerf(
+function planPipeNerfCore(
     command: string,
     options: PipeOptions = {}
 ): PipePlan {
@@ -1066,4 +1072,23 @@ export function planPipeNerf(
         rewritten: final.trim(),
         stageZero,
     };
+}
+
+export function planPipeNerf(
+    command: string,
+    options: PipeOptions = {}
+): PipePlan {
+    const plan = planPipeNerfCore(command, options);
+    const directory = options.stageZeroDirectory;
+    if (
+        plan.action === "rewrite" &&
+        directory &&
+        command.includes(directory)
+    ) {
+        return {
+            ...skipped(command, "capture-directory-reference", plan.invocation),
+            captureDirectory: directory,
+        };
+    }
+    return plan;
 }

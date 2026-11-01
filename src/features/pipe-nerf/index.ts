@@ -25,7 +25,7 @@ import { isFeatureEnabled } from "../features-helpers.ts";
 import { countLines } from "../log-classify.ts";
 import { formatSidecarReceipt } from "../sidecar.ts";
 import { bashGuidelines, pipeNoteSections } from "./messages.ts";
-import { stageZeroPathFor } from "./stage0-path.ts";
+import { stageZeroDirectory, stageZeroPathFor } from "./stage0-path.ts";
 import { applyLimiter, planPipeNerf } from "./parse.ts";
 import type { LimiterView, PipeInvocation } from "./parse.ts";
 import type { PipePlan } from "./parse.ts";
@@ -179,9 +179,18 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
         // the rewrite left a single command, its whole output is already the
         // capture. `planPipeNerf` decides that, so the path is offered rather
         // than prescribed.
-        const stageZeroPath = stageZeroPathFor(event.toolCallId);
-        const plan = planPipeNerf(command, { stageZeroPath });
-        if (plan.action !== "rewrite") return;
+        const captureDirectory = stageZeroDirectory();
+        const stageZeroPath = stageZeroPathFor(event.toolCallId, captureDirectory);
+        const plan = planPipeNerf(command, {
+            stageZeroPath,
+            stageZeroDirectory: captureDirectory,
+        });
+        if (plan.action !== "rewrite") {
+            if (plan.reason === "capture-directory-reference") {
+                pending.set(event.toolCallId, plan);
+            }
+            return;
+        }
 
         input.command = plan.rewritten;
         if (plan.stageZeroSegments && plan.stageZeroSegments.length > 1) {
@@ -244,11 +253,23 @@ export function registerPipeNerf(pi: ExtensionAPI, state?: TauState): void {
 
     pi.on("tool_result", (event) => {
         const plan = pending.get(event.toolCallId);
-        if (!plan || plan.action !== "rewrite") {
+        if (!plan) {
             pending.delete(event.toolCallId);
             return;
         }
         pending.delete(event.toolCallId);
+        if (plan.action !== "rewrite") {
+            if (plan.reason !== "capture-directory-reference") return;
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: `capture disabled: command references the capture directory (${plan.captureDirectory})`,
+                    },
+                    ...event.content,
+                ],
+            };
+        }
 
         // The bash tool has prepared the result by now, so the flag has done its
         // job. Cleared on every path: a leak here would index unrelated calls.
