@@ -84,7 +84,7 @@ function cleanup(
     return cleanupStaleTmuxRunDirs({
         rootDir: root,
         now: () => NOW_MS,
-        isAlive: () => false,
+        isAlive: () => "dead",
         retentionMs: RUN_DIR_RETENTION_MS,
         runTmux: () => "",
         ...overrides,
@@ -94,8 +94,32 @@ function cleanup(
 void describe("stale run dir cleanup", () => {
     void it("preserves the run dir of a live process", () => {
         const dir = makeRunDir("pi-tmux-111", 48 * HOUR_MS);
-        cleanup({ isAlive: (pid) => pid === 111 });
+        cleanup({ isAlive: (pid) => (pid === 111 ? "alive" : "dead") });
         assert.equal(existsSync(dir), true);
+    });
+
+    void it("preserves an EPERM fixture and counts it as unknown", () => {
+        const dir = makeRunDir("pi-tmux-112", 48 * HOUR_MS);
+        mock.method(process, "kill", ((
+            pid: number,
+            signal?: NodeJS.Signals | number
+        ) => {
+            if (pid === 112 && signal === 0) {
+                throw Object.assign(new Error("operation not permitted"), {
+                    code: "EPERM",
+                });
+            }
+            return true;
+        }) as typeof process.kill);
+        const stats = cleanupStaleTmuxRunDirs({
+            rootDir: root,
+            now: () => NOW_MS,
+            retentionMs: 0,
+            runTmux: () => "",
+        });
+        assert.equal(existsSync(dir), true);
+        assert.equal(stats.keptUnknown, 1);
+        assert.equal(stats.removed, 0);
     });
 
     void it("preserves a dead process's run dir and job logs inside the retention window", () => {
@@ -135,14 +159,17 @@ void describe("stale run dir cleanup", () => {
     void it("removes dead-process dirs regardless of age when retention is 0", () => {
         const fresh = makeRunDir("pi-tmux-555", 0);
         const live = makeRunDir("pi-tmux-556", 0);
-        cleanup({ retentionMs: 0, isAlive: (pid) => pid === 556 });
+        cleanup({
+            retentionMs: 0,
+            isAlive: (pid) => (pid === 556 ? "alive" : "dead"),
+        });
         assert.equal(existsSync(fresh), false);
         assert.equal(existsSync(live), true);
     });
 
     void it("skips our own process id", () => {
         const dir = makeRunDir(`pi-tmux-${process.pid}`, 48 * HOUR_MS);
-        cleanup({ retentionMs: 0, isAlive: () => false });
+        cleanup({ retentionMs: 0, isAlive: () => "dead" });
         assert.equal(existsSync(dir), true);
     });
 
@@ -173,7 +200,7 @@ void describe("stale run dir cleanup", () => {
                     // Another pi process reaped it between readdir and stat.
                     rmSync(vanishing, { recursive: true, force: true });
                 }
-                return false;
+                return "dead";
             },
         });
         assert.equal(existsSync(vanishing), false);
@@ -191,16 +218,21 @@ void describe("stale run dir cleanup", () => {
         const stale = makeRunDir("pi-tmux-779", 48 * HOUR_MS);
         const recent = makeRunDir("pi-tmux-780", HOUR_MS);
         const stats = cleanup({
-            isAlive: (pid) => pid === 778,
+            isAlive: (pid) => (pid === 778 ? "alive" : "dead"),
             runTmux: () => "",
         });
         assert.equal(existsSync(live), true);
         assert.equal(existsSync(stale), false);
         assert.equal(existsSync(recent), true);
-        assert.deepEqual(stats, { examined: 3, removed: 1, keptAlive: 1 });
+        assert.deepEqual(stats, {
+            examined: 3,
+            removed: 1,
+            keptAlive: 1,
+            keptUnknown: 0,
+        });
         assert.equal(
             formatTmuxRunDirSweepLog("startup", stats),
-            "[tau] tmux-run-dir-sweep source=startup examined=3 removed=1 kept-alive=1"
+            "[tau] tmux-run-dir-sweep source=startup examined=3 removed=1 kept-alive=1 kept-unknown=0"
         );
     });
 
@@ -211,7 +243,7 @@ void describe("stale run dir cleanup", () => {
             cleanupStaleTmuxRunDirs({
                 rootDir: root,
                 now: () => NOW_MS,
-                isAlive: () => false,
+                isAlive: () => "dead",
                 runTmux: () => "",
             });
             assert.equal(existsSync(dir), false);
@@ -236,7 +268,12 @@ void describe("periodic stale run-dir sweep", () => {
         const timer = schedulePeriodicTmuxRunDirCleanup({
             cleanup: () => {
                 calls++;
-                return { examined: 4, removed: 2, keptAlive: 1 };
+                return {
+                    examined: 4,
+                    removed: 2,
+                    keptAlive: 1,
+                    keptUnknown: 0,
+                };
             },
             log: (line) => lines.push(line),
             isTestRunner: false,
@@ -251,7 +288,7 @@ void describe("periodic stale run-dir sweep", () => {
         await Promise.resolve();
         assert.equal(calls, 1);
         assert.deepEqual(lines, [
-            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1",
+            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1 kept-unknown=0",
         ]);
     });
 
@@ -262,6 +299,7 @@ void describe("periodic stale run-dir sweep", () => {
                   examined: number;
                   removed: number;
                   keptAlive: number;
+                  keptUnknown: number;
               }) => void)
             | undefined;
         schedulePeriodicTmuxRunDirCleanup({
@@ -279,12 +317,22 @@ void describe("periodic stale run-dir sweep", () => {
         assert.equal(calls, 1);
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
         assert.equal(calls, 1);
-        resolveSweep?.({ examined: 0, removed: 0, keptAlive: 0 });
+        resolveSweep?.({
+            examined: 0,
+            removed: 0,
+            keptAlive: 0,
+            keptUnknown: 0,
+        });
         for (let turn = 0; turn < 6; turn++) await Promise.resolve();
         mock.timers.tick(TMUX_RUN_DIR_SWEEP_INTERVAL_MS);
         for (let turn = 0; turn < 3; turn++) await Promise.resolve();
         assert.equal(calls, 2);
-        resolveSweep?.({ examined: 0, removed: 0, keptAlive: 0 });
+        resolveSweep?.({
+            examined: 0,
+            removed: 0,
+            keptAlive: 0,
+            keptUnknown: 0,
+        });
     });
 });
 
@@ -322,7 +370,19 @@ void describe("orphaned tmux session reaping", () => {
 
     void it("keeps pi-bg sessions that still have a live pane", () => {
         const { calls, runTmux } = tmuxWithPanes("4242\n4243\n");
-        cleanup({ runTmux, isAlive: (pid) => pid === 4243 });
+        cleanup({
+            runTmux,
+            isAlive: (pid) => (pid === 4243 ? "alive" : "dead"),
+        });
+        assert.equal(
+            calls.some((command) => command.startsWith("tmux kill-session")),
+            false
+        );
+    });
+
+    void it("does not kill sessions when pane process liveness is unknown", () => {
+        const { calls, runTmux } = tmuxWithPanes("4242\\n");
+        cleanup({ runTmux, isAlive: () => "unknown" });
         assert.equal(
             calls.some((command) => command.startsWith("tmux kill-session")),
             false
@@ -345,7 +405,10 @@ void describe("orphaned tmux session reaping", () => {
 
     void it("does not kill sessions with mixed live and malformed pane pids", () => {
         const { calls, runTmux } = tmuxWithPanes("4242\nmalformed\n");
-        cleanup({ runTmux, isAlive: (pid) => pid === 4242 });
+        cleanup({
+            runTmux,
+            isAlive: (pid) => (pid === 4242 ? "alive" : "dead"),
+        });
         assert.equal(
             calls.some((command) => command.startsWith("tmux kill-session")),
             false
@@ -355,7 +418,7 @@ void describe("orphaned tmux session reaping", () => {
     void it("does not delete a retained run dir while reaping sessions", () => {
         const { runTmux } = tmuxWithPanes("4242\n");
         const dir = makeRunDir("pi-tmux-888", HOUR_MS, "kept log");
-        cleanup({ runTmux, isAlive: () => false });
+        cleanup({ runTmux, isAlive: () => "dead" });
         assert.equal(existsSync(dir), true);
         assert.equal(
             readFileSync(join(dir, "pi-bg-job.out"), "utf-8"),

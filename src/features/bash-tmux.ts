@@ -98,21 +98,27 @@ export interface StaleRunDirCleanupOptions {
     rootDir?: string;
     /** Clock used for the retention comparison. */
     now?: () => number;
-    /** Process-liveness probe, also used for tmux pane pids. */
-    isAlive?: (pid: number) => boolean;
+    /** Process-identity probe, also used for tmux pane pids. */
+    isAlive?: (pid: number) => ProcessLiveness;
     /** Retention window in ms; defaults to the env-resolved value. */
     retentionMs?: number;
     /** tmux command runner; returns stdout, throws on failure. */
     runTmux?: (command: string) => string;
 }
 
-/** Process-liveness probe: `process.kill(pid, 0)` without the throw. */
-function processAlive(pid: number): boolean {
+type ProcessLiveness = "alive" | "dead" | "unknown";
+
+/** Process-liveness probe: fail closed when the OS cannot prove the PID is dead. */
+function processAlive(pid: number): ProcessLiveness {
     try {
         process.kill(pid, 0);
-        return true;
-    } catch {
-        return false;
+        return "alive";
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") return "dead";
+        // EPERM means the process exists but cannot be signalled. Other errors
+        // are not proof of death either, so callers must preserve the artifact.
+        return "unknown";
     }
 }
 
@@ -176,7 +182,7 @@ function isReapable(dir: string, nowMs: number, retentionMs: number): boolean {
  */
 function reapOrphanedTmuxSessions(
     runTmux: (command: string) => string,
-    isAlive: (pid: number) => boolean
+    isAlive: (pid: number) => ProcessLiveness
 ): void {
     try {
         const sessions = runTmux("tmux list-sessions -F '#{session_name}'")
@@ -201,7 +207,9 @@ function reapOrphanedTmuxSessions(
             if (panePids.some((pid) => pid === undefined)) continue;
             const allDead =
                 panePids.length > 0 &&
-                panePids.every((pid) => pid !== undefined && !isAlive(pid));
+                panePids.every(
+                    (pid) => pid !== undefined && isAlive(pid) === "dead"
+                );
             if (allDead) {
                 runTmux(
                     `tmux kill-session -t ${shellQuote(
@@ -235,6 +243,8 @@ export interface StaleRunDirCleanupStats {
     removed: number;
     /** Directories preserved because their embedded PID is still alive. */
     keptAlive: number;
+    /** Directories preserved because process liveness could not be established. */
+    keptUnknown: number;
 }
 
 export function cleanupStaleTmuxRunDirs(
@@ -250,6 +260,7 @@ export function cleanupStaleTmuxRunDirs(
         examined: 0,
         removed: 0,
         keptAlive: 0,
+        keptUnknown: 0,
     };
     let entries: string[];
     try {
@@ -270,9 +281,14 @@ export function cleanupStaleTmuxRunDirs(
         if (!Number.isSafeInteger(pid) || pid <= 0) continue;
         if (pid === process.pid) continue;
         stats.examined++;
-        if (isAlive(pid)) {
+        const liveness = isAlive(pid);
+        if (liveness === "alive") {
             stats.keptAlive++;
             continue; // still running — never touch
+        }
+        if (liveness === "unknown") {
+            stats.keptUnknown++;
+            continue; // uncertain identity is not proof of death
         }
         const dir = join(rootDir, entry);
         if (!isReapable(dir, nowMs, retentionMs)) continue;
@@ -302,7 +318,7 @@ export function formatTmuxRunDirSweepLog(
     source: "startup" | "periodic",
     stats: StaleRunDirCleanupStats
 ): string {
-    return `[tau] tmux-run-dir-sweep source=${source} examined=${stats.examined} removed=${stats.removed} kept-alive=${stats.keptAlive}`;
+    return `[tau] tmux-run-dir-sweep source=${source} examined=${stats.examined} removed=${stats.removed} kept-alive=${stats.keptAlive} kept-unknown=${stats.keptUnknown}`;
 }
 
 /**
