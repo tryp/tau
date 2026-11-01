@@ -4493,6 +4493,11 @@ export function registerBackgroundJobs(
                     // If already done or wait=false, return output immediately
                     const waitForCompletion = params.wait ?? true;
                     if (job.status !== "running" || !waitForCompletion) {
+                        // Completion indexing/delivery can settle while the
+                        // output reads below are pending. Invalidate that
+                        // notification before yielding; consumption itself is
+                        // recorded only after the output has been read.
+                        state.cancelCompletionBatchForJob?.(job.id);
                         const output = await readOutputTail(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
