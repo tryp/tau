@@ -14,6 +14,13 @@ notifications, task management, and web browsing.
   `.deployed-commit` with the source commit, and verifies). Use `make verify`
   to check for drift and `make deployed-commit` to see what is deployed.
 
+## Startup policy
+
+Background-task maintenance (restore, reaper scans, sweeps, and purges) must not
+run on the synchronous startup path or block `session_start`/first readiness.
+Defer it with unref'd timers or chunked async work. Destructive actions remain
+opt-in, and a pin test must guard this invariant.
+
 ## Loading extensions: deploy, don't point at ~/src
 
 Do **not** load `~/src/*` package copies directly in `~/.pi/agent/settings.json`

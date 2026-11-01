@@ -40,10 +40,11 @@ import {
 // Existing features
 import {
     evaluatePendingDecisionGate,
-    purgeSidecar,
     registerBackgroundJobs,
     restoreBackgroundJobs,
 } from "./features/background.ts";
+import { scheduleBackgroundJobRestore } from "./features/startup-maintenance.ts";
+import { scheduleSidecarPurge } from "./features/sidecar.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import {
@@ -95,13 +96,11 @@ import { restoreFeaturesState } from "./features/features-state.ts";
 import { isTmuxAvailable } from "./tmux.ts";
 import {
     cleanupTmuxRunDir,
-    cleanupStaleTmuxRunDirs,
-    formatTmuxRunDirSweepLog,
     schedulePeriodicTmuxRunDirCleanup,
 } from "./features/bash-tmux.ts";
 import {
-    formatOrphanReaperLog,
-    startOrphanReaper,
+    ORPHAN_REAPER_DEFAULT_DELAY_MS,
+    ORPHAN_REAPER_DELAY_ENV,
 } from "./features/tmux-orphan-reaper.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -184,8 +183,9 @@ export default function (pi: ExtensionAPI) {
 
     // ── Register all features ─────────────────────────────────────────
 
-    // Purge stale sidecar entries at startup
-    purgeSidecar();
+    // Purge sidecar entries after startup so SQLite maintenance cannot delay
+    // extension loading or first prompt readiness.
+    scheduleSidecarPurge();
 
     registerBackgroundJobs(pi, state);
     registerBackgroundCommands(pi, state);
@@ -558,36 +558,25 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             Boolean(process.stdin.isTTY)
         );
 
-        // Clean up run directories and tmux sessions from dead pi processes.
-        // Long-lived sessions repeat this sweep hourly; test runners do not
-        // create a background interval (the scheduler has its own guard).
-        if (state.tmuxAvailable) {
-            startOrphanReaper(
-                { rootDir: "/tmp" },
-                (stats) => {
-                    console.error(formatOrphanReaperLog(stats));
-                    const cleanupStats = cleanupStaleTmuxRunDirs();
-                    console.error(
-                        formatTmuxRunDirSweepLog("startup", cleanupStats)
-                    );
-                },
-                (error: unknown) => {
-                    const detail =
-                        error instanceof Error ? error.message : String(error);
-                    console.error(
-                        `[tau] tmux-orphan-reaper error=${JSON.stringify(detail)}`
-                    );
-                }
-            );
-            if (!tmuxRunDirSweepTimer) {
-                tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup();
-            }
+        // Background maintenance runs after readiness, never inside the
+        // synchronous session_start path. The initial reaper/sweep pass is
+        // timer-scheduled; subsequent passes remain hourly.
+        if (state.tmuxAvailable && !tmuxRunDirSweepTimer) {
+            const configuredDelay = Number(process.env[ORPHAN_REAPER_DELAY_ENV]);
+            const firstRunDelayMs = Number.isFinite(configuredDelay) && configuredDelay >= 5_000
+                ? configuredDelay
+                : ORPHAN_REAPER_DEFAULT_DELAY_MS;
+            tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs,
+            });
         }
 
-        // Restore the latest background-tasks snapshot and resume completion
-        // polling for tmux jobs that were still running at shutdown.
+        // Get entries for synchronous lightweight UI-state restoration below;
+        // the background-job snapshot/poller restore itself is deferred.
         const entries = ctx.sessionManager.getEntries();
-        restoreBackgroundJobs(entries, state, pi, ctx);
+        scheduleBackgroundJobRestore(
+            () => restoreBackgroundJobs(entries, state, pi, ctx)
+        );
 
         // Restore plan-mode state from CLI flag
         if (pi.getFlag("plan") === true) {

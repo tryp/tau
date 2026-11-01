@@ -282,7 +282,9 @@ void describe("stale run dir cleanup", () => {
 });
 
 void describe("periodic stale run-dir sweep", () => {
-    void beforeEach(() => mock.timers.enable({ apis: ["setInterval"] }));
+    void beforeEach(() =>
+        mock.timers.enable({ apis: ["setInterval", "setTimeout"] })
+    );
     void afterEach(() => mock.timers.reset());
 
     void it("does not schedule a timer under the Node test runner", () => {
@@ -294,6 +296,7 @@ void describe("periodic stale run-dir sweep", () => {
         let calls = 0;
         const lines: string[] = [];
         const timer = schedulePeriodicTmuxRunDirCleanup({
+            firstRunDelayMs: TMUX_RUN_DIR_SWEEP_INTERVAL_MS + 1,
             reapOrphans: async () => ({
                 examined: 0,
                 orphaned: 0,

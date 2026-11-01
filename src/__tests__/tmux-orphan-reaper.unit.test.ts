@@ -181,6 +181,21 @@ async function twoObservations(
 }
 
 void describe("tmux orphan process reaper", () => {
+    void it("uses asynchronous process enumeration when the reader provides it", async () => {
+        const { reader } = fixture();
+        let asyncEnumerations = 0;
+        reader.pidsAsync = async () => {
+            asyncEnumerations++;
+            return reader.pids();
+        };
+        await reapOrphanedTmuxProcesses({
+            rootDir: ROOT,
+            reader,
+            minimumObservationIntervalMs: 0,
+        });
+        assert.equal(asyncEnumerations, 1);
+    });
+
     void it("reaps a dead-owner frozen chain with TERM then KILL and pinned counters", async () => {
         const { reader, outputFile } = fixture();
         const previousEnable = process.env[ORPHAN_REAPER_ENABLE_ENV];

@@ -341,13 +341,14 @@ export function formatTmuxRunDirSweepLog(
 }
 
 /**
- * Schedule the same conservative sweep used at startup. It deliberately waits
- * one full interval before its first run; the caller already performs startup
- * cleanup. The timer is unref'd so it cannot keep pi alive on its own.
+ * Schedule conservative maintenance off the startup path. The first pass is
+ * delayed; later passes follow the hourly interval. Timers are unref'd so they
+ * cannot keep pi alive on their own.
  */
 export function schedulePeriodicTmuxRunDirCleanup(
     options: {
         intervalMs?: number;
+        firstRunDelayMs?: number;
         cleanup?: () =>
             | StaleRunDirCleanupStats
             | Promise<StaleRunDirCleanupStats>;
@@ -361,31 +362,35 @@ export function schedulePeriodicTmuxRunDirCleanup(
     if (options.isTestRunner ?? isNodeTestRunner()) return undefined;
 
     const intervalMs = options.intervalMs ?? TMUX_RUN_DIR_SWEEP_INTERVAL_MS;
+    const firstRunDelayMs = options.firstRunDelayMs ?? 5_000;
     const cleanup = options.cleanup ?? cleanupStaleTmuxRunDirs;
     const log = options.log ?? ((line: string) => console.error(line));
     const reapOrphans =
         options.reapOrphans ??
         (() => reapOrphanedTmuxProcesses({ rootDir: "/tmp" }));
     let inFlight = false;
-    const timer = setInterval(() => {
+    const runSweep = (source: "startup" | "periodic") => {
         if (inFlight) return;
         inFlight = true;
         void Promise.resolve()
             .then(() => reapOrphans())
             .then((stats) => log(formatOrphanReaperLog(stats)))
             .then(() => cleanup())
-            .then((stats) => log(formatTmuxRunDirSweepLog("periodic", stats)))
+            .then((stats) => log(formatTmuxRunDirSweepLog(source, stats)))
             .catch((error: unknown) => {
                 const detail =
                     error instanceof Error ? error.message : String(error);
                 log(
-                    `[tau] tmux-run-dir-sweep source=periodic error=${JSON.stringify(detail)}`
+                    `[tau] tmux-run-dir-sweep source=${source} error=${JSON.stringify(detail)}`
                 );
             })
             .finally(() => {
                 inFlight = false;
             });
-    }, intervalMs);
+    };
+    const firstPass = setTimeout(() => runSweep("startup"), firstRunDelayMs);
+    firstPass.unref?.();
+    const timer = setInterval(() => runSweep("periodic"), intervalMs);
     timer.unref?.();
     return timer;
 }

@@ -6,6 +6,7 @@ import {
     writeFileSync,
     renameSync,
 } from "node:fs";
+import { readdir, readlink } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -17,6 +18,8 @@ import { join } from "node:path";
 export const ORPHAN_REAPER_METADATA_SUFFIX = ".owner.json";
 export const ORPHAN_REAPER_STATE_SUFFIX = ".reaper.json";
 export const ORPHAN_REAPER_DISABLE_ENV = "PI_TAU_DISABLE_ORPHAN_REAPER";
+export const ORPHAN_REAPER_DELAY_ENV = "PI_TAU_ORPHAN_REAPER_DELAY_MS";
+export const ORPHAN_REAPER_DEFAULT_DELAY_MS = 5_000;
 export const ORPHAN_REAPER_ENABLE_ENV = "PI_TAU_ENABLE_ORPHAN_REAPER";
 export const ORPHAN_REAPER_DRY_RUN_ENV = "PI_TAU_ORPHAN_REAPER_DRY_RUN";
 export const ORPHAN_REAPER_MIN_INTERVAL_ENV =
@@ -43,11 +46,17 @@ export interface TmuxJobOwnership {
 export interface ReaperProcReader {
     bootId(): string | null;
     pids(): number[];
+    pidsAsync?(): Promise<number[]>;
     identity(pid: number): ProcessIdentity | null;
     cpuTime(pid: number): number | null;
     pipeState(
         pid: number
-    ): "not-blocked" | "blocked-no-peer" | "blocked-peer" | null;
+    ):
+        | "not-blocked"
+        | "blocked-no-peer"
+        | "blocked-peer"
+        | null
+        | Promise<"not-blocked" | "blocked-no-peer" | "blocked-peer" | null>;
     signal(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean;
     sleep(ms: number): Promise<void>;
     outputBytes(path: string): number | null;
@@ -55,6 +64,7 @@ export interface ReaperProcReader {
     writeText(path: string, value: string): void;
     rename(from: string, to: string): void;
     list(path: string): string[];
+    listAsync?(path: string): Promise<string[]>;
     exists(path: string): boolean;
 }
 
@@ -144,6 +154,15 @@ const defaultReader: ReaperProcReader = {
             return [];
         }
     },
+    pidsAsync: async () => {
+        try {
+            return (await readdir("/proc"))
+                .filter((x) => /^\d+$/.test(x))
+                .map(Number);
+        } catch {
+            return [];
+        }
+    },
     identity: readLinuxProcessIdentity,
     cpuTime: (pid) => {
         try {
@@ -158,7 +177,7 @@ const defaultReader: ReaperProcReader = {
             return null;
         }
     },
-    pipeState: (pid) => {
+    pipeState: async (pid) => {
         try {
             const wchan = readFileSync(`/proc/${pid}/wchan`, "utf8").trim();
             if (!/pipe_(read|write|wait)|wait_for_partner/.test(wchan))
@@ -172,24 +191,27 @@ const defaultReader: ReaperProcReader = {
             const match = /^pipe:\[(\d+)\]$/.exec(link);
             if (!match) return null;
             const inode = match[1];
-            for (const otherPid of readdirSync("/proc").filter(
+            for (const otherPid of (await readdir("/proc")).filter(
                 (x) => /^\d+$/.test(x) && Number(x) !== pid
             )) {
                 let fds: string[];
                 try {
-                    fds = readdirSync(`/proc/${otherPid}/fd`);
+                    fds = await readdir(`/proc/${otherPid}/fd`);
                 } catch {
                     return null;
                 }
                 for (const otherFd of fds) {
                     try {
                         if (
-                            readlinkSync(`/proc/${otherPid}/fd/${otherFd}`) ===
+                            (await readlink(`/proc/${otherPid}/fd/${otherFd}`)) ===
                             `pipe:[${inode}]`
                         )
                             return "blocked-peer";
                     } catch {
                         return null;
+                    }
+                    if (Number(otherFd) > 0 && Number(otherFd) % 128 === 0) {
+                        await new Promise<void>((resolve) => setImmediate(resolve));
                     }
                 }
             }
@@ -226,6 +248,13 @@ const defaultReader: ReaperProcReader = {
     list: (path) => {
         try {
             return readdirSync(path);
+        } catch {
+            return [];
+        }
+    },
+    listAsync: async (path) => {
+        try {
+            return await readdir(path);
         } catch {
             return [];
         }
@@ -300,12 +329,20 @@ export function inspectRunDirWrapperLiveness(
     return foundMetadata ? "dead" : "unknown";
 }
 
-function descendants(
+async function readPids(reader: ReaperProcReader): Promise<number[]> {
+    return reader.pidsAsync ? reader.pidsAsync() : reader.pids();
+}
+
+async function descendants(
     root: ProcessIdentity,
-    reader: ReaperProcReader
-): ProcessIdentity[] | null {
-    const pids = reader.pids();
-    const identities = pids.map((pid) => reader.identity(pid));
+    reader: ReaperProcReader,
+    pids: number[]
+): Promise<ProcessIdentity[] | null> {
+    const identities: Array<ProcessIdentity | null> = [];
+    for (let i = 0; i < pids.length; i++) {
+        identities.push(reader.identity(pids[i]));
+        if ((i + 1) % 128 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     // An unreadable process could be a child in this chain. Fail closed rather
     // than signalling a partial tree while an unverified descendant survives.
     if (identities.some((identity) => identity === null)) return null;
@@ -410,12 +447,23 @@ export async function reapOrphanedTmuxProcesses(
         return stats;
     }
     let killedThisSweep = 0;
-    for (const runName of reader.list(options.rootDir)) {
+    const pids = await readPids(reader);
+    const runNames = reader.listAsync
+        ? await reader.listAsync(options.rootDir)
+        : reader.list(options.rootDir);
+    for (let runIndex = 0; runIndex < runNames.length; runIndex++) {
+        const runName = runNames[runIndex];
+        if (runIndex > 0 && runIndex % 16 === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
         if (!runName.startsWith("pi-tmux-")) continue;
         const runDir = join(options.rootDir, runName);
-        const metadataNames = reader
-            .list(runDir)
-            .filter((name) => name.endsWith(ORPHAN_REAPER_METADATA_SUFFIX));
+        const dirEntries = reader.listAsync
+            ? await reader.listAsync(runDir)
+            : reader.list(runDir);
+        const metadataNames = dirEntries.filter((name) =>
+            name.endsWith(ORPHAN_REAPER_METADATA_SUFFIX)
+        );
         if (metadataNames.length === 0) {
             stats.examined++;
             stats.keptUnverified++;
@@ -439,7 +487,7 @@ export async function reapOrphanedTmuxProcesses(
                 stats.keptLive++;
                 continue;
             }
-            if (!ownerCurrent && reader.pids().includes(owner.pid)) {
+            if (!ownerCurrent && pids.includes(owner.pid)) {
                 stats.keptUnverified++;
                 continue;
             }
@@ -469,7 +517,7 @@ export async function reapOrphanedTmuxProcesses(
                 ORPHAN_REAPER_METADATA_SUFFIX,
                 ORPHAN_REAPER_STATE_SUFFIX
             );
-            const chain = descendants(currentWrapper, reader);
+            const chain = await descendants(currentWrapper, reader, pids);
             if (!chain) {
                 stats.keptUnverified++;
                 continue;
@@ -509,7 +557,9 @@ export async function reapOrphanedTmuxProcesses(
                 stats.intervalNotElapsed++;
                 continue;
             }
-            const pipeResults = chain.map((proc) => reader.pipeState(proc.pid));
+            const pipeResults = await Promise.all(
+                chain.map((proc) => reader.pipeState(proc.pid))
+            );
             if (pipeResults.includes("blocked-peer")) {
                 stats.stuckChainCount++;
                 stats.stuckChains.push(
@@ -540,7 +590,7 @@ export async function reapOrphanedTmuxProcesses(
                 stats.keptLive++;
                 continue;
             }
-            if (!latestOwner && reader.pids().includes(owner.pid)) {
+            if (!latestOwner && pids.includes(owner.pid)) {
                 stats.keptUnverified++;
                 continue;
             }

@@ -183,6 +183,17 @@ export function sidecarDbPath(): string {
  * prevent unbounded growth. Scoped to entries this module owns
  * (bash_bg, agent_bg).
  */
+export const SIDECAR_PURGE_DELAY_MS = 5_000;
+
+export function scheduleSidecarPurge(
+    purge: () => void = () => purgeSidecar(),
+    delayMs = SIDECAR_PURGE_DELAY_MS
+): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(purge, delayMs);
+    timer.unref?.();
+    return timer;
+}
+
 export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
     const dbPath = sidecarDbPath();
     if (!existsSync(dbPath)) return;
