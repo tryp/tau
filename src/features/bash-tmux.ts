@@ -564,7 +564,8 @@ export function spawnBackgroundTmux(
         logPath: string
     ) => () => void,
     onCompletion: (job: BackgroundJob) => void,
-    onTerminal?: () => void
+    onTerminal?: () => void,
+    onPoll?: () => void
 ): BackgroundJob {
     const { tmuxCtx, logPath } = spawnForegroundTmux(command, cwd);
 
@@ -588,6 +589,7 @@ export function spawnBackgroundTmux(
 
     // Poll for exit-code completion every 500ms.
     const pollTimer = setInterval(() => {
+        onPoll?.();
         const result = pollTmuxCompletion(job);
         if (!result.completed) return;
 

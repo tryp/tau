@@ -509,6 +509,41 @@ export interface StallWatchdogOptions {
     silenceNoticeOnlyAfterGrowth?: boolean;
 }
 
+export const BG_WAIT_HEARTBEAT_INTERVAL_MS = 5_000;
+
+/** Create a throttled tool-progress update for a silent foreground bash wait. */
+export function createBgWaitHeartbeat(
+    jobId: string,
+    startTime: number,
+    logPath: string,
+    onUpdate: AgentToolUpdateCallback<BashToolDetails | undefined> | undefined,
+    now: () => number = Date.now
+): () => void {
+    let lastEmittedAt = startTime;
+    return () => {
+        const currentTime = now();
+        if (currentTime - lastEmittedAt < BG_WAIT_HEARTBEAT_INTERVAL_MS) return;
+        lastEmittedAt = currentTime;
+        let logBytes = 0;
+        try {
+            logBytes = statSync(logPath).size;
+        } catch {
+            // The tmux log may not exist yet; report zero bytes in that case.
+        }
+        onUpdate?.({
+            content: [
+                {
+                    type: "text" as const,
+                    text:
+                        `[pi-tau] Bash job ${jobId} still running: ` +
+                        `elapsedMs=${currentTime - startTime}, logBytes=${logBytes}`,
+                },
+            ],
+            details: undefined,
+        });
+    };
+}
+
 export function startStallWatchdog(
     jobId: string,
     command: string,
@@ -665,6 +700,36 @@ export function hasForegroundTasks(state: TauState): boolean {
 }
 
 // ─── Widget / status bar ────────────────────────────────────────────
+
+export const RUNNING_JOBS_WIDGET_REFRESH_MS = 5_000;
+
+/**
+ * Create a throttled widget refresh callback for an existing job poller.
+ * Reusing the poller avoids a new timer per job; the callback becomes inert
+ * when no jobs remain running.
+ */
+export function createRunningJobsWidgetRefresh(
+    state: TauState,
+    ctx: UiContext,
+    now: () => number = Date.now
+): () => void {
+    let lastRefreshAt = now();
+    return () => {
+        const currentTime = now();
+        if (currentTime - lastRefreshAt < RUNNING_JOBS_WIDGET_REFRESH_MS) {
+            return;
+        }
+        if (
+            !Array.from(state.backgroundJobs.values()).some(
+                (job) => job.status === "running"
+            )
+        ) {
+            return;
+        }
+        lastRefreshAt = currentTime;
+        updateWidget(state, ctx);
+    };
+}
 
 export function updateWidget(state: TauState, ctx: UiContext): void {
     // Runs from completion/terminal paths (timers, process close events) that
@@ -3283,9 +3348,10 @@ export function registerBackgroundJobs(
                         cancelDeadlineWake = undefined;
                         handleTmuxCompletion(job, state, pi, ctx, shouldNotify);
                     },
-                    // Refresh the background-jobs widget once the job is
-                    // finalized (completion/cleanup), not just at spawn.
-                    () => updateWidget(state, ctx)
+                    // Refresh once finalized, and tick elapsed-duration pills
+                    // from this existing completion poll while the job runs.
+                    () => updateWidget(state, ctx),
+                    createRunningJobsWidgetRefresh(state, ctx)
                 );
 
                 updateWidget(state, ctx);
@@ -4248,6 +4314,7 @@ async function executeTmuxForeground(
     createJobDonePromise(job);
     attachTmuxContext(job, tmuxCtx);
     state.backgroundJobs.set(jobId, job);
+    const refreshRunningJobsWidget = createRunningJobsWidgetRefresh(state, ctx);
 
     // Ctrl+B background signal
     let backgroundResolve: (() => void) | null = null;
@@ -4335,8 +4402,15 @@ async function executeTmuxForeground(
     const noOutputSignal = new Promise<void>((resolve) => {
         noOutputResolve = resolve;
     });
+    const emitWaitHeartbeat = createBgWaitHeartbeat(
+        jobId,
+        job.startTime,
+        logPath,
+        onUpdate
+    );
     const startPolling = (): void => {
         pollTimer = setInterval(() => {
+            refreshRunningJobsWidget();
             try {
                 const content = readOutputTailSync(logPath, 4_096);
                 if (content && content !== "(no output yet)") {
@@ -4348,6 +4422,7 @@ async function executeTmuxForeground(
             } catch {
                 // File may not be readable yet
             }
+            emitWaitHeartbeat();
         }, PROGRESS_POLL_MS);
         pollTimer.unref();
     };
@@ -4597,6 +4672,7 @@ async function executeTmuxForeground(
 
             // Start background completion poller
             const bgPoller = setInterval(() => {
+                refreshRunningJobsWidget();
                 const result = pollTmuxCompletion(job);
                 if (!result.completed) return;
                 clearInterval(bgPoller);
