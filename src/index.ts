@@ -44,7 +44,7 @@ import {
     restoreBackgroundJobs,
 } from "./features/background.ts";
 import { scheduleBackgroundJobRestore } from "./features/startup-maintenance.ts";
-import { scheduleSidecarPurge } from "./features/sidecar.ts";
+import { purgeSidecar, scheduleSidecarPurge } from "./features/sidecar.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import {
@@ -108,6 +108,20 @@ export default function (pi: ExtensionAPI) {
     let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
     let startupGeneration = 0;
     let sessionShuttingDown = false;
+    let sidecarPurgeCompleted = false;
+    const isStartupActive = (generation: number) =>
+        generation === startupGeneration && !sessionShuttingDown;
+    const scheduleSidecarPurgeForGeneration = (generation: number) => {
+        if (sidecarPurgeCompleted) return;
+        scheduleSidecarPurge(
+            () => {
+                sidecarPurgeCompleted = true;
+                purgeSidecar();
+            },
+            undefined,
+            () => isStartupActive(generation)
+        );
+    };
 
     // ── Compact renderer for job-completion messages ──────────────────
 
@@ -186,8 +200,9 @@ export default function (pi: ExtensionAPI) {
     // ── Register all features ─────────────────────────────────────────
 
     // Purge sidecar entries after startup so SQLite maintenance cannot delay
-    // extension loading or first prompt readiness.
-    scheduleSidecarPurge();
+    // extension loading or first prompt readiness. Session starts replace this
+    // registration-generation timer if it becomes stale before it fires.
+    scheduleSidecarPurgeForGeneration(startupGeneration);
 
     registerBackgroundJobs(pi, state);
     registerBackgroundCommands(pi, state);
@@ -536,6 +551,10 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_start", async (_event, ctx) => {
         const generation = ++startupGeneration;
+        if (tmuxRunDirSweepTimer) {
+            clearInterval(tmuxRunDirSweepTimer);
+            tmuxRunDirSweepTimer = undefined;
+        }
         sessionShuttingDown = false;
         ctx.ui.setStatus("tau-turn", ctx.ui.theme.fg("dim", "Ready"));
 
@@ -698,8 +717,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         // Schedule only after all awaited session initialization has completed.
         // Even a zero-delay timer runs after this handler returns to the event loop.
         if (
-            generation === startupGeneration &&
-            !sessionShuttingDown &&
+            isStartupActive(generation) &&
             state.tmuxAvailable &&
             !tmuxRunDirSweepTimer
         ) {
@@ -710,14 +728,23 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 Number.isFinite(configuredDelay) && configuredDelay >= 0
                     ? configuredDelay
                     : ORPHAN_REAPER_DEFAULT_DELAY_MS;
-            tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup({
+            const scheduledSweep = schedulePeriodicTmuxRunDirCleanup({
                 firstRunDelayMs,
+                shouldRun: () => isStartupActive(generation),
             });
+            tmuxRunDirSweepTimer = scheduledSweep;
         }
-        if (generation === startupGeneration && !sessionShuttingDown) {
-            scheduleBackgroundJobRestore(() =>
-                restoreBackgroundJobs(entries, state, pi, ctx)
-            );
+        if (isStartupActive(generation)) {
+            scheduleBackgroundJobRestore(() => {
+                if (!isStartupActive(generation)) {
+                    console.debug(
+                        "[tau] background restore skipped for stale startup"
+                    );
+                    return;
+                }
+                restoreBackgroundJobs(entries, state, pi, ctx);
+            });
+            scheduleSidecarPurgeForGeneration(generation);
         }
     });
 
@@ -743,6 +770,10 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_shutdown", async (_event, ctx) => {
         sessionShuttingDown = true;
+        if (tmuxRunDirSweepTimer) {
+            clearInterval(tmuxRunDirSweepTimer);
+            tmuxRunDirSweepTimer = undefined;
+        }
         stopTitlebarSpinner(pi, state, ctx);
         stopAgentTimer(state);
         state.agentStartTime = undefined;

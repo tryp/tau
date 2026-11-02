@@ -187,9 +187,16 @@ export const SIDECAR_PURGE_DELAY_MS = 5_000;
 
 export function scheduleSidecarPurge(
     purge: () => void = () => purgeSidecar(),
-    delayMs = SIDECAR_PURGE_DELAY_MS
+    delayMs = SIDECAR_PURGE_DELAY_MS,
+    shouldRun?: () => boolean
 ): ReturnType<typeof setTimeout> {
-    const timer = setTimeout(purge, delayMs);
+    const timer = setTimeout(() => {
+        if (shouldRun && !shouldRun()) {
+            console.debug("[tau] sidecar purge skipped for stale startup");
+            return;
+        }
+        purge();
+    }, delayMs);
     timer.unref?.();
     return timer;
 }

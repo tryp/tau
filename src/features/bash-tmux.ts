@@ -357,6 +357,8 @@ export function schedulePeriodicTmuxRunDirCleanup(
         isTestRunner?: boolean;
         /** Orphan process-chain reaper; invoked before directory cleanup. */
         reapOrphans?: () => Promise<OrphanReaperStats>;
+        /** Generation/lifecycle guard checked when each deferred pass fires. */
+        shouldRun?: () => boolean;
     } = {}
 ): ReturnType<typeof setInterval> | undefined {
     if (options.isTestRunner ?? isNodeTestRunner()) return undefined;
@@ -369,14 +371,35 @@ export function schedulePeriodicTmuxRunDirCleanup(
         options.reapOrphans ??
         (() => reapOrphanedTmuxProcesses({ rootDir: "/tmp" }));
     let inFlight = false;
+    let stopped = false;
+    const timers: {
+        firstPass?: ReturnType<typeof setTimeout>;
+        interval?: ReturnType<typeof setInterval>;
+    } = {};
+    const isCurrent = () => options.shouldRun?.() ?? true;
+    const stopStale = () => {
+        if (stopped) return;
+        stopped = true;
+        if (timers.firstPass) clearTimeout(timers.firstPass);
+        if (timers.interval) clearInterval(timers.interval);
+        console.debug("[tau] tmux maintenance skipped for stale startup");
+    };
     const runSweep = (source: "startup" | "periodic") => {
-        if (inFlight) return;
+        if (!isCurrent()) {
+            stopStale();
+            return;
+        }
+        if (stopped || inFlight) return;
         inFlight = true;
-        void Promise.resolve()
-            .then(() => reapOrphans())
-            .then((stats) => log(formatOrphanReaperLog(stats)))
-            .then(() => cleanup())
-            .then((stats) => log(formatTmuxRunDirSweepLog(source, stats)))
+        void (async () => {
+            if (!isCurrent()) return;
+            const reaperStats = await reapOrphans();
+            if (!isCurrent()) return;
+            log(formatOrphanReaperLog(reaperStats));
+            const cleanupStats = await cleanup();
+            if (!isCurrent()) return;
+            log(formatTmuxRunDirSweepLog(source, cleanupStats));
+        })()
             .catch((error: unknown) => {
                 const detail =
                     error instanceof Error ? error.message : String(error);
@@ -386,11 +409,14 @@ export function schedulePeriodicTmuxRunDirCleanup(
             })
             .finally(() => {
                 inFlight = false;
+                if (!isCurrent()) stopStale();
             });
     };
     const firstPass = setTimeout(() => runSweep("startup"), firstRunDelayMs);
+    timers.firstPass = firstPass;
     firstPass.unref?.();
     const timer = setInterval(() => runSweep("periodic"), intervalMs);
+    timers.interval = timer;
     timer.unref?.();
     return timer;
 }

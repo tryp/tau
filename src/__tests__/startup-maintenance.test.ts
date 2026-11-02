@@ -477,22 +477,61 @@ exit 0
             for (const handler of startHandlers.slice(0, -1)) {
                 await handler({}, ctx);
             }
-            const startupPromise = mainStart({}, ctx) as Promise<void>;
+            const shutdownHandlers = events.get("session_shutdown") ?? [];
+            const indexShutdown = shutdownHandlers[shutdownHandlers.length - 1];
+            assert.ok(indexShutdown);
+            const staleJobId = "stale-timer-job";
+            const staleContext = {
+                ...ctx,
+                sessionManager: {
+                    ...ctx.sessionManager,
+                    getEntries: () => [
+                        {
+                            type: "custom",
+                            customType: "background-tasks-state",
+                            data: {
+                                jobs: [
+                                    [
+                                        staleJobId,
+                                        {
+                                            id: staleJobId,
+                                            command: "echo stale",
+                                            pid: 2_147_483_647,
+                                            startTime: Date.now() - 1000,
+                                            status: "running",
+                                            logPath: join(dir, "stale-job.out"),
+                                            toolCallId: "call-stale",
+                                            isBackgrounded: true,
+                                            wantsCompletionNotification: false,
+                                        },
+                                    ],
+                                ],
+                                jobCounter: 1,
+                            },
+                        },
+                    ],
+                },
+            };
+            const startupA = mainStart({}, staleContext) as Promise<void>;
             assertRestoreIdle();
             fakeTimers.advance(0);
             assert.equal(procScans, 0);
             assert.equal(tmpSweeps, 0);
             assert.equal(sidecarSelects, 0);
-            await startupPromise;
+            await startupA;
             assertRestoreIdle();
-            assert.equal(procScans, 0);
-            assert.equal(tmpSweeps, 0);
-            assert.equal(sidecarSelects, 0);
+
+            // Shutdown A after it has scheduled all maintenance, then start B
+            // before any of A's timers can fire.
+            await indexShutdown({}, staleContext);
+            const startupB = mainStart({}, ctx) as Promise<void>;
+            await startupB;
+            assertRestoreIdle();
 
             fakeTimers.advance(0);
             await waitFor(() => procScans === 1 && tmpSweeps === 1);
-            assert.equal(procScans, 1);
-            assert.equal(tmpSweeps, 1);
+            assert.equal(procScans, 1, "only B's deferred orphan scan runs");
+            assert.equal(tmpSweeps, 1, "only B's run-dir sweep runs");
             assert.equal(sidecarSelects, 0);
             const tmuxAfterMaintenance = readFileSync(tmuxLog, "utf8")
                 .trim()
@@ -523,6 +562,11 @@ exit 0
                     (entry.data as { event?: string }).event === "terminal"
             );
             assert.equal(terminalRecords.length, 1);
+            assert.equal(
+                (terminalRecords[0].data as { jobId?: string }).jobId,
+                "deferred-restore-job",
+                "A's stale restore must no-op while B's restore remains active"
+            );
             assert.ok(sqliteInteractions > 0);
             const jobsTool = tools.get("jobs");
             assert.ok(jobsTool);
@@ -606,15 +650,15 @@ exit 0
                     )
                     .map((entry) => (entry.data as { jobId?: string }).jobId);
             const timersBeforeOverlap = fakeTimers.records.length;
-            const startupA = mainStart(
+            const overlapStartupA = mainStart(
                 {},
                 contextWithSnapshot(makeSnapshot("stale-generation-job"))
             ) as Promise<void>;
-            const startupB = mainStart(
+            const overlapStartupB = mainStart(
                 {},
                 contextWithSnapshot(makeSnapshot("current-generation-job"))
             ) as Promise<void>;
-            await startupA;
+            await overlapStartupA;
             const overlapRestoreTimers = fakeTimers.records
                 .slice(timersBeforeOverlap)
                 .filter((timer) => timer.due === fakeTimers.now + 100);
@@ -623,7 +667,7 @@ exit 0
                 1,
                 "only the latest overlapping session_start may schedule restore"
             );
-            await startupB;
+            await overlapStartupB;
             fakeTimers.advance(100);
             await waitFor(() =>
                 terminalJobIds().includes("current-generation-job")
@@ -634,8 +678,6 @@ exit 0
                 "the superseded startup must not restore using its stale entries"
             );
 
-            const shutdownHandlers = events.get("session_shutdown") ?? [];
-            const indexShutdown = shutdownHandlers[shutdownHandlers.length - 1];
             assert.ok(mainStart);
             assert.ok(indexShutdown);
             const timersBeforeShutdownRace = fakeTimers.records.length;
