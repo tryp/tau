@@ -564,6 +564,76 @@ exit 0
             );
             dbAfterPurge.close();
 
+            const makeSnapshot = (jobId: string) => [
+                {
+                    type: "custom",
+                    customType: "background-tasks-state",
+                    data: {
+                        jobs: [
+                            [
+                                jobId,
+                                {
+                                    id: jobId,
+                                    command: "echo generation",
+                                    pid: 2_147_483_647,
+                                    startTime: Date.now() - 1000,
+                                    status: "running",
+                                    logPath: jobOutputFile,
+                                    toolCallId: `call-${jobId}`,
+                                    isBackgrounded: true,
+                                    wantsCompletionNotification: false,
+                                },
+                            ],
+                        ],
+                        jobCounter: 1,
+                    },
+                },
+            ];
+            const contextWithSnapshot = (snapshot: unknown[]) => ({
+                ...ctx,
+                sessionManager: {
+                    ...ctx.sessionManager,
+                    getEntries: () => snapshot,
+                },
+            });
+            const terminalJobIds = () =>
+                appended
+                    .filter(
+                        (entry) =>
+                            entry.type === "background-job-liveness" &&
+                            (entry.data as { event?: string }).event ===
+                                "terminal"
+                    )
+                    .map((entry) => (entry.data as { jobId?: string }).jobId);
+            const timersBeforeOverlap = fakeTimers.records.length;
+            const startupA = mainStart(
+                {},
+                contextWithSnapshot(makeSnapshot("stale-generation-job"))
+            ) as Promise<void>;
+            const startupB = mainStart(
+                {},
+                contextWithSnapshot(makeSnapshot("current-generation-job"))
+            ) as Promise<void>;
+            await startupA;
+            const overlapRestoreTimers = fakeTimers.records
+                .slice(timersBeforeOverlap)
+                .filter((timer) => timer.due === fakeTimers.now + 100);
+            assert.equal(
+                overlapRestoreTimers.length,
+                1,
+                "only the latest overlapping session_start may schedule restore"
+            );
+            await startupB;
+            fakeTimers.advance(100);
+            await waitFor(() =>
+                terminalJobIds().includes("current-generation-job")
+            );
+            assert.equal(
+                terminalJobIds().includes("stale-generation-job"),
+                false,
+                "the superseded startup must not restore using its stale entries"
+            );
+
             const shutdownHandlers = events.get("session_shutdown") ?? [];
             const indexShutdown = shutdownHandlers[shutdownHandlers.length - 1];
             assert.ok(mainStart);

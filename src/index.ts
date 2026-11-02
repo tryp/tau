@@ -106,6 +106,7 @@ import {
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
     let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
+    let startupGeneration = 0;
     let sessionShuttingDown = false;
 
     // ── Compact renderer for job-completion messages ──────────────────
@@ -534,6 +535,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     // ── Session lifecycle ─────────────────────────────────────────────
 
     pi.on("session_start", async (_event, ctx) => {
+        const generation = ++startupGeneration;
         sessionShuttingDown = false;
         ctx.ui.setStatus("tau-turn", ctx.ui.theme.fg("dim", "Ready"));
 
@@ -696,6 +698,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         // Schedule only after all awaited session initialization has completed.
         // Even a zero-delay timer runs after this handler returns to the event loop.
         if (
+            generation === startupGeneration &&
             !sessionShuttingDown &&
             state.tmuxAvailable &&
             !tmuxRunDirSweepTimer
@@ -711,7 +714,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 firstRunDelayMs,
             });
         }
-        if (!sessionShuttingDown) {
+        if (generation === startupGeneration && !sessionShuttingDown) {
             scheduleBackgroundJobRestore(() =>
                 restoreBackgroundJobs(entries, state, pi, ctx)
             );
