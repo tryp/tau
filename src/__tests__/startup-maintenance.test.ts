@@ -2,6 +2,7 @@ import {
     chmodSync,
     mkdirSync,
     mkdtempSync,
+    readFileSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
@@ -209,6 +210,8 @@ void describe("deferred startup maintenance", () => {
             "PI_TAU_DISABLE_ORPHAN_REAPER",
             "PI_TAU_ENABLE_ORPHAN_REAPER",
             "PI_TAU_TMUX_RUN_DIR_RETENTION_MS",
+            "PI_TAU_TMUX_LIVENESS_POLL_EVERY",
+            "PI_TAU_TEST_TMUX_LOG",
         ];
         const rememberEnv = (key: string) =>
             previousEnv.set(key, process.env[key]);
@@ -229,6 +232,7 @@ void describe("deferred startup maintenance", () => {
         let procScans = 0;
         let tmpSweeps = 0;
         let sidecarSelects = 0;
+        let sqliteInteractions = 0;
         const tools = new Map<
             string,
             { execute: (...args: unknown[]) => unknown }
@@ -246,16 +250,45 @@ void describe("deferred startup maintenance", () => {
             mkdirSync(fakeBin, { recursive: true });
             mkdirSync(cwd, { recursive: true });
             const fakeTmux = join(fakeBin, "tmux");
-            writeFileSync(fakeTmux, "#!/bin/sh\nexit 0\n");
+            const tmuxLog = join(dir, "tmux.log");
+            writeFileSync(tmuxLog, "");
+            writeFileSync(
+                fakeTmux,
+                `#!/bin/sh
+echo "$*" >> "$PI_TAU_TEST_TMUX_LOG"
+exit 0
+`
+            );
             chmodSync(fakeTmux, 0o755);
 
             const db = new DatabaseSync(join(agentDir, "context.db"));
-            db.exec(
-                "CREATE TABLE context_sources (id TEXT PRIMARY KEY, tool_name TEXT, created_at INTEGER);" +
-                    "CREATE TABLE context_chunks (source_id TEXT);"
-            );
+            db.exec(`
+                CREATE TABLE context_sources (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    project_path TEXT,
+                    tool_name TEXT NOT NULL,
+                    input_summary TEXT,
+                    created_at INTEGER NOT NULL,
+                    byte_count INTEGER NOT NULL,
+                    line_count INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    preview_byte_count INTEGER NOT NULL DEFAULT 0,
+                    returned_byte_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE context_chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES context_sources(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    title TEXT,
+                    content TEXT NOT NULL,
+                    byte_count INTEGER NOT NULL
+                );
+            `);
             db.prepare(
-                "INSERT INTO context_sources (id, tool_name, created_at) VALUES (?, ?, ?)"
+                `INSERT INTO context_sources
+                    (id, tool_name, created_at, byte_count, line_count, content_hash)
+                 VALUES (?, ?, ?, 0, 0, '')`
             ).run("stale", "bash_bg", 1);
             db.close();
 
@@ -267,6 +300,8 @@ void describe("deferred startup maintenance", () => {
             delete process.env.NODE_TEST_CONTEXT;
             process.argv = process.argv.filter((arg) => arg !== "--test");
             process.env.PI_TAU_TMUX_RUN_DIR_RETENTION_MS = "2592000000";
+            process.env.PI_TAU_TMUX_LIVENESS_POLL_EVERY = "1";
+            process.env.PI_TAU_TEST_TMUX_LOG = tmuxLog;
 
             globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
             globalThis.setInterval =
@@ -289,9 +324,10 @@ void describe("deferred startup maintenance", () => {
             }) as typeof fsPromises.readdir;
             syncBuiltinESMExports();
             DatabaseSync.prototype.prepare = function (sql: string) {
+                sqliteInteractions++;
                 if (
                     sql
-                        .replace(/\\s+/g, " ")
+                        .replace(/\s+/g, " ")
                         .trim()
                         .startsWith("SELECT id FROM context_sources") &&
                     sql.includes("created_at < ?")
@@ -337,6 +373,17 @@ void describe("deferred startup maintenance", () => {
                 }
             );
             registerTau(pi as never);
+            const assertRestoreIdle = () => {
+                const terminalRecords = appended.filter(
+                    (entry) =>
+                        entry.type === "background-job-liveness" &&
+                        (entry.data as { event?: string }).event === "terminal"
+                );
+                assert.equal(terminalRecords.length, 0);
+                assert.equal(sqliteInteractions, 0);
+                assert.equal(readFileSync(tmuxLog, "utf8").trim(), "");
+            };
+            assertRestoreIdle();
             assert.equal(procScans, 0);
             assert.equal(tmpSweeps, 0);
             assert.equal(sidecarSelects, 0);
@@ -348,6 +395,8 @@ void describe("deferred startup maintenance", () => {
             );
 
             const jobId = "deferred-restore-job";
+            const jobOutputFile = join(dir, "job.out");
+            writeFileSync(jobOutputFile, "restored job output\n");
             const entries = [
                 {
                     type: "custom",
@@ -361,6 +410,13 @@ void describe("deferred startup maintenance", () => {
                                     command: "echo done",
                                     pid: 2_147_483_647,
                                     startTime: Date.now() - 1000,
+                                    tmux: {
+                                        session: "restore-test",
+                                        windowId: "@1",
+                                        exitCodeFile: join(dir, "missing.exit"),
+                                        outputFile: jobOutputFile,
+                                        gitRoot: cwd,
+                                    },
                                     status: "running",
                                     logPath: join(dir, "job.out"),
                                     toolCallId: "call-1",
@@ -416,15 +472,19 @@ void describe("deferred startup maintenance", () => {
             };
             const startHandlers = events.get("session_start");
             assert.ok(startHandlers?.length);
-            const start = async (...args: unknown[]) => {
-                for (const handler of startHandlers) await handler(...args);
-            };
-            const startupPromise = start({}, ctx);
+            const mainStart = startHandlers[startHandlers.length - 1];
+            assert.ok(mainStart);
+            for (const handler of startHandlers.slice(0, -1)) {
+                await handler({}, ctx);
+            }
+            const startupPromise = mainStart({}, ctx) as Promise<void>;
+            assertRestoreIdle();
             fakeTimers.advance(0);
             assert.equal(procScans, 0);
             assert.equal(tmpSweeps, 0);
             assert.equal(sidecarSelects, 0);
             await startupPromise;
+            assertRestoreIdle();
             assert.equal(procScans, 0);
             assert.equal(tmpSweeps, 0);
             assert.equal(sidecarSelects, 0);
@@ -434,14 +494,36 @@ void describe("deferred startup maintenance", () => {
             assert.equal(procScans, 1);
             assert.equal(tmpSweeps, 1);
             assert.equal(sidecarSelects, 0);
+            const tmuxAfterMaintenance = readFileSync(tmuxLog, "utf8")
+                .trim()
+                .split("\n")
+                .filter(Boolean).length;
+            assert.ok(tmuxAfterMaintenance > 0);
 
             fakeTimers.advance(100);
+            await waitFor(() => {
+                const terminals = appended.filter(
+                    (entry) =>
+                        entry.type === "background-job-liveness" &&
+                        (entry.data as { event?: string }).event === "terminal"
+                );
+                const tmuxLines = readFileSync(tmuxLog, "utf8")
+                    .trim()
+                    .split("\n")
+                    .filter(Boolean).length;
+                return (
+                    terminals.length === 1 &&
+                    sqliteInteractions > 0 &&
+                    tmuxLines > tmuxAfterMaintenance
+                );
+            });
             const terminalRecords = appended.filter(
                 (entry) =>
                     entry.type === "background-job-liveness" &&
                     (entry.data as { event?: string }).event === "terminal"
             );
             assert.equal(terminalRecords.length, 1);
+            assert.ok(sqliteInteractions > 0);
             const jobsTool = tools.get("jobs");
             assert.ok(jobsTool);
             const listed = (await jobsTool.execute(
@@ -455,7 +537,7 @@ void describe("deferred startup maintenance", () => {
             };
             assert.match(
                 listed.content[0].text,
-                /deferred-restore-job: .*completed/
+                /deferred-restore-job: .*failed/
             );
 
             fakeTimers.advance(150);
@@ -473,11 +555,28 @@ void describe("deferred startup maintenance", () => {
             assert.equal(sidecarSelects, 1);
             const dbAfterPurge = new DatabaseSync(join(agentDir, "context.db"));
             assert.equal(
-                dbAfterPurge.prepare("SELECT id FROM context_sources").all()
-                    .length,
+                dbAfterPurge
+                    .prepare(
+                        "SELECT id FROM context_sources WHERE id = 'stale'"
+                    )
+                    .all().length,
                 0
             );
             dbAfterPurge.close();
+
+            const shutdownHandlers = events.get("session_shutdown") ?? [];
+            const indexShutdown = shutdownHandlers[shutdownHandlers.length - 1];
+            assert.ok(mainStart);
+            assert.ok(indexShutdown);
+            const timersBeforeShutdownRace = fakeTimers.records.length;
+            const lateStartup = mainStart({}, ctx);
+            await indexShutdown({}, ctx);
+            await lateStartup;
+            assert.equal(
+                fakeTimers.records.length,
+                timersBeforeShutdownRace,
+                "shutdown during startup must not schedule a late restore"
+            );
 
             const maintenanceTimers = fakeTimers.records.filter(
                 (timer) =>

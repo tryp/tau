@@ -106,6 +106,7 @@ import {
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
     let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
+    let sessionShuttingDown = false;
 
     // ── Compact renderer for job-completion messages ──────────────────
 
@@ -533,6 +534,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     // ── Session lifecycle ─────────────────────────────────────────────
 
     pi.on("session_start", async (_event, ctx) => {
+        sessionShuttingDown = false;
         ctx.ui.setStatus("tau-turn", ctx.ui.theme.fg("dim", "Ready"));
 
         // ── Feature toggle state restoration ───────────────────────
@@ -693,7 +695,11 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
         // Schedule only after all awaited session initialization has completed.
         // Even a zero-delay timer runs after this handler returns to the event loop.
-        if (state.tmuxAvailable && !tmuxRunDirSweepTimer) {
+        if (
+            !sessionShuttingDown &&
+            state.tmuxAvailable &&
+            !tmuxRunDirSweepTimer
+        ) {
             const configuredDelay = Number(
                 process.env[ORPHAN_REAPER_DELAY_ENV]
             );
@@ -705,9 +711,11 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 firstRunDelayMs,
             });
         }
-        scheduleBackgroundJobRestore(() =>
-            restoreBackgroundJobs(entries, state, pi, ctx)
-        );
+        if (!sessionShuttingDown) {
+            scheduleBackgroundJobRestore(() =>
+                restoreBackgroundJobs(entries, state, pi, ctx)
+            );
+        }
     });
 
     pi.on("agent_end", async (event, ctx) => {
@@ -731,6 +739,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
+        sessionShuttingDown = true;
         stopTitlebarSpinner(pi, state, ctx);
         stopAgentTimer(state);
         state.agentStartTime = undefined;
