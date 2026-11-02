@@ -14,6 +14,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { appendFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { TauState } from "./state.ts";
 import { cleanupStaleLogs, detectNonInteractive } from "./utils.ts";
@@ -98,16 +101,34 @@ import {
     cleanupTmuxRunDir,
     schedulePeriodicTmuxRunDirCleanup,
 } from "./features/bash-tmux.ts";
-import {
-    ORPHAN_REAPER_DEFAULT_DELAY_MS,
-    ORPHAN_REAPER_DELAY_ENV,
-} from "./features/tmux-orphan-reaper.ts";
+import { ORPHAN_REAPER_DELAY_ENV } from "./features/tmux-orphan-reaper.ts";
+
+const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_MAINTENANCE_DELAY_MS = 86_400_000;
+
+export function resolveMaintenanceDelayMs(configuredDelay: number): number {
+    if (
+        !Number.isFinite(configuredDelay) ||
+        configuredDelay > MAX_NODE_TIMER_DELAY_MS
+    ) {
+        return 30_000;
+    }
+    return Math.max(
+        30_000,
+        Math.min(configuredDelay, MAX_MAINTENANCE_DELAY_MS)
+    );
+}
 
 export default function (pi: ExtensionAPI) {
     const state = new TauState();
     let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
     let startupGeneration = 0;
     let sessionShuttingDown = false;
+    let turnProcessing = false;
+    let lastActivityAt = Date.now();
+    const noteTerminalActivity = () => {
+        lastActivityAt = Date.now();
+    };
     let sidecarPurgeCompleted = false;
     const isStartupActive = (generation: number) =>
         generation === startupGeneration && !sessionShuttingDown;
@@ -271,7 +292,14 @@ export default function (pi: ExtensionAPI) {
         return undefined;
     }
 
+    pi.on("input", async (_event) => {
+        lastActivityAt = Date.now();
+        return { action: "continue" };
+    });
+
     pi.on("agent_start", async (_event, ctx) => {
+        turnProcessing = true;
+        lastActivityAt = Date.now();
         startTitlebarSpinner(pi, state, ctx);
         state.agentStartTime = Date.now();
         if (ctx.hasUI) startAgentTimer(state, ctx);
@@ -556,6 +584,9 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             tmuxRunDirSweepTimer = undefined;
         }
         sessionShuttingDown = false;
+        process.stdin.off("data", noteTerminalActivity);
+        if (ctx.hasUI) process.stdin.on("data", noteTerminalActivity);
+        lastActivityAt = Date.now();
         ctx.ui.setStatus("tau-turn", ctx.ui.theme.fg("dim", "Ready"));
 
         // ── Feature toggle state restoration ───────────────────────
@@ -721,16 +752,34 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             state.tmuxAvailable &&
             !tmuxRunDirSweepTimer
         ) {
-            const configuredDelay = Number(
-                process.env[ORPHAN_REAPER_DELAY_ENV]
-            );
-            const firstRunDelayMs =
-                Number.isFinite(configuredDelay) && configuredDelay >= 0
-                    ? configuredDelay
-                    : ORPHAN_REAPER_DEFAULT_DELAY_MS;
+            if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return;
+            const configuredDelayRaw =
+                process.env.PI_TAU_MAINTENANCE_DELAY_MS ??
+                process.env[ORPHAN_REAPER_DELAY_ENV];
+            const configuredDelay = Number(configuredDelayRaw);
+            const delayExceedsNodeLimit =
+                configuredDelayRaw !== undefined &&
+                Number.isFinite(configuredDelay) &&
+                configuredDelay > MAX_NODE_TIMER_DELAY_MS;
+            const firstRunDelayMs = resolveMaintenanceDelayMs(configuredDelay);
+            if (delayExceedsNodeLimit) {
+                void appendFile(
+                    join(tmpdir(), "pi-tau-maintenance.log"),
+                    `[tau] maintenance delay rejected above Node timer range; using 30000ms default\n`
+                ).catch(() => {});
+            }
             const scheduledSweep = schedulePeriodicTmuxRunDirCleanup({
                 firstRunDelayMs,
                 shouldRun: () => isStartupActive(generation),
+                isIdle: () =>
+                    !turnProcessing && Date.now() - lastActivityAt >= 5_000,
+                log: (line) => {
+                    void appendFile(
+                        join(tmpdir(), "pi-tau-maintenance.log"),
+                        `${line}\n`
+                    ).catch(() => {});
+                },
+                notify: (line) => ctx.ui.notify(line, "info"),
             });
             tmuxRunDirSweepTimer = scheduledSweep;
         }
@@ -749,6 +798,8 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     });
 
     pi.on("agent_end", async (event, ctx) => {
+        turnProcessing = false;
+        lastActivityAt = Date.now();
         // Stop timers and clear start time — guaranteed cleanup before
         // any fallible logic below. The interval's self-terminating guard
         // will also catch a surviving interval on its next tick.
@@ -770,6 +821,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_shutdown", async (_event, ctx) => {
         sessionShuttingDown = true;
+        process.stdin.off("data", noteTerminalActivity);
         if (tmuxRunDirSweepTimer) {
             clearInterval(tmuxRunDirSweepTimer);
             tmuxRunDirSweepTimer = undefined;

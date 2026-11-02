@@ -8,6 +8,32 @@ import {
 } from "node:fs";
 import { readdir, readlink } from "node:fs/promises";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setImmediate as yieldToEventLoop } from "node:timers";
+
+export async function forEachWithinTimeBudget<T>(
+    items: readonly T[],
+    visit: (item: T) => void | Promise<void>,
+    options: {
+        budgetMs?: number;
+        now?: () => number;
+        yield?: () => Promise<void>;
+    } = {}
+): Promise<void> {
+    const budgetMs = options.budgetMs ?? 8;
+    const now = options.now ?? (() => performance.now());
+    const yieldControl =
+        options.yield ??
+        (() => new Promise<void>((resolve) => yieldToEventLoop(resolve)));
+    let sliceStartedAt = now();
+    for (const item of items) {
+        await visit(item);
+        if (now() - sliceStartedAt >= budgetMs) {
+            await yieldControl();
+            sliceStartedAt = now();
+        }
+    }
+}
 
 /**
  * This detector only kills when a chain is stable and pipe-blocked with no
@@ -156,9 +182,12 @@ const defaultReader: ReaperProcReader = {
     },
     pidsAsync: async () => {
         try {
-            return (await readdir("/proc"))
-                .filter((x) => /^\d+$/.test(x))
-                .map(Number);
+            const names = await readdir("/proc");
+            const pids: number[] = [];
+            await forEachWithinTimeBudget(names, (name) => {
+                if (/^\d+$/.test(name)) pids.push(Number(name));
+            });
+            return pids;
         } catch {
             return [];
         }
@@ -191,9 +220,14 @@ const defaultReader: ReaperProcReader = {
             const match = /^pipe:\[(\d+)\]$/.exec(link);
             if (!match) return null;
             const inode = match[1];
-            for (const otherPid of (await readdir("/proc")).filter(
-                (x) => /^\d+$/.test(x) && Number(x) !== pid
-            )) {
+            const procEntries = await readdir("/proc");
+            const otherPids: string[] = [];
+            await forEachWithinTimeBudget(procEntries, (name) => {
+                if (/^\d+$/.test(name) && Number(name) !== pid)
+                    otherPids.push(name);
+            });
+            let sliceStartedAt = performance.now();
+            for (const otherPid of otherPids) {
                 let fds: string[];
                 try {
                     fds = await readdir(`/proc/${otherPid}/fd`);
@@ -211,10 +245,11 @@ const defaultReader: ReaperProcReader = {
                     } catch {
                         return null;
                     }
-                    if (Number(otherFd) > 0 && Number(otherFd) % 128 === 0) {
+                    if (performance.now() - sliceStartedAt >= 8) {
                         await new Promise<void>((resolve) =>
-                            setImmediate(resolve)
+                            yieldToEventLoop(resolve)
                         );
+                        sliceStartedAt = performance.now();
                     }
                 }
             }
@@ -310,6 +345,46 @@ function identityMatches(
     );
 }
 
+export async function inspectRunDirWrapperLivenessAsync(
+    dir: string
+): Promise<"alive" | "dead" | "unknown"> {
+    const boot = defaultReader.bootId();
+    if (!boot) return "unknown";
+    let foundMetadata = false;
+    const names = defaultReader.listAsync
+        ? await defaultReader.listAsync(dir)
+        : defaultReader.list(dir);
+    let pids: Set<number> | undefined;
+    let sliceStartedAt = performance.now();
+    for (const name of names) {
+        if (name.endsWith(ORPHAN_REAPER_METADATA_SUFFIX)) {
+            foundMetadata = true;
+            const ownership = parseOwnership(
+                defaultReader.readText(join(dir, name))
+            );
+            if (!ownership) return "unknown";
+            if (ownership.wrapper.bootId === boot) {
+                const current = defaultReader.identity(ownership.wrapper.pid);
+                if (identityMatches(ownership.wrapper, current, boot))
+                    return "alive";
+                if (!current) {
+                    pids ??= new Set(
+                        defaultReader.pidsAsync
+                            ? await defaultReader.pidsAsync()
+                            : defaultReader.pids()
+                    );
+                    if (pids.has(ownership.wrapper.pid)) return "unknown";
+                }
+            }
+        }
+        if (performance.now() - sliceStartedAt >= 8) {
+            await new Promise<void>((resolve) => yieldToEventLoop(resolve));
+            sliceStartedAt = performance.now();
+        }
+    }
+    return foundMetadata ? "dead" : "unknown";
+}
+
 export function inspectRunDirWrapperLiveness(
     dir: string
 ): "alive" | "dead" | "unknown" {
@@ -342,23 +417,26 @@ async function descendants(
     pids: number[]
 ): Promise<ProcessIdentity[] | null> {
     const identities: Array<ProcessIdentity | null> = [];
-    for (let i = 0; i < pids.length; i++) {
-        identities.push(reader.identity(pids[i]));
-        if ((i + 1) % 128 === 0)
-            await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    await forEachWithinTimeBudget(pids, (pid) => {
+        identities.push(reader.identity(pid));
+    });
     // An unreadable process could be a child in this chain. Fail closed rather
     // than signalling a partial tree while an unverified descendant survives.
     if (identities.some((identity) => identity === null)) return null;
     const verified = identities as ProcessIdentity[];
     const found = new Map<number, ProcessIdentity>([[root.pid, root]]);
     let changed = true;
+    let closureSliceStartedAt = performance.now();
     while (changed) {
         changed = false;
         for (const p of verified) {
             if (!found.has(p.pid) && found.has(p.ppid)) {
                 found.set(p.pid, p);
                 changed = true;
+            }
+            if (performance.now() - closureSliceStartedAt >= 8) {
+                await new Promise<void>((resolve) => yieldToEventLoop(resolve));
+                closureSliceStartedAt = performance.now();
             }
         }
     }
@@ -455,12 +533,8 @@ export async function reapOrphanedTmuxProcesses(
     const runNames = reader.listAsync
         ? await reader.listAsync(options.rootDir)
         : reader.list(options.rootDir);
-    for (let runIndex = 0; runIndex < runNames.length; runIndex++) {
-        const runName = runNames[runIndex];
-        if (runIndex > 0 && runIndex % 16 === 0) {
-            await new Promise<void>((resolve) => setImmediate(resolve));
-        }
-        if (!runName.startsWith("pi-tmux-")) continue;
+    await forEachWithinTimeBudget(runNames, async (runName) => {
+        if (!runName.startsWith("pi-tmux-")) return;
         const runDir = join(options.rootDir, runName);
         const dirEntries = reader.listAsync
             ? await reader.listAsync(runDir)
@@ -471,7 +545,7 @@ export async function reapOrphanedTmuxProcesses(
         if (metadataNames.length === 0) {
             stats.examined++;
             stats.keptUnverified++;
-            continue;
+            return;
         }
         for (const name of metadataNames) {
             stats.examined++;
@@ -643,7 +717,7 @@ export async function reapOrphanedTmuxProcesses(
                 stats.killEscalated++;
             } else stats.keptUnverified++;
         }
-    }
+    });
     return stats;
 }
 

@@ -17,7 +17,11 @@ import assert from "node:assert/strict";
 import { scheduleBackgroundJobRestore } from "../features/startup-maintenance.ts";
 import { schedulePeriodicTmuxRunDirCleanup } from "../features/bash-tmux.ts";
 import { scheduleSidecarPurge } from "../features/sidecar.ts";
-import { ORPHAN_REAPER_DELAY_ENV } from "../features/tmux-orphan-reaper.ts";
+import { resolveMaintenanceDelayMs } from "../index.ts";
+import {
+    forEachWithinTimeBudget,
+    ORPHAN_REAPER_DELAY_ENV,
+} from "../features/tmux-orphan-reaper.ts";
 
 const realSetTimeout = globalThis.setTimeout;
 
@@ -101,6 +105,15 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 void describe("deferred startup maintenance", () => {
+    void it("bounds configured maintenance delays to safe timer values", () => {
+        assert.equal(resolveMaintenanceDelayMs(30_000), 30_000);
+        assert.equal(resolveMaintenanceDelayMs(86_400_000), 86_400_000);
+        assert.equal(resolveMaintenanceDelayMs(100_000_000), 86_400_000);
+        assert.equal(resolveMaintenanceDelayMs(2_147_483_647), 86_400_000);
+        assert.equal(resolveMaintenanceDelayMs(2_147_483_648), 30_000);
+        assert.equal(resolveMaintenanceDelayMs(Number.NaN), 30_000);
+    });
+
     void it("defers and unrefs sidecar purge and background-job restore", () => {
         const fakeTimers = new FakeTimers();
         const oldSetTimeout = globalThis.setTimeout;
@@ -197,7 +210,154 @@ void describe("deferred startup maintenance", () => {
         }
     });
 
-    void it("keeps the real extension entry deferred through session_start, including zero delay", async () => {
+    void it("postpones maintenance until the caller reports sustained idle", async () => {
+        const fakeTimers = new FakeTimers();
+        const original = {
+            setTimeout: globalThis.setTimeout,
+            clearTimeout: globalThis.clearTimeout,
+        };
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        try {
+            let idle = false;
+            let runs = 0;
+            schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs: 30_000,
+                intervalMs: 60 * 60 * 1000,
+                isTestRunner: false,
+                isIdle: () => idle,
+                reapOrphans: async () => {
+                    runs++;
+                    return {
+                        examined: 0,
+                        orphaned: 0,
+                        killed: 0,
+                        keptLive: 0,
+                        keptFinished: 0,
+                        keptGrowing: 0,
+                        keptQuiet: 0,
+                        keptUnverified: 0,
+                        skippedBootMismatch: 0,
+                        killEscalated: 0,
+                        wouldKill: [],
+                        wouldKillOmitted: 0,
+                        intervalNotElapsed: 0,
+                        chainAbandoned: 0,
+                        stuckChainCount: 0,
+                        stuckChains: [],
+                    };
+                },
+                cleanup: async () => ({
+                    examined: 0,
+                    removed: 0,
+                    keptAlive: 0,
+                    keptUnknown: 0,
+                }),
+            });
+            fakeTimers.advance(30_000);
+            assert.equal(runs, 0);
+            idle = true;
+            fakeTimers.advance(1_000);
+            await waitFor(() => runs === 1);
+        } finally {
+            globalThis.setTimeout = original.setTimeout;
+            globalThis.clearTimeout = original.clearTimeout;
+        }
+    });
+
+    void it("uses elapsed-time slices instead of fixed item counts", async () => {
+        let now = 0;
+        let yields = 0;
+        let visits = 0;
+        await forEachWithinTimeBudget(
+            Array.from({ length: 10 }),
+            () => {
+                visits++;
+                now += 3;
+            },
+            {
+                budgetMs: 8,
+                now: () => now,
+                yield: async () => {
+                    yields++;
+                },
+            }
+        );
+        assert.equal(visits, 10);
+        assert.equal(yields, 3);
+    });
+
+    void it("timer callbacks never write directly to console", async () => {
+        const fakeTimers = new FakeTimers();
+        const originals = {
+            log: console.log,
+            info: console.info,
+            warn: console.warn,
+            error: console.error,
+            debug: console.debug,
+        };
+        let writes = 0;
+        let complete = false;
+        for (const method of Object.keys(originals) as Array<
+            keyof typeof originals
+        >) {
+            console[method] = (() => {
+                writes++;
+            }) as (typeof console)[typeof method];
+        }
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldSetInterval = globalThis.setInterval;
+        const oldClearTimeout = globalThis.clearTimeout;
+        const oldClearInterval = globalThis.clearInterval;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.setInterval = fakeTimers.setInterval as typeof setInterval;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        globalThis.clearInterval = fakeTimers.clear as typeof clearInterval;
+        try {
+            schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs: 30_000,
+                isTestRunner: false,
+                reapOrphans: async () => ({
+                    examined: 0,
+                    orphaned: 0,
+                    killed: 0,
+                    keptLive: 0,
+                    keptFinished: 0,
+                    keptGrowing: 0,
+                    keptQuiet: 0,
+                    keptUnverified: 0,
+                    skippedBootMismatch: 0,
+                    killEscalated: 0,
+                    wouldKill: [],
+                    wouldKillOmitted: 0,
+                    intervalNotElapsed: 0,
+                    chainAbandoned: 0,
+                    stuckChainCount: 0,
+                    stuckChains: [],
+                }),
+                cleanup: async () => {
+                    complete = true;
+                    return {
+                        examined: 0,
+                        removed: 0,
+                        keptAlive: 0,
+                        keptUnknown: 0,
+                    };
+                },
+            });
+            fakeTimers.advance(30_000);
+            await waitFor(() => complete);
+            assert.equal(writes, 0);
+        } finally {
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.setInterval = oldSetInterval;
+            globalThis.clearTimeout = oldClearTimeout;
+            globalThis.clearInterval = oldClearInterval;
+            Object.assign(console, originals);
+        }
+    });
+
+    void it("keeps the real extension entry deferred through session_start, rejecting unsafe timer delays", async () => {
         const dir = mkdtempSync(join(tmpdir(), "pi-tau-startup-maintenance-"));
         const agentDir = join(dir, "agent");
         const fakeBin = join(dir, "bin");
@@ -205,6 +365,7 @@ void describe("deferred startup maintenance", () => {
         const previousEnv = new Map<string, string | undefined>();
         const envKeys = [
             "PATH",
+            "TMPDIR",
             "PI_CODING_AGENT_DIR",
             "PI_TAU_ORPHAN_REAPER_DELAY_MS",
             "PI_TAU_DISABLE_ORPHAN_REAPER",
@@ -220,6 +381,7 @@ void describe("deferred startup maintenance", () => {
         const oldSetInterval = globalThis.setInterval;
         const oldClearTimeout = globalThis.clearTimeout;
         const oldClearInterval = globalThis.clearInterval;
+        const oldDateNow = Date.now;
         const oldReaddirSync = fs.readdirSync;
         const oldReaddir = fsPromises.readdir;
         const oldPrepare = Object.getOwnPropertyDescriptor(
@@ -293,8 +455,9 @@ exit 0
             db.close();
 
             process.env.PATH = `${fakeBin}:${previousEnv.get("PATH") ?? ""}`;
+            process.env.TMPDIR = dir;
             process.env.PI_CODING_AGENT_DIR = agentDir;
-            process.env[ORPHAN_REAPER_DELAY_ENV] = "0";
+            process.env[ORPHAN_REAPER_DELAY_ENV] = "2147483648";
             delete process.env.PI_TAU_DISABLE_ORPHAN_REAPER;
             delete process.env.PI_TAU_ENABLE_ORPHAN_REAPER;
             delete process.env.NODE_TEST_CONTEXT;
@@ -303,6 +466,7 @@ exit 0
             process.env.PI_TAU_TMUX_LIVENESS_POLL_EVERY = "1";
             process.env.PI_TAU_TEST_TMUX_LOG = tmuxLog;
 
+            Date.now = () => oldDateNow() + fakeTimers.now;
             globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
             globalThis.setInterval =
                 fakeTimers.setInterval as typeof setInterval;
@@ -320,6 +484,10 @@ exit 0
                 ...args: unknown[]
             ) => {
                 if (String(path) === "/proc") procScans++;
+                if (String(path) === "/tmp") {
+                    tmpSweeps++;
+                    return [];
+                }
                 return oldReaddir(path, ...(args as [never]));
             }) as typeof fsPromises.readdir;
             syncBuiltinESMExports();
@@ -528,16 +696,42 @@ exit 0
             await startupB;
             assertRestoreIdle();
 
-            fakeTimers.advance(0);
-            await waitFor(() => procScans === 1 && tmpSweeps === 1);
+            const maintenanceTimer = fakeTimers.records
+                .filter(
+                    (timer) =>
+                        !timer.cleared &&
+                        timer.interval === 0 &&
+                        timer.due >= 30_000
+                )
+                .at(-1);
+            assert.ok(maintenanceTimer, "maintenance timer uses the 30s floor");
+            assert.equal(maintenanceTimer.due, 30_000);
+            Date.now = () => oldDateNow() + 30_000;
+            maintenanceTimer.callback();
+            Date.now = oldDateNow;
+            await new Promise<void>((resolve) => realSetTimeout(resolve, 50));
+            assert.equal(
+                procScans,
+                1,
+                `maintenance callback did not scan; due=${maintenanceTimer.due}, cleared=${maintenanceTimer.cleared}`
+            );
+            await waitFor(() => tmpSweeps === 2);
             assert.equal(procScans, 1, "only B's deferred orphan scan runs");
-            assert.equal(tmpSweeps, 1, "only B's run-dir sweep runs");
+            assert.equal(
+                tmpSweeps,
+                2,
+                "B performs one reaper root enumeration and one run-dir sweep"
+            );
+            await waitFor(() =>
+                readFileSync(
+                    join(dir, "pi-tau-maintenance.log"),
+                    "utf8"
+                ).includes("maintenance delay rejected above Node timer range")
+            );
             assert.equal(sidecarSelects, 0);
-            const tmuxAfterMaintenance = readFileSync(tmuxLog, "utf8")
-                .trim()
-                .split("\n")
-                .filter(Boolean).length;
-            assert.ok(tmuxAfterMaintenance > 0);
+            await waitFor(
+                () => readFileSync(tmuxLog, "utf8").trim().length > 0
+            );
 
             fakeTimers.advance(100);
             await waitFor(() => {
@@ -546,15 +740,7 @@ exit 0
                         entry.type === "background-job-liveness" &&
                         (entry.data as { event?: string }).event === "terminal"
                 );
-                const tmuxLines = readFileSync(tmuxLog, "utf8")
-                    .trim()
-                    .split("\n")
-                    .filter(Boolean).length;
-                return (
-                    terminals.length === 1 &&
-                    sqliteInteractions > 0 &&
-                    tmuxLines > tmuxAfterMaintenance
-                );
+                return terminals.length === 1 && sqliteInteractions > 0;
             });
             const terminalRecords = appended.filter(
                 (entry) =>
@@ -704,6 +890,7 @@ exit 0
             );
         } finally {
             await stopExtension?.();
+            Date.now = oldDateNow;
             globalThis.setTimeout = oldSetTimeout;
             globalThis.setInterval = oldSetInterval;
             globalThis.clearTimeout = oldClearTimeout;

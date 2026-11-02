@@ -335,15 +335,7 @@ void describe("periodic stale run-dir sweep", () => {
         mock.timers.tick(1);
         for (let turn = 0; turn < 10; turn++) await Promise.resolve();
         assert.equal(calls, 1);
-        assert.equal(lines.length, 2);
-        assert.equal(
-            lines[0],
-            "[tau] tmux-orphan-reaper dry-run=true examined=0 orphaned=0 killed=0 kept-live=0 kept-finished=0 kept-growing=0 kept-quiet=0 kept-unverified=0 interval-not-elapsed=0 chain-abandoned=0 stuck-chains=0 stuck-findings=- skipped-boot-mismatch=0 kill-escalated=0 would-kill=-"
-        );
-        assert.equal(
-            lines[1],
-            "[tau] tmux-run-dir-sweep source=periodic examined=4 removed=2 kept-alive=1 kept-unknown=0"
-        );
+        assert.deepEqual(lines, []); // Maintenance completion is silent by default.
     });
 
     void it("skips an interval callback while a previous sweep is in flight", async () => {

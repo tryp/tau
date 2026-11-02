@@ -11,8 +11,12 @@
  */
 
 import { lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { lstat, readdir as readdirAsync, rm } from "node:fs/promises";
+import { setImmediate as yieldToEventLoop } from "node:timers";
+import { performance } from "node:perf_hooks";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
+import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TauState } from "../state.ts";
 import type { BackgroundJob, JobStatus, UiContext } from "../types.ts";
@@ -20,7 +24,9 @@ import {
     formatOrphanReaperLog,
     reapOrphanedTmuxProcesses,
     inspectRunDirWrapperLiveness,
+    inspectRunDirWrapperLivenessAsync,
     type OrphanReaperStats,
+    forEachWithinTimeBudget,
 } from "./tmux-orphan-reaper.ts";
 import {
     createJobDonePromise,
@@ -131,6 +137,8 @@ function processAlive(pid: number): ProcessLiveness {
 }
 
 /** Run a tmux command in the same shape the cleanup path always used. */
+const execFileAsync = promisify(execFile);
+
 function execTmux(command: string): string {
     return execSync(command, {
         encoding: "utf-8",
@@ -170,6 +178,34 @@ function newestMtimeMs(path: string): number | undefined {
         const childMtimeMs = newestMtimeMs(join(path, entry));
         if (childMtimeMs === undefined) return undefined;
         newest = Math.max(newest, childMtimeMs);
+    }
+    return newest;
+}
+
+async function newestMtimeMsAsync(path: string): Promise<number | undefined> {
+    let info;
+    try {
+        info = await lstat(path);
+    } catch {
+        return undefined;
+    }
+    let newest = info.mtimeMs;
+    if (!info.isDirectory()) return newest;
+    let entries: string[];
+    try {
+        entries = await readdirAsync(path);
+    } catch {
+        return undefined;
+    }
+    let sliceStartedAt = performance.now();
+    for (const entry of entries) {
+        const childMtime = await newestMtimeMsAsync(join(path, entry));
+        if (childMtime === undefined) return undefined;
+        newest = Math.max(newest, childMtime);
+        if (performance.now() - sliceStartedAt >= 8) {
+            await new Promise<void>((resolve) => yieldToEventLoop(resolve));
+            sliceStartedAt = performance.now();
+        }
     }
     return newest;
 }
@@ -253,6 +289,133 @@ export interface StaleRunDirCleanupStats {
     keptAlive: number;
     /** Directories preserved because process liveness could not be established. */
     keptUnknown: number;
+}
+
+export async function cleanupStaleTmuxRunDirsAsync(
+    options: StaleRunDirCleanupOptions = {}
+): Promise<StaleRunDirCleanupStats> {
+    const rootDir = options.rootDir ?? "/tmp";
+    const nowMs = (options.now ?? Date.now)();
+    const isAlive = options.isAlive ?? processAlive;
+    const retentionMs = options.retentionMs ?? resolveRunDirRetentionMs();
+    const wrapperLiveness = options.wrapperLiveness;
+    const stats: StaleRunDirCleanupStats = {
+        examined: 0,
+        removed: 0,
+        keptAlive: 0,
+        keptUnknown: 0,
+    };
+    let entries: string[];
+    try {
+        entries = await readdirAsync(rootDir);
+    } catch {
+        return stats;
+    }
+    await forEachWithinTimeBudget(entries, async (entry) => {
+        if (!entry.startsWith("pi-tmux-")) return;
+        const suffix = entry.slice("pi-tmux-".length);
+        if (!/^\d+$/.test(suffix)) return;
+        const pid = Number(suffix);
+        if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid)
+            return;
+        stats.examined++;
+        const liveness = isAlive(pid);
+        if (liveness === "alive") {
+            stats.keptAlive++;
+            return;
+        }
+        if (liveness === "unknown") {
+            stats.keptUnknown++;
+            return;
+        }
+        const dir = join(rootDir, entry);
+        const wrapperState = wrapperLiveness
+            ? wrapperLiveness(dir)
+            : await inspectRunDirWrapperLivenessAsync(dir);
+        if (wrapperState === "alive") {
+            stats.keptAlive++;
+            return;
+        }
+        if (wrapperState === "unknown") {
+            stats.keptUnknown++;
+            return;
+        }
+        const newest = await newestMtimeMsAsync(dir);
+        if (newest !== undefined && nowMs - newest >= retentionMs) {
+            try {
+                await rm(dir, { recursive: true, force: true });
+                stats.removed++;
+            } catch {
+                /* concurrent cleanup or permissions */
+            }
+        }
+    });
+    if (options.runTmux) reapOrphanedTmuxSessions(options.runTmux, isAlive);
+    else await reapOrphanedTmuxSessionsAsync(isAlive);
+    return stats;
+}
+
+async function reapOrphanedTmuxSessionsAsync(
+    isAlive: (pid: number) => ProcessLiveness
+): Promise<void> {
+    try {
+        const { stdout } = await execFileAsync(
+            "tmux",
+            ["list-sessions", "-F", "#{session_name}"],
+            { encoding: "utf8", timeout: 3000 }
+        );
+        const sessions = stdout
+            .trim()
+            .split("\n")
+            .filter((s) => s.startsWith("pi-bg-"));
+        await forEachWithinTimeBudget(sessions, async (session) => {
+            try {
+                const result = await execFileAsync(
+                    "tmux",
+                    [
+                        "list-panes",
+                        "-t",
+                        sanitizeTmuxToken(session, 64, "bg"),
+                        "-F",
+                        "#{pane_pid}",
+                    ],
+                    { encoding: "utf8", timeout: 3000 }
+                );
+                const pids = result.stdout
+                    .trim()
+                    .split("\n")
+                    .map((raw) =>
+                        /^\d+$/.test(raw.trim())
+                            ? Number(raw.trim())
+                            : undefined
+                    );
+                if (
+                    pids.length &&
+                    pids.every(
+                        (pid) =>
+                            pid !== undefined &&
+                            Number.isSafeInteger(pid) &&
+                            pid > 0 &&
+                            isAlive(pid) === "dead"
+                    )
+                ) {
+                    await execFileAsync(
+                        "tmux",
+                        [
+                            "kill-session",
+                            "-t",
+                            sanitizeTmuxToken(session, 64, "bg"),
+                        ],
+                        { timeout: 3000 }
+                    );
+                }
+            } catch {
+                /* tmux session changed or unavailable */
+            }
+        });
+    } catch {
+        /* tmux unavailable or no sessions */
+    }
 }
 
 export function cleanupStaleTmuxRunDirs(
@@ -359,14 +522,19 @@ export function schedulePeriodicTmuxRunDirCleanup(
         reapOrphans?: () => Promise<OrphanReaperStats>;
         /** Generation/lifecycle guard checked when each deferred pass fires. */
         shouldRun?: () => boolean;
+        /** Maintenance may start only after sustained idle. */
+        isIdle?: () => boolean;
+        /** Optional TUI-safe completion notification. */
+        notify?: (line: string) => void;
     } = {}
 ): ReturnType<typeof setInterval> | undefined {
     if (options.isTestRunner ?? isNodeTestRunner()) return undefined;
 
     const intervalMs = options.intervalMs ?? TMUX_RUN_DIR_SWEEP_INTERVAL_MS;
-    const firstRunDelayMs = options.firstRunDelayMs ?? 5_000;
-    const cleanup = options.cleanup ?? cleanupStaleTmuxRunDirs;
-    const log = options.log ?? ((line: string) => console.error(line));
+    if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return undefined;
+    const firstRunDelayMs = options.firstRunDelayMs ?? 30_000;
+    const cleanup = options.cleanup ?? cleanupStaleTmuxRunDirsAsync;
+    const log = options.log ?? (() => {});
     const reapOrphans =
         options.reapOrphans ??
         (() => reapOrphanedTmuxProcesses({ rootDir: "/tmp" }));
@@ -374,6 +542,7 @@ export function schedulePeriodicTmuxRunDirCleanup(
     let stopped = false;
     const timers: {
         firstPass?: ReturnType<typeof setTimeout>;
+        idleRetry?: ReturnType<typeof setTimeout>;
         interval?: ReturnType<typeof setInterval>;
     } = {};
     const isCurrent = () => options.shouldRun?.() ?? true;
@@ -381,8 +550,9 @@ export function schedulePeriodicTmuxRunDirCleanup(
         if (stopped) return;
         stopped = true;
         if (timers.firstPass) clearTimeout(timers.firstPass);
+        if (timers.idleRetry) clearTimeout(timers.idleRetry);
         if (timers.interval) clearInterval(timers.interval);
-        console.debug("[tau] tmux maintenance skipped for stale startup");
+        // Stale callbacks are intentionally silent: this may run during TUI rendering.
     };
     const runSweep = (source: "startup" | "periodic") => {
         if (!isCurrent()) {
@@ -390,22 +560,32 @@ export function schedulePeriodicTmuxRunDirCleanup(
             return;
         }
         if (stopped || inFlight) return;
+        if (options.isIdle && !options.isIdle()) {
+            timers.idleRetry = setTimeout(() => runSweep(source), 1_000);
+            timers.idleRetry.unref?.();
+            return;
+        }
+        if (timers.idleRetry) clearTimeout(timers.idleRetry);
         inFlight = true;
         void (async () => {
             if (!isCurrent()) return;
             const reaperStats = await reapOrphans();
             if (!isCurrent()) return;
-            log(formatOrphanReaperLog(reaperStats));
             const cleanupStats = await cleanup();
             if (!isCurrent()) return;
-            log(formatTmuxRunDirSweepLog(source, cleanupStats));
+            const summary = `${formatOrphanReaperLog(reaperStats)}\n${formatTmuxRunDirSweepLog(source, cleanupStats)}`;
+            if (process.env.PI_TAU_MAINTENANCE_LOG === "1") log(summary);
+            if (process.env.PI_TAU_MAINTENANCE_TOAST === "1")
+                options.notify?.(summary);
         })()
             .catch((error: unknown) => {
                 const detail =
                     error instanceof Error ? error.message : String(error);
-                log(
-                    `[tau] tmux-run-dir-sweep source=${source} error=${JSON.stringify(detail)}`
-                );
+                if (process.env.PI_TAU_MAINTENANCE_LOG === "1") {
+                    log(
+                        `[tau] tmux-run-dir-sweep source=${source} error=${JSON.stringify(detail)}`
+                    );
+                }
             })
             .finally(() => {
                 inFlight = false;
