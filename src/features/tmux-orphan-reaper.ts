@@ -203,15 +203,18 @@ const defaultReader: ReaperProcReader = {
                 for (const otherFd of fds) {
                     try {
                         if (
-                            (await readlink(`/proc/${otherPid}/fd/${otherFd}`)) ===
-                            `pipe:[${inode}]`
+                            (await readlink(
+                                `/proc/${otherPid}/fd/${otherFd}`
+                            )) === `pipe:[${inode}]`
                         )
                             return "blocked-peer";
                     } catch {
                         return null;
                     }
                     if (Number(otherFd) > 0 && Number(otherFd) % 128 === 0) {
-                        await new Promise<void>((resolve) => setImmediate(resolve));
+                        await new Promise<void>((resolve) =>
+                            setImmediate(resolve)
+                        );
                     }
                 }
             }
@@ -341,7 +344,8 @@ async function descendants(
     const identities: Array<ProcessIdentity | null> = [];
     for (let i = 0; i < pids.length; i++) {
         identities.push(reader.identity(pids[i]));
-        if ((i + 1) % 128 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+        if ((i + 1) % 128 === 0)
+            await new Promise<void>((resolve) => setImmediate(resolve));
     }
     // An unreadable process could be a child in this chain. Fail closed rather
     // than signalling a partial tree while an unverified descendant survives.
@@ -558,7 +562,7 @@ export async function reapOrphanedTmuxProcesses(
                 continue;
             }
             const pipeResults = await Promise.all(
-                chain.map((proc) => reader.pipeState(proc.pid))
+                chain.map((proc) => Promise.resolve(reader.pipeState(proc.pid)))
             );
             if (pipeResults.includes("blocked-peer")) {
                 stats.stuckChainCount++;

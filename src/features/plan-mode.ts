@@ -15,8 +15,8 @@ import type {
 import { Key } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
-import type { PermissionMode } from "./permissions/types.js";
-import { modeStatusText, modeColour } from "./permissions/index.js";
+import type { PermissionMode } from "./permissions/types.ts";
+import { modeStatusText, modeColour } from "./permissions/index.ts";
 import { planIdFromSession, createPlanFile } from "./plan-file.ts";
 import { clearToolsBeforePlanMode } from "./plan-tools.ts";
 

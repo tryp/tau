@@ -28,7 +28,7 @@ import {
     checkToolPermission,
     modeStatusText,
     modeColour,
-} from "./features/permissions/index.js";
+} from "./features/permissions/index.ts";
 import {
     startTitlebarSpinner,
     stopTitlebarSpinner,
@@ -88,8 +88,8 @@ import { registerClaudeResumeCommand } from "./features/claude-resume.ts";
 import { buildStatusBars, readUsageSnapshot } from "./features/quota-bars.ts";
 import { registerReloadTool } from "./features/reload.ts";
 import { registerCallbacks } from "./features/callbacks.ts";
-import { registerPermissions } from "./features/permissions/commands.js";
-import { registerPlanTools } from "./features/plan-tools.js";
+import { registerPermissions } from "./features/permissions/commands.ts";
+import { registerPlanTools } from "./features/plan-tools.ts";
 import { registerTauCommand } from "./features/features-register.ts";
 import { registerWakeup } from "./features/wakeup.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
@@ -558,25 +558,9 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
             Boolean(process.stdin.isTTY)
         );
 
-        // Background maintenance runs after readiness, never inside the
-        // synchronous session_start path. The initial reaper/sweep pass is
-        // timer-scheduled; subsequent passes remain hourly.
-        if (state.tmuxAvailable && !tmuxRunDirSweepTimer) {
-            const configuredDelay = Number(process.env[ORPHAN_REAPER_DELAY_ENV]);
-            const firstRunDelayMs = Number.isFinite(configuredDelay) && configuredDelay >= 5_000
-                ? configuredDelay
-                : ORPHAN_REAPER_DEFAULT_DELAY_MS;
-            tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup({
-                firstRunDelayMs,
-            });
-        }
-
-        // Get entries for synchronous lightweight UI-state restoration below;
-        // the background-job snapshot/poller restore itself is deferred.
+        // Get entries for lightweight UI-state restoration below; background
+        // job restore is scheduled after all awaited session initialization.
         const entries = ctx.sessionManager.getEntries();
-        scheduleBackgroundJobRestore(
-            () => restoreBackgroundJobs(entries, state, pi, ctx)
-        );
 
         // Restore plan-mode state from CLI flag
         if (pi.getFlag("plan") === true) {
@@ -706,6 +690,24 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         }
 
         cleanupStaleLogs();
+
+        // Schedule only after all awaited session initialization has completed.
+        // Even a zero-delay timer runs after this handler returns to the event loop.
+        if (state.tmuxAvailable && !tmuxRunDirSweepTimer) {
+            const configuredDelay = Number(
+                process.env[ORPHAN_REAPER_DELAY_ENV]
+            );
+            const firstRunDelayMs =
+                Number.isFinite(configuredDelay) && configuredDelay >= 0
+                    ? configuredDelay
+                    : ORPHAN_REAPER_DEFAULT_DELAY_MS;
+            tmuxRunDirSweepTimer = schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs,
+            });
+        }
+        scheduleBackgroundJobRestore(() =>
+            restoreBackgroundJobs(entries, state, pi, ctx)
+        );
     });
 
     pi.on("agent_end", async (event, ctx) => {

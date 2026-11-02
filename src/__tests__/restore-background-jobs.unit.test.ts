@@ -94,6 +94,50 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 void describe("restored background jobs", () => {
+    void it("delivers completion when the tmux sentinel appears before deferred restore", async () => {
+        const dir = mkdtempSync(
+            join(tmpdir(), "pi-tau-restore-deferred-sentinel-")
+        );
+        try {
+            const sentinel = join(dir, "job.exit");
+            const output = join(dir, "job.out");
+            writeFileSync(output, "finished output\n");
+            writeFileSync(sentinel, "0\n");
+            const job = persistedJob(
+                "restore-deferred-sentinel",
+                "running",
+                sentinel,
+                output
+            );
+            const state = new TauState();
+            const { pi, ctx, sent } = testRuntime();
+
+            // Session shutdown snapshots a still-running task. The command
+            // completes and writes its sentinel before the deferred restore runs.
+            await restoreFromSession([snapshot(job)], state, pi, ctx);
+            assert.equal(job.status, "completed");
+            await waitFor(() =>
+                sent.some(
+                    (message) =>
+                        (message as { customType?: string }).customType ===
+                        "job-completion"
+                )
+            );
+            flushCompletionBatch();
+            assert.ok(
+                sent.some(
+                    (message) =>
+                        (message as { customType?: string }).customType ===
+                        "job-completion"
+                ),
+                "deferred restore must deliver the completion notice"
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            flushCompletionBatch();
+        }
+    });
+
     void it("resumes polling and notifies when a running tmux job later writes its sentinel", async () => {
         const dir = mkdtempSync(join(tmpdir(), "pi-tau-restore-running-"));
         try {

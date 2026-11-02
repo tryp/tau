@@ -42,6 +42,7 @@ class FakeProc implements ReaperProcReader {
         [21, "not-blocked"],
     ]);
     boot: string | null = BOOT;
+    pidsAsync = async (): Promise<number[]> => this.pids();
     pids(): number[] {
         return this.listedPids.length
             ? [...this.listedPids]
