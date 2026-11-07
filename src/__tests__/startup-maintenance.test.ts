@@ -403,6 +403,8 @@ void describe("deferred startup maintenance", () => {
         const oldError = console.error;
         const sidecarErrors: string[] = [];
         const sidecarSuccesses: string[] = [];
+        let throwPurgeStatsOnce = false;
+        let thrownPurgeStats = 0;
         const stalePurgeLogs: string[] = [];
         console.debug = (...args: unknown[]) => {
             if (
@@ -416,6 +418,14 @@ void describe("deferred startup maintenance", () => {
             const message = String(args[0]);
             if (message.includes("[tau] sidecar purge failed:"))
                 sidecarErrors.push(message);
+            if (
+                throwPurgeStatsOnce &&
+                message.includes("[tau] sidecar-purge")
+            ) {
+                throwPurgeStatsOnce = false;
+                thrownPurgeStats++;
+                throw new Error("injected purge stats logger failure");
+            }
             if (
                 message.includes("[tau] sidecar-purge") &&
                 message.includes("errors=0")
@@ -486,6 +496,21 @@ exit 0
                     (id, tool_name, created_at, byte_count, line_count, content_hash)
                  VALUES (?, ?, ?, 0, 0, '')`
             ).run("stale", "bash_bg", 1);
+            const insertChunk = db.prepare(
+                `INSERT INTO context_chunks
+                    (id, source_id, ordinal, title, content, byte_count)
+                 VALUES (?, ?, ?, ?, ?, ?)`
+            );
+            for (let ordinal = 0; ordinal < 600; ordinal++) {
+                insertChunk.run(
+                    `stale-${ordinal}`,
+                    "stale",
+                    ordinal,
+                    "chunk",
+                    "x",
+                    1
+                );
+            }
             db.close();
 
             process.env.PATH = `${fakeBin}:${previousEnv.get("PATH") ?? ""}`;
@@ -883,9 +908,11 @@ exit 0
             fakeTimers.advance(4_750);
             assert.equal(sidecarSelects, 0, "purge must not run during a turn");
 
-            const validDbBackup = join(dir, "context.db.valid");
-            fs.renameSync(contextDbPath, validDbBackup);
-            mkdirSync(contextDbPath);
+            const retryAgentDir = join(dir, "retry-agent");
+            mkdirSync(retryAgentDir);
+            const retryDbPath = join(retryAgentDir, "context.db");
+            mkdirSync(retryDbPath);
+            process.env.PI_CODING_AGENT_DIR = retryAgentDir;
             await agentEnd({ messages: [] }, ctx);
             fakeTimers.advance(5_000);
             await waitFor(() => sidecarErrors.length > 0);
@@ -901,19 +928,40 @@ exit 0
                 ),
                 "a transient purge failure must arm a retry"
             );
-            fs.rmSync(contextDbPath, { recursive: true, force: true });
-            fs.renameSync(validDbBackup, contextDbPath);
+            fs.rmSync(retryDbPath, { recursive: true, force: true });
+            fs.copyFileSync(contextDbPath, retryDbPath);
+            throwPurgeStatsOnce = true;
             fakeTimers.advance(5_000);
-            await waitFor(() => sidecarSelects === 1);
+            assert.equal(
+                sidecarSelects,
+                1,
+                "the retry must query the restored database"
+            );
+            const overlappingAgentEnd = agentEnd({ messages: [] }, ctx);
+            fakeTimers.advance(5_000);
+            assert.equal(
+                sidecarSelects,
+                1,
+                "a second timer trigger must not open a concurrent purge"
+            );
+            await overlappingAgentEnd;
+            await waitFor(() => thrownPurgeStats === 1);
+            await waitFor(() =>
+                sidecarErrors.some((message) =>
+                    message.includes("injected purge stats logger failure")
+                )
+            );
+            fakeTimers.advance(5_000);
+            await waitFor(() => sidecarSelects === 2);
             await waitFor(() => sidecarSuccesses.length === 1);
             await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
             Date.now = oldDateNow;
             assert.equal(
                 sidecarSelects,
-                1,
-                "the retry must query the restored valid database"
+                2,
+                "the later trigger must run after the rejected purge releases its latch"
             );
-            const dbAfterPurge = new DatabaseSync(join(agentDir, "context.db"));
+            const dbAfterPurge = new DatabaseSync(retryDbPath);
             assert.equal(
                 dbAfterPurge
                     .prepare(

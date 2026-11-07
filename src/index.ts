@@ -135,6 +135,7 @@ export default function (pi: ExtensionAPI) {
     };
     let sidecarPurgeCompleted = false;
     let sidecarPurgeTimer: ReturnType<typeof setTimeout> | undefined;
+    let sidecarPurgeInFlightGeneration: number | undefined;
     const MAX_STALE_PURGE_REARMS = 3;
     const MAX_PURGE_ERROR_RETRIES = 3;
     const PURGE_ERROR_RETRY_DELAYS = [5_000, 15_000, 45_000] as const;
@@ -159,6 +160,18 @@ export default function (pi: ExtensionAPI) {
             async () => {
                 if (sidecarPurgeTimer === scheduledTimer)
                     sidecarPurgeTimer = undefined;
+                if (sidecarPurgeCompleted) return;
+                if (sidecarPurgeInFlightGeneration === generation) {
+                    // Defer rather than overlap SQLite connections; the idle ladder
+                    // will retry after the active pass releases its generation latch.
+                    scheduleSidecarPurgeForGeneration(
+                        generation,
+                        PURGE_IDLE_RETRY_DELAYS[0],
+                        staleRearms,
+                        idleRetries + 1
+                    );
+                    return;
+                }
                 if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
                     const delay =
                         PURGE_IDLE_RETRY_DELAYS[
@@ -175,43 +188,51 @@ export default function (pi: ExtensionAPI) {
                     );
                     return;
                 }
-                const stats = await purgeSidecar(undefined, {
-                    shouldContinue: () =>
-                        isStartupActive(generation) &&
-                        canRunSidecarPurge(turnProcessing, lastActivityAt),
-                });
-                if (!isStartupActive(generation)) return;
-                if (stats.errors > 0) {
-                    sidecarPurgeErrors += stats.errors;
-                    if (sidecarPurgeErrors <= MAX_PURGE_ERROR_RETRIES) {
-                        const delay =
-                            PURGE_ERROR_RETRY_DELAYS[sidecarPurgeErrors - 1];
-                        console.error(
-                            `[tau] sidecar purge error retry=${sidecarPurgeErrors}/${MAX_PURGE_ERROR_RETRIES} errors=${sidecarPurgeErrors} delay-ms=${delay}`
-                        );
+                sidecarPurgeInFlightGeneration = generation;
+                try {
+                    const stats = await purgeSidecar(undefined, {
+                        shouldContinue: () =>
+                            isStartupActive(generation) &&
+                            canRunSidecarPurge(turnProcessing, lastActivityAt),
+                    });
+                    if (!isStartupActive(generation)) return;
+                    if (stats.errors > 0) {
+                        sidecarPurgeErrors += stats.errors;
+                        if (sidecarPurgeErrors <= MAX_PURGE_ERROR_RETRIES) {
+                            const delay =
+                                PURGE_ERROR_RETRY_DELAYS[
+                                    sidecarPurgeErrors - 1
+                                ];
+                            console.error(
+                                `[tau] sidecar purge error retry=${sidecarPurgeErrors}/${MAX_PURGE_ERROR_RETRIES} errors=${sidecarPurgeErrors} delay-ms=${delay}`
+                            );
+                            scheduleSidecarPurgeForGeneration(
+                                generation,
+                                delay,
+                                staleRearms,
+                                0
+                            );
+                        } else {
+                            console.error(
+                                `[tau] sidecar purge retry limit reached failures=${sidecarPurgeErrors}`
+                            );
+                        }
+                        return;
+                    }
+                    if (stats.budgetExhausted) {
                         scheduleSidecarPurgeForGeneration(
                             generation,
-                            delay,
+                            5_000,
                             staleRearms,
                             0
                         );
-                    } else {
-                        console.error(
-                            `[tau] sidecar purge retry limit reached failures=${sidecarPurgeErrors}`
-                        );
+                        return;
                     }
-                    return;
+                    sidecarPurgeCompleted = true;
+                } finally {
+                    if (sidecarPurgeInFlightGeneration === generation)
+                        sidecarPurgeInFlightGeneration = undefined;
                 }
-                if (stats.budgetExhausted) {
-                    scheduleSidecarPurgeForGeneration(
-                        generation,
-                        5_000,
-                        staleRearms,
-                        0
-                    );
-                    return;
-                }
-                sidecarPurgeCompleted = true;
             },
             delayMs,
             () => isStartupActive(generation),
