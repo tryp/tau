@@ -14,6 +14,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+    cancelMaintenanceTasks,
+    runMaintenanceTask,
+} from "./maintenance/client.ts";
+import {
+    flushMaintenanceEvents,
+    recordMaintenanceEvent,
+} from "./maintenance/events.ts";
 import { appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,11 +55,6 @@ import {
     restoreBackgroundJobs,
 } from "./features/background.ts";
 import { scheduleBackgroundJobRestore } from "./features/startup-maintenance.ts";
-import {
-    canRunSidecarPurge,
-    purgeSidecar,
-    scheduleSidecarPurge,
-} from "./features/sidecar.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import {
@@ -130,132 +133,13 @@ export default function (pi: ExtensionAPI) {
     let sessionShuttingDown = false;
     let turnProcessing = false;
     let lastActivityAt = Date.now();
+    const cancelMaintenanceWorker = () => cancelMaintenanceTasks();
     const noteTerminalActivity = () => {
         lastActivityAt = Date.now();
+        cancelMaintenanceWorker();
     };
-    let sidecarPurgeCompleted = false;
-    let sidecarPurgeTimer: ReturnType<typeof setTimeout> | undefined;
-    let sidecarPurgeInFlightGeneration: number | undefined;
-    const MAX_STALE_PURGE_REARMS = 3;
-    const MAX_PURGE_ERROR_RETRIES = 3;
-    const PURGE_ERROR_RETRY_DELAYS = [5_000, 15_000, 45_000] as const;
-    const PURGE_IDLE_RETRY_DELAYS = [5_000, 15_000, 45_000, 120_000] as const;
-    let sidecarPurgeErrors = 0;
     const isStartupActive = (generation: number) =>
         generation === startupGeneration && !sessionShuttingDown;
-    const scheduleSidecarPurgeForGeneration = (
-        generation: number,
-        delayMs?: number,
-        staleRearms = 0,
-        idleRetries = 0
-    ) => {
-        if (
-            sidecarPurgeCompleted ||
-            sessionShuttingDown ||
-            process.env.PI_TAU_MAINTENANCE_DISABLE === "1"
-        )
-            return;
-        if (sidecarPurgeTimer) clearTimeout(sidecarPurgeTimer);
-        const scheduledTimer = scheduleSidecarPurge(
-            async () => {
-                if (sidecarPurgeTimer === scheduledTimer)
-                    sidecarPurgeTimer = undefined;
-                if (sidecarPurgeCompleted) return;
-                if (sidecarPurgeInFlightGeneration === generation) {
-                    // Defer rather than overlap SQLite connections; the idle ladder
-                    // will retry after the active pass releases its generation latch.
-                    scheduleSidecarPurgeForGeneration(
-                        generation,
-                        PURGE_IDLE_RETRY_DELAYS[0],
-                        staleRearms,
-                        idleRetries + 1
-                    );
-                    return;
-                }
-                if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
-                    const delay =
-                        PURGE_IDLE_RETRY_DELAYS[
-                            Math.min(
-                                idleRetries,
-                                PURGE_IDLE_RETRY_DELAYS.length - 1
-                            )
-                        ];
-                    scheduleSidecarPurgeForGeneration(
-                        generation,
-                        delay,
-                        staleRearms,
-                        idleRetries + 1
-                    );
-                    return;
-                }
-                sidecarPurgeInFlightGeneration = generation;
-                try {
-                    const stats = await purgeSidecar(undefined, {
-                        shouldContinue: () =>
-                            isStartupActive(generation) &&
-                            canRunSidecarPurge(turnProcessing, lastActivityAt),
-                    });
-                    if (!isStartupActive(generation)) return;
-                    if (stats.errors > 0) {
-                        sidecarPurgeErrors += stats.errors;
-                        if (sidecarPurgeErrors <= MAX_PURGE_ERROR_RETRIES) {
-                            const delay =
-                                PURGE_ERROR_RETRY_DELAYS[
-                                    sidecarPurgeErrors - 1
-                                ];
-                            console.error(
-                                `[tau] sidecar purge error retry=${sidecarPurgeErrors}/${MAX_PURGE_ERROR_RETRIES} errors=${sidecarPurgeErrors} delay-ms=${delay}`
-                            );
-                            scheduleSidecarPurgeForGeneration(
-                                generation,
-                                delay,
-                                staleRearms,
-                                0
-                            );
-                        } else {
-                            console.error(
-                                `[tau] sidecar purge retry limit reached failures=${sidecarPurgeErrors}`
-                            );
-                        }
-                        return;
-                    }
-                    if (stats.budgetExhausted) {
-                        scheduleSidecarPurgeForGeneration(
-                            generation,
-                            5_000,
-                            staleRearms,
-                            0
-                        );
-                        return;
-                    }
-                    sidecarPurgeCompleted = true;
-                } finally {
-                    if (sidecarPurgeInFlightGeneration === generation)
-                        sidecarPurgeInFlightGeneration = undefined;
-                }
-            },
-            delayMs,
-            () => isStartupActive(generation),
-            () => {
-                if (
-                    sessionShuttingDown ||
-                    sidecarPurgeCompleted ||
-                    staleRearms >= MAX_STALE_PURGE_REARMS
-                )
-                    return;
-                if (sidecarPurgeTimer && sidecarPurgeTimer !== scheduledTimer)
-                    clearTimeout(sidecarPurgeTimer);
-                sidecarPurgeTimer = undefined;
-                scheduleSidecarPurgeForGeneration(
-                    startupGeneration,
-                    undefined,
-                    staleRearms + 1,
-                    idleRetries
-                );
-            }
-        );
-        sidecarPurgeTimer = scheduledTimer;
-    };
 
     // ── Compact renderer for job-completion messages ──────────────────
 
@@ -333,11 +217,6 @@ export default function (pi: ExtensionAPI) {
 
     // ── Register all features ─────────────────────────────────────────
 
-    // Purge sidecar entries after startup so SQLite maintenance cannot delay
-    // extension loading or first prompt readiness. session_start replaces this
-    // registration-generation timer with one bound to the active generation.
-    scheduleSidecarPurgeForGeneration(startupGeneration);
-
     registerBackgroundJobs(pi, state);
     registerBackgroundCommands(pi, state);
     registerAgentBackground(pi, state);
@@ -412,6 +291,7 @@ export default function (pi: ExtensionAPI) {
 
     pi.on("agent_start", async (_event, ctx) => {
         turnProcessing = true;
+        cancelMaintenanceWorker();
         lastActivityAt = Date.now();
         startTitlebarSpinner(pi, state, ctx);
         state.agentStartTime = Date.now();
@@ -692,10 +572,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_start", async (_event, ctx) => {
         const generation = ++startupGeneration;
-        if (sidecarPurgeTimer) {
-            clearTimeout(sidecarPurgeTimer);
-            sidecarPurgeTimer = undefined;
-        }
+        cancelMaintenanceWorker();
         if (tmuxRunDirSweepTimer) {
             clearInterval(tmuxRunDirSweepTimer);
             tmuxRunDirSweepTimer = undefined;
@@ -890,36 +767,46 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                 shouldRun: () => isStartupActive(generation),
                 isIdle: () =>
                     !turnProcessing && Date.now() - lastActivityAt >= 5_000,
+                runSweep: () =>
+                    runMaintenanceTask<{
+                        reaper: import("./features/tmux-orphan-reaper.ts").OrphanReaperStats;
+                        cleanup: import("./features/bash-tmux.ts").StaleRunDirCleanupStats;
+                    }>("tmux-sweep", undefined, undefined, (event, details) =>
+                        recordMaintenanceEvent(event, details, (type, data) =>
+                            pi.appendEntry(type, data)
+                        )
+                    ),
+                record: (event, details) =>
+                    recordMaintenanceEvent(event, details, (type, data) =>
+                        pi.appendEntry(type, data)
+                    ),
                 log: (line) => {
                     void appendFile(
                         join(tmpdir(), "pi-tau-maintenance.log"),
                         `${line}\n`
                     ).catch(() => {});
                 },
-                notify: (line) => ctx.ui.notify(line, "info"),
             });
             tmuxRunDirSweepTimer = scheduledSweep;
         }
         if (isStartupActive(generation)) {
             scheduleBackgroundJobRestore(() => {
                 if (!isStartupActive(generation)) {
-                    console.debug(
-                        "[tau] background restore skipped for stale startup"
+                    recordMaintenanceEvent(
+                        "background-restore-stale-startup",
+                        {},
+                        (type, data) => pi.appendEntry(type, data)
                     );
                     return;
                 }
                 restoreBackgroundJobs(entries, state, pi, ctx);
             });
-            scheduleSidecarPurgeForGeneration(generation);
         }
     });
 
     pi.on("agent_end", async (event, ctx) => {
         turnProcessing = false;
         lastActivityAt = Date.now();
-        if (!sidecarPurgeCompleted && !sidecarPurgeTimer) {
-            scheduleSidecarPurgeForGeneration(startupGeneration, 5_000, 0, 0);
-        }
         // Stop timers and clear start time — guaranteed cleanup before
         // any fallible logic below. The interval's self-terminating guard
         // will also catch a surviving interval on its next tick.
@@ -941,20 +828,18 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_shutdown", async (_event, ctx) => {
         sessionShuttingDown = true;
+        cancelMaintenanceWorker();
         process.stdin.off("data", noteTerminalActivity);
         if (tmuxRunDirSweepTimer) {
             clearInterval(tmuxRunDirSweepTimer);
             tmuxRunDirSweepTimer = undefined;
-        }
-        if (sidecarPurgeTimer) {
-            clearTimeout(sidecarPurgeTimer);
-            sidecarPurgeTimer = undefined;
         }
         stopTitlebarSpinner(pi, state, ctx);
         stopAgentTimer(state);
         state.agentStartTime = undefined;
 
         cleanupTmuxRunDir();
+        await flushMaintenanceEvents();
 
         pi.appendEntry("background-tasks-state", {
             jobs: Array.from(state.backgroundJobs.entries()).map(

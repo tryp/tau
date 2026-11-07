@@ -632,7 +632,7 @@ void describe("pipe-nerf stage-0 retention", () => {
         return mkdtempSync(join(tmpdir(), "pipe-nerf-retention-"));
     }
 
-    void it("deletes oldest indexed captures under budget pressure", () => {
+    void it("deletes oldest indexed captures under budget pressure", async () => {
         const dir = tempDir();
         const oldPath = join(dir, "pi-pipe-stage0-old.log");
         const newPath = join(dir, "pi-pipe-stage0-new.log");
@@ -647,7 +647,7 @@ void describe("pipe-nerf stage-0 retention", () => {
                 writeFileSync(`${oldPath}${suffix}`, "old auxiliary");
                 writeFileSync(`${newPath}${suffix}`, "new auxiliary");
             }
-            const result = sweepStage0Captures({
+            const result = await sweepStage0Captures({
                 directories: [dir],
                 budgetBytes: 4,
             });
@@ -665,7 +665,7 @@ void describe("pipe-nerf stage-0 retention", () => {
         }
     });
 
-    void it("retains unindexed captures even when over budget", () => {
+    void it("retains unindexed captures even when over budget", async () => {
         const dir = tempDir();
         const unindexed = join(dir, "pi-pipe-stage0-unindexed.log");
         try {
@@ -673,7 +673,7 @@ void describe("pipe-nerf stage-0 retention", () => {
             for (const suffix of [".status.json", ".exits", ".tail"]) {
                 writeFileSync(`${unindexed}${suffix}`, "keep with capture");
             }
-            const result = sweepStage0Captures({
+            const result = await sweepStage0Captures({
                 directories: [dir],
                 budgetBytes: 1,
             });
@@ -689,7 +689,7 @@ void describe("pipe-nerf stage-0 retention", () => {
         }
     });
 
-    void it("bounds each sweep by its file limit", () => {
+    void it("bounds each sweep by its file limit", async () => {
         const dir = tempDir();
         try {
             for (let i = 0; i < 6; i++) {
@@ -701,9 +701,9 @@ void describe("pipe-nerf stage-0 retention", () => {
                 budgetBytes: 1,
                 maxFiles: 2,
             };
-            const first = sweepStage0Captures(options);
-            const second = sweepStage0Captures(options);
-            const third = sweepStage0Captures(options);
+            const first = await sweepStage0Captures(options);
+            const second = await sweepStage0Captures(options);
+            const third = await sweepStage0Captures(options);
             assert.equal(first.filesVisited, 2);
             assert.equal(second.filesVisited, 2);
             assert.equal(first.complete, false);
@@ -715,7 +715,7 @@ void describe("pipe-nerf stage-0 retention", () => {
         }
     });
 
-    void it("sweeps both current and legacy capture locations", () => {
+    void it("sweeps both current and legacy capture locations", async () => {
         const current = tempDir();
         const legacy = tempDir();
         const currentPath = join(current, "pi-pipe-stage0-current.log");
@@ -735,7 +735,7 @@ void describe("pipe-nerf stage-0 retention", () => {
                 Date.now(),
                 current
             );
-            const result = sweepStage0Captures({
+            const result = await sweepStage0Captures({
                 directories: [current, legacy],
                 budgetBytes: 1,
             });
@@ -801,23 +801,29 @@ void describe("pipe-nerf stage-0 capture", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-status-"));
         const capture = join(dir, "stage-zero.log");
         try {
-            writeFileSync(`${capture}.status.json`, JSON.stringify({
-                truncated: true,
-                bytesWritten: 4096,
-                reason: "cap",
-            }));
+            writeFileSync(
+                `${capture}.status.json`,
+                JSON.stringify({
+                    truncated: true,
+                    bytesWritten: 4096,
+                    reason: "cap",
+                })
+            );
             assert.deepEqual(stageZeroStatus(capture), {
                 truncated: true,
                 bytesWritten: 4096,
                 reason: "cap",
                 tail: null,
             });
-            writeFileSync(`${capture}.status.json`, JSON.stringify({
-                truncated: true,
-                bytesWritten: 4096,
-                reason: "cap",
-                tail: { bytes: "bad", dropped: 10 },
-            }));
+            writeFileSync(
+                `${capture}.status.json`,
+                JSON.stringify({
+                    truncated: true,
+                    bytesWritten: 4096,
+                    reason: "cap",
+                    tail: { bytes: "bad", dropped: 10 },
+                })
+            );
             assert.equal(stageZeroStatus(capture), null);
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -897,12 +903,17 @@ void describe("pipe-nerf stage-0 capture", () => {
                 bytes: 4096,
                 dropped:
                     input.length -
-                    (4096 - Buffer.byteLength("\n[stage-0 capture truncated at byte cap]\n")) -
+                    (4096 -
+                        Buffer.byteLength(
+                            "\n[stage-0 capture truncated at byte cap]\n"
+                        )) -
                     4096,
             });
             assert.deepEqual(
                 readFileSync(`${capture}.tail`).subarray(
-                    Buffer.byteLength("[stage-0 tail capture: earlier bytes omitted]\n")
+                    Buffer.byteLength(
+                        "[stage-0 tail capture: earlier bytes omitted]\n"
+                    )
                 ),
                 input.subarray(-4096)
             );

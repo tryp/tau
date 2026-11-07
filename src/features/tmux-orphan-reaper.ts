@@ -102,6 +102,7 @@ export interface OrphanReaperOptions {
     maxProcesses?: number;
     graceMs?: number;
     minimumObservationIntervalMs?: number;
+    shouldContinue?: () => boolean;
 }
 
 export interface OrphanReaperStats {
@@ -534,6 +535,7 @@ export async function reapOrphanedTmuxProcesses(
         ? await reader.listAsync(options.rootDir)
         : reader.list(options.rootDir);
     await forEachWithinTimeBudget(runNames, async (runName) => {
+        if (options.shouldContinue && !options.shouldContinue()) return;
         if (!runName.startsWith("pi-tmux-")) return;
         const runDir = join(options.rootDir, runName);
         const dirEntries = reader.listAsync

@@ -118,6 +118,7 @@ export interface StaleRunDirCleanupOptions {
     runTmux?: (command: string) => string;
     /** Probe for an active wrapper stored in a run directory. */
     wrapperLiveness?: (dir: string) => ProcessLiveness;
+    shouldContinue?: () => boolean;
 }
 
 type ProcessLiveness = "alive" | "dead" | "unknown";
@@ -312,6 +313,7 @@ export async function cleanupStaleTmuxRunDirsAsync(
         return stats;
     }
     await forEachWithinTimeBudget(entries, async (entry) => {
+        if (options.shouldContinue && !options.shouldContinue()) return;
         if (!entry.startsWith("pi-tmux-")) return;
         const suffix = entry.slice("pi-tmux-".length);
         if (!/^\d+$/.test(suffix)) return;
@@ -350,6 +352,7 @@ export async function cleanupStaleTmuxRunDirsAsync(
             }
         }
     });
+    if (options.shouldContinue && !options.shouldContinue()) return stats;
     if (options.runTmux) reapOrphanedTmuxSessions(options.runTmux, isAlive);
     else await reapOrphanedTmuxSessionsAsync(isAlive);
     return stats;
@@ -515,7 +518,12 @@ export function schedulePeriodicTmuxRunDirCleanup(
         cleanup?: () =>
             | StaleRunDirCleanupStats
             | Promise<StaleRunDirCleanupStats>;
+        runSweep?: () => Promise<{
+            reaper: OrphanReaperStats;
+            cleanup: StaleRunDirCleanupStats;
+        }>;
         log?: (line: string) => void;
+        record?: (event: string, details: Record<string, unknown>) => void;
         /** Test seam; production defaults to the Node test-runner detector. */
         isTestRunner?: boolean;
         /** Orphan process-chain reaper; invoked before directory cleanup. */
@@ -540,6 +548,8 @@ export function schedulePeriodicTmuxRunDirCleanup(
         (() => reapOrphanedTmuxProcesses({ rootDir: "/tmp" }));
     let inFlight = false;
     let stopped = false;
+    let retryAttempt = 0;
+    const retryDelays = [5_000, 15_000, 45_000, 120_000] as const;
     const timers: {
         firstPass?: ReturnType<typeof setTimeout>;
         idleRetry?: ReturnType<typeof setTimeout>;
@@ -569,11 +579,20 @@ export function schedulePeriodicTmuxRunDirCleanup(
         inFlight = true;
         void (async () => {
             if (!isCurrent()) return;
-            const reaperStats = await reapOrphans();
+            const sweep = options.runSweep
+                ? await options.runSweep()
+                : undefined;
+            const reaperStats = sweep?.reaper ?? (await reapOrphans());
             if (!isCurrent()) return;
-            const cleanupStats = await cleanup();
+            const cleanupStats = sweep?.cleanup ?? (await cleanup());
             if (!isCurrent()) return;
             const summary = `${formatOrphanReaperLog(reaperStats)}\n${formatTmuxRunDirSweepLog(source, cleanupStats)}`;
+            options.record?.("tmux-run-dir-sweep", {
+                source,
+                reaper: reaperStats,
+                cleanup: cleanupStats,
+            });
+            retryAttempt = 0;
             if (process.env.PI_TAU_MAINTENANCE_LOG === "1") log(summary);
             if (process.env.PI_TAU_MAINTENANCE_TOAST === "1")
                 options.notify?.(summary);
@@ -581,10 +600,26 @@ export function schedulePeriodicTmuxRunDirCleanup(
             .catch((error: unknown) => {
                 const detail =
                     error instanceof Error ? error.message : String(error);
+                options.record?.("tmux-run-dir-sweep-error", {
+                    source,
+                    error: detail,
+                });
                 if (process.env.PI_TAU_MAINTENANCE_LOG === "1") {
                     log(
                         `[tau] tmux-run-dir-sweep source=${source} error=${JSON.stringify(detail)}`
                     );
+                }
+                if (isCurrent() && !stopped) {
+                    const delay =
+                        retryDelays[
+                            Math.min(retryAttempt, retryDelays.length - 1)
+                        ];
+                    retryAttempt++;
+                    timers.idleRetry = setTimeout(
+                        () => runSweep(source),
+                        delay
+                    );
+                    timers.idleRetry.unref?.();
                 }
             })
             .finally(() => {
