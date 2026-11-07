@@ -284,6 +284,7 @@ export interface RunningProcess {
 // ─── Minimal context interfaces ─────────────────────────────────────
 
 export interface UiContext {
+    appendEntry?: (customType: string, data: unknown) => void;
     // Sidecar indexing reads cwd/session identity off the same ctx. Optional
     // so pure-UI call sites (tests, widget-only paths) stay valid.
     cwd?: string;

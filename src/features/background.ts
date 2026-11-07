@@ -30,8 +30,10 @@ import { stageZeroDirectory } from "./pipe-nerf/stage0-path.ts";
 import {
     legacyStage0Directory,
     markStage0CaptureIndexed,
-    sweepStage0Captures,
+    type Stage0SweepResult,
 } from "./pipe-nerf/stage0-retention.ts";
+import { runMaintenanceTask } from "../maintenance/client.ts";
+import { recordMaintenanceEvent } from "../maintenance/events.ts";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
@@ -1620,12 +1622,22 @@ async function indexStageZeroCapture(
         const sourceId = outcome.source?.sourceId ?? null;
         if (sourceId) {
             markStage0CaptureIndexed(capture.path, sourceId);
-            sweepStage0Captures({
-                directories: [
-                    stageZeroDirectory(),
-                    legacyStage0Directory(homedir()),
-                ],
-            });
+            const sweepStats = await runMaintenanceTask<Stage0SweepResult>(
+                "stage0-retention",
+                undefined,
+                {
+                    directories: [
+                        stageZeroDirectory(),
+                        legacyStage0Directory(homedir()),
+                    ],
+                },
+                (event, details) => recordMaintenanceEvent(event, details)
+            );
+            recordMaintenanceEvent(
+                "stage0-retention-complete",
+                { ...sweepStats },
+                (type, data) => ctx.appendEntry?.(type, data)
+            );
         }
         return sourceId;
     } catch {
