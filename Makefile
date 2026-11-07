@@ -9,6 +9,7 @@
 #   make verify            # content + commit marker must match this checkout
 #   make smoke-test        # load only this deployed extension in a fresh pi
 #   make deployed-commit   # show what is deployed
+#   make test-serial       # run one full suite per checkout, retaining complete output
 
 RUNTIME_DIR ?= $(HOME)/.pi/agent/local/pi-tau
 SMOKE_SCRIPT ?= /home/dev/src/pi-session-analysis/scripts/predeploy_smoke.py
@@ -27,7 +28,7 @@ RSYNC_EXCLUDES := \
 	--exclude '.deployed-commit' \
 	--exclude 'README.md'
 
-.PHONY: deploy runtime-deps verify smoke-test deployed-commit record-deploy-ledger
+.PHONY: deploy runtime-deps verify smoke-test deployed-commit record-deploy-ledger test-serial
 
 deploy:  ## Copy this checkout, verify it, and smoke-test the deployed extension
 	@test -z "$$(git status --porcelain)" || { echo "ERROR: commit source changes before deploying" >&2; git status --short >&2; exit 1; }
@@ -79,3 +80,22 @@ verify:  ## Verify runtime files match this checkout (content + commit marker)
 
 deployed-commit:  ## Show which commit is deployed
 	@cat "$(RUNTIME_DIR)/.deployed-commit" 2>/dev/null || echo "no .deployed-commit marker in $(RUNTIME_DIR)"
+
+# Serialize suites per checkout: concurrent runs caused timing flakes, and
+# grep-filtered pipelines lost failure details before we could identify them.
+# Keep the full TAP log in tmp/ and propagate pnpm's status, not tee's.
+test-serial:  ## Run one full test suite per checkout, retaining complete output
+	@mkdir -p tmp
+	@checkout_id=$$(printf '%s' "$(CURDIR)" | sha256sum | cut -c1-16); \
+	lock_path="$${TMPDIR:-/tmp}/pi-tau-test-$$checkout_id.lock"; \
+	exec 9>"$$lock_path"; \
+	if ! flock -n 9; then echo "ERROR: another suite is running in this checkout ($(CURDIR))" >&2; exit 1; fi; \
+	bash -o pipefail -c '\
+		log="tmp/test-$$(date -u +%Y%m%dT%H%M%S)-$$$$.log"; \
+		echo "Full test output: $$log"; \
+		pnpm test 2>&1 | tee "$$log"; \
+		statuses=("$${PIPESTATUS[@]}"); suite_rc=$${statuses[0]}; tee_rc=$${statuses[1]}; \
+		echo "--- test summary ($$log) ---"; \
+		grep -E "ℹ (tests|pass|fail|cancelled|skipped)" "$$log" | tail -8 || true; \
+		if [ "$$suite_rc" -ne 0 ]; then exit "$$suite_rc"; fi; \
+		exit "$$tee_rc"'
