@@ -263,8 +263,15 @@ void describe("deferred startup maintenance", () => {
     });
 
     void it("keeps the real extension startup path nonblocking for maintenance", async () => {
-        const previous = process.env.PI_TAU_MAINTENANCE_DISABLE;
-        process.env.PI_TAU_MAINTENANCE_DISABLE = "1";
+        const fakeTimers = new FakeTimers();
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldSetInterval = globalThis.setInterval;
+        const oldClearTimeout = globalThis.clearTimeout;
+        const oldClearInterval = globalThis.clearInterval;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.setInterval = fakeTimers.setInterval as typeof setInterval;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        globalThis.clearInterval = fakeTimers.clear as typeof clearInterval;
         const events = new Map<
             string,
             Array<(...args: unknown[]) => unknown>
@@ -313,11 +320,23 @@ void describe("deferred startup maintenance", () => {
             const start = events.get("session_start")?.at(-1);
             assert.ok(start);
             await start({}, ctx);
-            assert.ok((events.get("session_shutdown")?.length ?? 0) > 0);
+            assert.ok(
+                fakeTimers.records.some((timer) => timer.unrefCalled),
+                "real extension startup schedules maintenance for later"
+            );
+            assert.equal(
+                fakeTimers.records.some(
+                    (timer) => timer.due <= fakeTimers.now && !timer.cleared
+                ),
+                false
+            );
+            for (const shutdown of events.get("session_shutdown") ?? [])
+                await shutdown({}, ctx);
         } finally {
-            if (previous === undefined)
-                delete process.env.PI_TAU_MAINTENANCE_DISABLE;
-            else process.env.PI_TAU_MAINTENANCE_DISABLE = previous;
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.setInterval = oldSetInterval;
+            globalThis.clearTimeout = oldClearTimeout;
+            globalThis.clearInterval = oldClearInterval;
         }
     });
 
