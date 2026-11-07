@@ -20,9 +20,9 @@ import {
     readdirSync,
     statSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, resolve as resolvePath } from "node:path";
+import { appendFile, readFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve as resolvePath } from "node:path";
 
 // ─── Context sidecar integration ────────────────────────────────────
 
@@ -1086,6 +1086,10 @@ export function restoreBackgroundJobs(
         jobCounter?: number;
     };
     for (const [id, jobData] of data.jobs ?? []) {
+        // The tuple key is the snapshot's authoritative identity. Older or
+        // partial snapshots may omit jobData.id; later completion paths use
+        // the object field, not the map key, when building notices.
+        if (jobData.id !== id) jobData.id = id;
         const restoredSessionId = resolveCompletionSessionId(
             ctx,
             jobData,
@@ -1709,6 +1713,13 @@ const BATCH_MAX_DELAY_MS = 10000; // force flush this long after the first job i
 // Round p95 up to 30s (25.7 + 4.3s headroom); about 5% take the handle path.
 const INLINE_ATTACH_WINDOW_MS = 30_000;
 const ACKNOWLEDGED_STALE_MAX_AGE_MS = 5 * 60 * 1000;
+const MAX_INDIVIDUAL_FAILURE_DELIVERIES = 5;
+let completionBatchWindowSequence = 0;
+let suppressedUnidentifiableCompletionCount = 0;
+
+export function getSuppressedUnidentifiableCompletionCount(): number {
+    return suppressedUnidentifiableCompletionCount;
+}
 
 type CompletionTrigger =
     | "poller-observed"
@@ -1721,6 +1732,8 @@ type CompletionTrigger =
 
 type CompletionBatchItem = {
     job: BackgroundJob;
+    /** Debounce window that coalesced this completion. */
+    coalesceWindowId: number;
     duration: string;
     emoji: string;
     /** Per-notification attempt generation, used to invalidate stale callbacks. */
@@ -1743,6 +1756,7 @@ const completionBatch: {
     jobs: CompletionBatchItem[];
     timer?: NodeJS.Timeout;
     startTime: number; // timestamp of the first job in the current batch
+    windowId?: number;
     pi?: ExtensionAPI;
     state?: TauState;
 } = { jobs: [], startTime: 0 };
@@ -2084,6 +2098,7 @@ export function flushCompletionBatch(): void {
     const state = completionBatch.state!;
     completionBatch.timer = undefined;
     completionBatch.startTime = 0;
+    completionBatch.windowId = undefined;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
 
@@ -2290,6 +2305,129 @@ function completeCompletionDeliveryHandoff(
     }
 }
 
+function logUnidentifiableCompletion(item: CompletionBatchItem): void {
+    suppressedUnidentifiableCompletionCount++;
+    const line =
+        `${new Date().toISOString()} [tau] bg-delivery suppressed_unidentifiable ` +
+        `session=${item.sessionId} status=${String(item.job.status ?? "unknown")}\n`;
+    void appendFile(join(tmpdir(), "pi-tau-maintenance.log"), line).catch(
+        () => {}
+    );
+}
+
+function completionDigestLine(item: CompletionBatchItem): string {
+    const job = item.job;
+    const status = typeof job.status === "string" ? job.status : "unknown";
+    const failed = status !== "completed" || job.exitCode !== 0;
+    const parts = [`${job.id}`, failed ? `FAILED ${status}` : status];
+    if (job.exitCode !== undefined) parts.push(`exit=${job.exitCode}`);
+    if (typeof job.command === "string" && job.command.trim()) {
+        parts.push(`command=${JSON.stringify(oneLine(job.command, 60))}`);
+    }
+    if (typeof job.logPath === "string" && job.logPath.trim()) {
+        parts.push(`log=${job.logPath}`);
+    }
+    if (typeof job.sourceId === "string" && job.sourceId.trim()) {
+        parts.push(`sourceId=${job.sourceId}`);
+    }
+    return `- ${parts.join(" | ")}`;
+}
+
+function sendCompletionPayload(
+    delivery: PendingCompletionDelivery,
+    jobs: CompletionBatchItem[],
+    content: string,
+    details: Record<string, unknown>
+): void {
+    const individualDelivery: PendingCompletionDelivery = {
+        ...delivery,
+        jobs,
+        queueKey: nextCompletionQueueKey(),
+    };
+    const sent = sendQueuedMessage(
+        delivery.pi,
+        { customType: "job-completion", content, display: true, details },
+        {
+            deliverAs: "followUp",
+            triggerTurn: true,
+            queueKey: individualDelivery.queueKey,
+        }
+    );
+    completeCompletionDeliveryHandoff(individualDelivery, sent);
+}
+
+function sendCompletionDigest(
+    delivery: PendingCompletionDelivery,
+    items: CompletionBatchItem[],
+    terminalItems: CompletionBatchItem[],
+    label: string
+): void {
+    if (items.length === 0) return;
+    const lines = items.map(completionDigestLine);
+    sendCompletionPayload(
+        delivery,
+        terminalItems,
+        `${label} (${items.length}):\n${lines.join("\n")}`,
+        {
+            jobIds: items.map((item) => item.job.id),
+            batch: items.map((item) => ({
+                jobId: item.job.id,
+                status: item.job.status,
+                exitCode: item.job.exitCode,
+                ...(item.job.command
+                    ? { command: oneLine(item.job.command, 60) }
+                    : {}),
+                ...(item.job.logPath ? { logPath: item.job.logPath } : {}),
+                ...(item.job.sourceId ? { sourceId: item.job.sourceId } : {}),
+            })),
+            suppressedCount: items.length,
+        }
+    );
+}
+
+function sendIndividualFailure(
+    delivery: PendingCompletionDelivery,
+    item: CompletionBatchItem
+): void {
+    const job = item.job;
+    const duration = Number.isFinite(job.startTime)
+        ? formatDuration(Date.now() - job.startTime)
+        : "unknown duration";
+    const outstandingSuffix =
+        item.outstandingJobs > 0
+            ? ` (${item.outstandingJobs} jobs outstanding)`
+            : "";
+    const logEvidence = completionLogEvidence(job);
+    const lines = [
+        `❌ ${job.id} ${job.status ?? "failed"} (${duration})${outstandingSuffix}`,
+        ...(job.exitCode !== undefined ? [`Exit code: ${job.exitCode}`] : []),
+        ...(logEvidence?.text ? [`Output evidence: ${logEvidence.text}`] : []),
+        `Command: ${job.command}`,
+        `Output: ${job.logPath}`,
+        ...(job.sourceId ? [`Context source: ${job.sourceId}`] : []),
+        ...(job.sidecarIndexStatus === "failed"
+            ? [
+                  `Warning: sidecar indexing failed (${job.sidecarIndexErrorCategory ?? "unknown"}).`,
+              ]
+            : []),
+    ];
+    sendCompletionPayload(delivery, [item], lines.join("\n"), {
+        jobId: job.id,
+        sessionId: item.sessionId,
+        generation: item.generation,
+        jobGeneration: item.jobGeneration,
+        status: job.status,
+        duration,
+        ...(job.exitCode !== undefined ? { exitCode: job.exitCode } : {}),
+        command: job.command,
+        logPath: job.logPath,
+        ...(job.sourceId ? { sourceId: job.sourceId } : {}),
+        ...(job.chunkIds ? { chunkIds: job.chunkIds } : {}),
+        outstandingJobs: item.outstandingJobs,
+        ...(logEvidence?.counts ? { severityCounts: logEvidence.counts } : {}),
+    });
+}
+
 function deliverCompletionNotification(
     delivery: PendingCompletionDelivery
 ): void {
@@ -2320,7 +2458,7 @@ function deliverCompletionNotification(
             );
         }
     }
-    const eligible = unconsumed.filter((item) => {
+    const acknowledgedFiltered = unconsumed.filter((item) => {
         if (!isCompletionAcknowledged(item)) return true;
         const now = Date.now();
         recordCompletionItemTelemetry(
@@ -2340,16 +2478,41 @@ function deliverCompletionNotification(
         });
         return false;
     });
-    delivery.jobs = eligible;
-    if (eligible.length === 0) {
-        for (const { job } of originalJobs)
-            pendingCompletionJobs.delete(job.id);
+    const unidentifiable = acknowledgedFiltered.filter(
+        ({ job }) => typeof job.id !== "string" || job.id.trim().length === 0
+    );
+    for (const item of unidentifiable) {
+        logUnidentifiableCompletion(item);
+        if (typeof item.job.id === "string") {
+            pendingCompletionJobs.delete(item.job.id);
+        }
+    }
+    const identified = acknowledgedFiltered.filter(
+        ({ job }) => typeof job.id === "string" && job.id.trim().length > 0
+    );
+    const incompleteItems = identified.filter(
+        ({ job }) =>
+            typeof job.command !== "string" ||
+            job.command.trim().length === 0 ||
+            typeof job.logPath !== "string" ||
+            job.logPath.trim().length === 0
+    );
+    const eligible = identified.filter(
+        (item) => !incompleteItems.includes(item)
+    );
+    delivery.jobs = [...eligible, ...incompleteItems];
+    if (eligible.length === 0 && incompleteItems.length === 0) {
+        for (const { job } of originalJobs) {
+            if (typeof job.id === "string")
+                pendingCompletionJobs.delete(job.id);
+        }
         return;
     }
 
     const now = Date.now();
     const stale = eligible.filter(
         ({ job }) =>
+            job.status === "completed" &&
             job.endTime !== undefined &&
             now - job.endTime > ACKNOWLEDGED_STALE_MAX_AGE_MS
     );
@@ -2370,7 +2533,7 @@ function deliverCompletionNotification(
                     item.job.id,
                     item.jobGeneration
                 )
-            )
+            ) || item.job.status !== "completed"
     );
     for (const item of stale) {
         const ageSeconds = Math.max(
@@ -2388,45 +2551,80 @@ function deliverCompletionNotification(
             status: item.job.status,
             exitCode: item.job.exitCode,
         });
+        pendingCompletionJobs.delete(item.job.id);
     }
-    const olderFailures = stale
-        .filter(({ job }) => job.status !== "completed")
-        .map(
-            ({ job }) =>
-                `${job.id} (${job.status}${job.exitCode !== undefined ? `, exit ${job.exitCode}` : ""})`
-        );
+    const supplementalDigestItems = [...incompleteItems, ...stale];
+    const olderFailures: string[] = [];
+    const digestReasons = [
+        ...(stale.length > 0
+            ? [
+                  `${stale.length} older completion${stale.length === 1 ? "" : "s"} suppressed from individual delivery`,
+              ]
+            : []),
+        ...(incompleteItems.length > 0
+            ? [
+                  `${incompleteItems.length} completion${incompleteItems.length === 1 ? "" : "s"} with incomplete metadata`,
+              ]
+            : []),
+    ];
     const staleSummary =
-        stale.length > 0
-            ? `${stale.length} older completion${stale.length === 1 ? "" : "s"} suppressed from individual delivery.` +
-              (olderFailures.length > 0
-                  ? ` Older failures: ${olderFailures.join(", ")}.`
-                  : "")
+        supplementalDigestItems.length > 0
+            ? `${digestReasons.join("; ")}.\n${supplementalDigestItems.map(completionDigestLine).join("\n")}`
             : "";
 
     const { pi } = delivery;
-    if (batch.length === 0) {
-        delivery.jobs = [];
-        const sent = sendQueuedMessage(
-            pi,
-            {
-                customType: "job-completion",
-                content: staleSummary,
-                display: true,
-                details: {
-                    suppressedOlderCount: stale.length,
-                    olderFailures,
-                    batchSize: eligible.length,
-                },
-            },
-            {
-                deliverAs: "followUp",
-                triggerTurn: true,
-                queueKey: delivery.queueKey,
+    const failures = batch.filter(({ job }) => job.status !== "completed");
+    if (failures.length > 0) {
+        const individualFailures: CompletionBatchItem[] = [];
+        const overflowFailures: CompletionBatchItem[] = [];
+        const individualFailureCountByWindow = new Map<number, number>();
+        for (const item of failures) {
+            const deliveredForWindow =
+                individualFailureCountByWindow.get(item.coalesceWindowId) ?? 0;
+            if (deliveredForWindow < MAX_INDIVIDUAL_FAILURE_DELIVERIES) {
+                individualFailures.push(item);
+                individualFailureCountByWindow.set(
+                    item.coalesceWindowId,
+                    deliveredForWindow + 1
+                );
+            } else {
+                overflowFailures.push(item);
             }
+        }
+        const digestItems = [
+            ...overflowFailures,
+            ...batch.filter(({ job }) => job.status === "completed"),
+            ...supplementalDigestItems,
+        ];
+        for (const item of individualFailures) {
+            sendIndividualFailure(delivery, item);
+        }
+        const digestTerminalItems = [
+            ...overflowFailures,
+            ...batch.filter(({ job }) => job.status === "completed"),
+            ...incompleteItems,
+        ];
+        sendCompletionDigest(
+            delivery,
+            digestItems,
+            digestTerminalItems,
+            "Additional coalesced background completions"
         );
-        completeCompletionDeliveryHandoff(delivery, sent);
         return;
     }
+
+    if (batch.length === 0) {
+        sendCompletionDigest(
+            delivery,
+            supplementalDigestItems,
+            incompleteItems,
+            stale.length > 0
+                ? `${stale.length} older completion${stale.length === 1 ? "" : "s"} suppressed from individual delivery`
+                : "Background completions with incomplete metadata"
+        );
+        return;
+    }
+    delivery.jobs = [...batch, ...incompleteItems];
     // Use the count captured when each job completed, not a fresh count: the
     // delivery may be minutes later (agent-busy deferral), and the notice's
     // own `duration` describes the completion instant.
@@ -2447,7 +2645,7 @@ function deliverCompletionNotification(
         );
     }
 
-    delivery.jobs = batch;
+    delivery.jobs = [...batch, ...incompleteItems];
     if (batch.length === 1) {
         const { job, duration, emoji } = batch[0];
         const logEvidence = completionEvidenceById.get(job.id);
@@ -2551,7 +2749,7 @@ function deliverCompletionNotification(
                     : ""
             }`
     );
-    const detailLines = batch.map((j) => `  Command: ${j.job.command}`);
+    const detailLines = batch.map(completionDigestLine);
     const outputEvidence = oneLine(
         batch
             .map((item) => {
@@ -2831,6 +3029,8 @@ export function clearJobFromCompletionBatch(jobId: string): void {
             for (const { job: remainingJob } of remaining) {
                 restoreCompletionForWake(remainingJob, wakeStates, batchState);
             }
+            completionBatch.windowId = undefined;
+            completionBatch.startTime = 0;
             if (completionBatch.timer) {
                 clearTimeout(completionBatch.timer);
                 completionBatch.timer = undefined;
@@ -2845,6 +3045,8 @@ export function clearJobFromCompletionBatch(jobId: string): void {
             }
             completionBatch.pi = undefined;
             completionBatch.state = undefined;
+            completionBatch.windowId = undefined;
+            completionBatch.startTime = 0;
         }
     }
 
@@ -2959,6 +3161,7 @@ export function clearAllCompletionBatches(): void {
     }
     completionBatch.jobs.length = 0;
     completionBatch.startTime = 0;
+    completionBatch.windowId = undefined;
     completionBatch.pi = undefined;
     completionBatch.state = undefined;
     pendingCompletionDeliveries.length = 0;
@@ -3084,8 +3287,10 @@ export function notifyCompletion(
             status: job.status,
             exitCode: job.exitCode,
         });
+        completionBatch.windowId ??= ++completionBatchWindowSequence;
         completionBatch.jobs.push({
             job,
+            coalesceWindowId: completionBatch.windowId,
             duration,
             emoji,
             generation: notifyGeneration,
