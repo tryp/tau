@@ -679,13 +679,17 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(known, state, pi as never, notificationContext());
         notifyCompletion(unseen, state, pi as never, notificationContext());
         flushCompletionBatch();
-        assert.equal(queuedMessages.length, 1);
-        assert.deepEqual(
-            (queuedMessages[0]?.message as { details: { jobIds: string[] } })
-                .details.jobIds,
-            [known.id, unseen.id]
+        assert.equal(queuedMessages.length, 2);
+        const initialIds = queuedMessages.map(
+            ({ message }) =>
+                (message as { details: { jobId: string } }).details.jobId
         );
-        const originalQueueKey = queuedMessages[0]?.options.queueKey;
+        assert.deepEqual(initialIds, [known.id, unseen.id]);
+        const unseenQueueKey = queuedMessages.find(
+            ({ message }) =>
+                (message as { details: { jobId: string } }).details.jobId ===
+                unseen.id
+        )?.options.queueKey;
 
         try {
             await jobs.execute(
@@ -698,12 +702,14 @@ void describe("job completion regression coverage", () => {
             assert.equal(
                 queuedMessages.length,
                 1,
-                "unseen sibling is re-queued"
+                "only the unseen sibling is re-queued"
             );
-            assert.notEqual(
-                queuedMessages[0]?.options.queueKey,
-                originalQueueKey
-            );
+            const remaining = queuedMessages[0] as {
+                message: { content: string; details: { jobId: string } };
+                options: { queueKey?: string };
+            };
+            assert.equal(remaining.message.details.jobId, unseen.id);
+            assert.equal(remaining.options.queueKey, unseenQueueKey);
             processQueuedMessages();
             const message = sentMessages[0] as { content: string };
             assert.ok(message.content.includes(unseen.id));
@@ -852,13 +858,19 @@ void describe("job completion regression coverage", () => {
         assert.equal(queuedMessages.length, 0);
         assert.equal(
             sentMessages.length,
-            1,
-            "delivered batch is never re-emitted"
+            2,
+            "each failed sibling is delivered individually and never re-emitted"
+        );
+        const deliveredContents = sentMessages.map(
+            (message) => (message as { content: string }).content
         );
         assert.ok(
-            (sentMessages[0] as { content: string }).content.includes(
-                sibling.id
+            deliveredContents.some((content) =>
+                content.includes(acknowledged.id)
             )
+        );
+        assert.ok(
+            deliveredContents.some((content) => content.includes(sibling.id))
         );
         const queueTelemetry = appendedEntries
             .filter(
@@ -875,7 +887,7 @@ void describe("job completion regression coverage", () => {
                     data.reason === "delivered"
             ).length,
             2,
-            "the initial combined notice persists one delivered terminal record per job"
+            "individual notices persist one delivered terminal record per job"
         );
         await invoke("agent_settled");
         await new Promise((resolve) => setTimeout(resolve, 0));

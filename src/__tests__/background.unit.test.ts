@@ -2,7 +2,14 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    appendFileSync,
+    existsSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -19,6 +26,8 @@ import {
     lookupJob,
     startTimeoutTimer,
     handleTmuxCompletion,
+    restoreBackgroundJobs,
+    getSuppressedUnidentifiableCompletionCount,
 } from "../features/background.ts";
 import { registerBackgroundCommands } from "../features/background-commands.ts";
 import { BACKGROUND_SHORTCUTS } from "../features/shortcut-keys.ts";
@@ -1263,9 +1272,13 @@ void describe(
         });
 
         void it("omits stale dead processes from the completion outstanding count", async () => {
-            const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], {
-                stdio: "ignore",
-            });
+            const deadChild = spawn(
+                process.execPath,
+                ["-e", "process.exit(0)"],
+                {
+                    stdio: "ignore",
+                }
+            );
             await once(deadChild, "exit");
             const deadPid = deadChild.pid;
             assert.ok(deadPid, "spawned child must have a pid");
@@ -1281,20 +1294,36 @@ void describe(
                     registerTool() {},
                     registerCommand() {},
                     registerMessageRenderer() {},
-                    createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                    createBashTool: () => ({
+                        execute: async () => ({ content: [] }),
+                    }),
                     registerToolPromptGuidelines() {},
                     sendMessage() {},
                 } as never,
                 state
             );
             const sentMessages: unknown[] = [];
-            const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
-            const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
-            state.backgroundJobs.set("stale-running-job", makeJob({
-                id: "stale-running-job",
-                pid: deadPid,
-                status: "running",
-            }));
+            const pi = {
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            state.backgroundJobs.set(
+                "stale-running-job",
+                makeJob({
+                    id: "stale-running-job",
+                    pid: deadPid,
+                    status: "running",
+                })
+            );
             const completed = makeJob({
                 id: "completion-after-stale-job",
                 status: "failed",
@@ -1306,15 +1335,22 @@ void describe(
             await new Promise<void>((resolve) => setImmediate(resolve));
             state._flushCompletionBatch?.();
 
-            const message = sentMessages[0] as { content: string; details: { outstandingJobs: number } };
+            const message = sentMessages[0] as {
+                content: string;
+                details: { outstandingJobs: number };
+            };
             assert.equal(message.details.outstandingJobs, 0);
             assert.doesNotMatch(message.content, /jobs outstanding/);
         });
 
         void it("counts a live process in the completion outstanding count", async () => {
-            const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-                stdio: "ignore",
-            });
+            const liveChild = spawn(
+                process.execPath,
+                ["-e", "setInterval(() => {}, 1000)"],
+                {
+                    stdio: "ignore",
+                }
+            );
             await once(liveChild, "spawn");
             const livePid = liveChild.pid;
             assert.ok(livePid, "spawned child must have a pid");
@@ -1325,20 +1361,36 @@ void describe(
                         registerTool() {},
                         registerCommand() {},
                         registerMessageRenderer() {},
-                        createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                        createBashTool: () => ({
+                            execute: async () => ({ content: [] }),
+                        }),
                         registerToolPromptGuidelines() {},
                         sendMessage() {},
                     } as never,
                     state
                 );
                 const sentMessages: unknown[] = [];
-                const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
-                const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
-                state.backgroundJobs.set("live-running-job", makeJob({
-                    id: "live-running-job",
-                    pid: livePid,
-                    status: "running",
-                }));
+                const pi = {
+                    sendMessage(message: unknown) {
+                        sentMessages.push(message);
+                    },
+                } as never;
+                const ctx = {
+                    ui: {
+                        notify() {},
+                        setWidget() {},
+                        setStatus() {},
+                        theme: { fg: () => "" },
+                    },
+                } as never;
+                state.backgroundJobs.set(
+                    "live-running-job",
+                    makeJob({
+                        id: "live-running-job",
+                        pid: livePid,
+                        status: "running",
+                    })
+                );
                 const completed = makeJob({
                     id: "completion-with-live-job",
                     status: "failed",
@@ -1350,7 +1402,10 @@ void describe(
                 await new Promise<void>((resolve) => setImmediate(resolve));
                 state._flushCompletionBatch?.();
 
-                const message = sentMessages[0] as { content: string; details: { outstandingJobs: number } };
+                const message = sentMessages[0] as {
+                    content: string;
+                    details: { outstandingJobs: number };
+                };
                 assert.equal(message.details.outstandingJobs, 1);
                 assert.match(message.content, /\(1 jobs outstanding\)/);
             } finally {
@@ -1359,10 +1414,14 @@ void describe(
             }
         });
 
-        void it("preserves the outstanding count in a batched completion notice", async () => {
-            const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-                stdio: "ignore",
-            });
+        void it("preserves the outstanding count in individual failure notices", async () => {
+            const liveChild = spawn(
+                process.execPath,
+                ["-e", "setInterval(() => {}, 1000)"],
+                {
+                    stdio: "ignore",
+                }
+            );
             await once(liveChild, "spawn");
             const livePid = liveChild.pid;
             assert.ok(livePid, "spawned child must have a pid");
@@ -1373,36 +1432,60 @@ void describe(
                         registerTool() {},
                         registerCommand() {},
                         registerMessageRenderer() {},
-                        createBashTool: () => ({ execute: async () => ({ content: [] }) }),
+                        createBashTool: () => ({
+                            execute: async () => ({ content: [] }),
+                        }),
                         registerToolPromptGuidelines() {},
                         sendMessage() {},
                     } as never,
                     state
                 );
                 const sentMessages: unknown[] = [];
-                const pi = { sendMessage(message: unknown) { sentMessages.push(message); } } as never;
-                const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: () => "" } } } as never;
-                state.backgroundJobs.set("batch-live-running-job", makeJob({
-                    id: "batch-live-running-job",
-                    pid: livePid,
-                    status: "running",
-                }));
-                for (const id of ["batch-completion-one", "batch-completion-two"]) {
-                    const completed = makeJob({ id, status: "failed", exitCode: 1 });
+                const pi = {
+                    sendMessage(message: unknown) {
+                        sentMessages.push(message);
+                    },
+                } as never;
+                const ctx = {
+                    ui: {
+                        notify() {},
+                        setWidget() {},
+                        setStatus() {},
+                        theme: { fg: () => "" },
+                    },
+                } as never;
+                state.backgroundJobs.set(
+                    "batch-live-running-job",
+                    makeJob({
+                        id: "batch-live-running-job",
+                        pid: livePid,
+                        status: "running",
+                    })
+                );
+                for (const id of [
+                    "batch-completion-one",
+                    "batch-completion-two",
+                ]) {
+                    const completed = makeJob({
+                        id,
+                        status: "failed",
+                        exitCode: 1,
+                    });
                     state.backgroundJobs.set(id, completed);
                     notifyCompletion(completed, state, pi, ctx);
                 }
                 await new Promise<void>((resolve) => setImmediate(resolve));
                 state._flushCompletionBatch?.();
 
-                const message = sentMessages[0] as {
-                    content: string;
-                    details: { outstandingJobs: number; batch: unknown[] };
-                };
-                assert.equal(sentMessages.length, 1);
-                assert.match(message.content, /2 failed \(1 jobs outstanding\)/);
-                assert.equal(message.details.outstandingJobs, 1);
-                assert.equal(message.details.batch.length, 2);
+                assert.equal(sentMessages.length, 2);
+                for (const raw of sentMessages) {
+                    const message = raw as {
+                        content: string;
+                        details: { outstandingJobs: number };
+                    };
+                    assert.match(message.content, /\(1 jobs outstanding\)/);
+                    assert.equal(message.details.outstandingJobs, 1);
+                }
             } finally {
                 liveChild.kill("SIGTERM");
                 await once(liveChild, "exit");
@@ -1661,17 +1744,346 @@ void describe(
             proc.emitClose(1);
             await job2.outputIndexPromise;
             state._flushCompletionBatch?.();
-            assert.equal(
-                sentMessages.length,
-                1,
-                "failed completion must send one notification"
+            const failureMessages = sentMessages.filter((message) =>
+                (message as { content: string }).content.includes(job2.id)
             );
-            const msg = sentMessages[0] as {
+            assert.equal(failureMessages.length, 1);
+            assert.ok(sentMessages.length <= 2);
+            const msg = failureMessages[0] as {
                 customType: string;
                 content: string;
             };
             assert.equal(msg.customType, "job-completion");
+            assert.match(msg.content, /Exit code: 1/);
             assert.ok(msg.content.includes(job2.id));
+        });
+
+        void it("includes one attributed line per stale completion in the digest", () => {
+            const state = new TauState();
+            const sentMessages: Array<{
+                customType: string;
+                content: string;
+                details: Record<string, unknown>;
+            }> = [];
+            const pi = {
+                registerTool() {},
+                registerCommand() {},
+                registerMessageRenderer() {},
+                registerToolPromptGuidelines() {},
+                createBashTool: () => ({
+                    execute: async () => ({ content: [] }),
+                }),
+                sendMessage(message: (typeof sentMessages)[number]) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            registerBackgroundJobs(pi, state);
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            const oldEnd = Date.now() - 6 * 60_000;
+            const first = makeJob({
+                id: "stale-alpha",
+                command: "x".repeat(80),
+                logPath: "/tmp/stale-alpha.log",
+                status: "completed",
+                exitCode: 0,
+                endTime: oldEnd,
+                wantsCompletionNotification: true,
+                sourceId: "source-alpha",
+            });
+            const second = makeJob({
+                id: "stale-beta",
+                command: "printf beta",
+                logPath: "/tmp/stale-beta.log",
+                status: "completed",
+                exitCode: 0,
+                endTime: oldEnd,
+                wantsCompletionNotification: true,
+            });
+            notifyCompletion(first, state, pi, ctx);
+            notifyCompletion(second, state, pi, ctx);
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 1);
+            const { content, details } = sentMessages[0];
+            assert.match(content, /2 older completions suppressed/);
+            assert.match(content, /stale-alpha/);
+            assert.match(content, /stale-beta/);
+            assert.match(content, /log=\/tmp\/stale-alpha\.log/);
+            assert.match(content, /sourceId=source-alpha/);
+            assert.doesNotMatch(content, /sourceId=undefined/);
+            const commandLine = content.match(/command="([^"]+)"/)?.[1];
+            if (typeof commandLine !== "string") {
+                throw new Error("digest must include the command field");
+            }
+            assert.ok(
+                commandLine.length <= 60,
+                "digest command is capped at 60 chars"
+            );
+            assert.deepEqual(details.jobIds, ["stale-alpha", "stale-beta"]);
+        });
+
+        void it("attributes every completion in a coalesced success notice", () => {
+            const state = new TauState();
+            const sentMessages: Array<{ content: string }> = [];
+            const pi = {
+                registerTool() {},
+                registerCommand() {},
+                registerMessageRenderer() {},
+                registerToolPromptGuidelines() {},
+                createBashTool: () => ({
+                    execute: async () => ({ content: [] }),
+                }),
+                sendMessage(message: { content: string }) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            registerBackgroundJobs(pi, state);
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            const jobs = [
+                makeJob({
+                    id: "coalesced-alpha",
+                    command: "build alpha",
+                    logPath: "/tmp/coalesced-alpha.log",
+                    status: "completed",
+                    exitCode: 0,
+                    sourceId: "source-alpha",
+                    wantsCompletionNotification: true,
+                }),
+                makeJob({
+                    id: "coalesced-beta",
+                    command: "test beta",
+                    logPath: "/tmp/coalesced-beta.log",
+                    status: "completed",
+                    exitCode: 0,
+                    wantsCompletionNotification: true,
+                }),
+            ];
+            for (const job of jobs) notifyCompletion(job, state, pi, ctx);
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 1);
+            const content = sentMessages[0].content;
+            for (const job of jobs) {
+                assert.ok(content.includes(job.id));
+                assert.ok(
+                    content.includes(`command=${JSON.stringify(job.command)}`),
+                    content
+                );
+                assert.ok(content.includes(`log=${job.logPath}`));
+            }
+            assert.ok(content.includes("sourceId=source-alpha"));
+            assert.doesNotMatch(content, /sourceId=undefined/);
+        });
+
+        void it("delivers up to five failed completions individually and digests overflow", () => {
+            const state = new TauState();
+            const sentMessages: Array<{ customType: string; content: string }> =
+                [];
+            const pi = {
+                registerTool() {},
+                registerCommand() {},
+                registerMessageRenderer() {},
+                registerToolPromptGuidelines() {},
+                createBashTool: () => ({
+                    execute: async () => ({ content: [] }),
+                }),
+                sendMessage(message: { customType: string; content: string }) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            registerBackgroundJobs(pi, state);
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            for (let index = 0; index < 6; index++) {
+                notifyCompletion(
+                    makeJob({
+                        id: `failed-${index}`,
+                        command: `command-${index}`,
+                        logPath: `/tmp/failed-${index}.log`,
+                        status: "failed",
+                        exitCode: 1,
+                        startTime: Date.now() - 1000,
+                        endTime: Date.now(),
+                    }),
+                    state,
+                    pi,
+                    ctx
+                );
+            }
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 6);
+            for (let index = 0; index < 5; index++) {
+                assert.match(
+                    sentMessages[index].content,
+                    new RegExp(`failed-${index}`)
+                );
+                assert.match(
+                    sentMessages[index].content,
+                    new RegExp(`command-${index}`)
+                );
+                assert.match(
+                    sentMessages[index].content,
+                    new RegExp(`/tmp/failed-${index}\\.log`)
+                );
+                assert.match(sentMessages[index].content, /Exit code: 1/);
+            }
+            assert.match(
+                sentMessages[5].content,
+                /Additional coalesced background completions \(1\)/
+            );
+            assert.match(sentMessages[5].content, /failed-5/);
+            assert.match(sentMessages[5].content, /command="command-5"/);
+            assert.match(sentMessages[5].content, /exit=1/);
+            assert.match(sentMessages[5].content, /log=\/tmp\/failed-5\.log/);
+        });
+
+        void it("restores tuple identity and digests incomplete metadata instead of an empty failure stub", () => {
+            const state = new TauState();
+            const sentMessages: Array<{ customType: string; content: string }> =
+                [];
+            const pi = {
+                registerTool() {},
+                registerCommand() {},
+                registerMessageRenderer() {},
+                registerToolPromptGuidelines() {},
+                createBashTool: () => ({
+                    execute: async () => ({ content: [] }),
+                }),
+                appendEntry() {},
+                sendMessage(message: { customType: string; content: string }) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            registerBackgroundJobs(pi, state);
+            const ctx = {
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            restoreBackgroundJobs(
+                [
+                    {
+                        type: "custom",
+                        customType: "background-tasks-state",
+                        data: {
+                            jobs: [
+                                [
+                                    "restored-partial-job",
+                                    {
+                                        pid: 1,
+                                        startTime: Date.now() - 1000,
+                                        status: "failed",
+                                        exitCode: 1,
+                                        command: "",
+                                        logPath: "",
+                                        toolCallId: "restored-call",
+                                        isBackgrounded: true,
+                                    },
+                                ],
+                            ],
+                        },
+                    },
+                ],
+                state,
+                pi,
+                ctx
+            );
+            const restored = state.backgroundJobs.get("restored-partial-job");
+            if (!restored) throw new Error("restored snapshot job is missing");
+            assert.equal(restored.id, "restored-partial-job");
+            notifyCompletion(restored, state, pi, ctx);
+            state._flushCompletionBatch?.();
+
+            assert.equal(sentMessages.length, 1);
+            const message = sentMessages[0];
+            assert.match(message.content, /restored-partial-job/);
+            assert.match(message.content, /exit=1/);
+            assert.doesNotMatch(message.content, /Command:\\s*(?:\\n|$)/);
+            assert.doesNotMatch(message.content, /Output:\\s*(?:\\n|$)/);
+            assert.doesNotMatch(message.content, /❌\\s+\\(\\)/);
+        });
+
+        void it("counts and logs unidentifiable completions without rendering them", async () => {
+            const state = new TauState();
+            const sentMessages: unknown[] = [];
+            const sessionId = `bg-delivery-unidentified-${Date.now()}`;
+            const pi = {
+                registerTool() {},
+                registerCommand() {},
+                registerMessageRenderer() {},
+                registerToolPromptGuidelines() {},
+                createBashTool: () => ({
+                    execute: async () => ({ content: [] }),
+                }),
+                sendMessage(message: unknown) {
+                    sentMessages.push(message);
+                },
+            } as never;
+            registerBackgroundJobs(pi, state);
+            const ctx = {
+                sessionManager: { getSessionId: () => sessionId },
+                ui: {
+                    notify() {},
+                    setWidget() {},
+                    setStatus() {},
+                    theme: { fg: () => "" },
+                },
+            } as never;
+            const before = getSuppressedUnidentifiableCompletionCount();
+            notifyCompletion(
+                makeJob({ id: "", status: "failed", exitCode: 1 }),
+                state,
+                pi,
+                ctx
+            );
+            state._flushCompletionBatch?.();
+            for (let i = 0; i < 20; i++) {
+                if (
+                    existsSync(join(tmpdir(), "pi-tau-maintenance.log")) &&
+                    readFileSync(
+                        join(tmpdir(), "pi-tau-maintenance.log"),
+                        "utf8"
+                    ).includes(sessionId)
+                )
+                    break;
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+
+            assert.equal(sentMessages.length, 0);
+            assert.equal(
+                getSuppressedUnidentifiableCompletionCount(),
+                before + 1
+            );
+            assert.match(
+                readFileSync(join(tmpdir(), "pi-tau-maintenance.log"), "utf8"),
+                new RegExp(
+                    `bg-delivery suppressed_unidentifiable session=${sessionId}`
+                )
+            );
         });
 
         void it("wakes the agent for a kept auto-backgrounded job's successful completion", async () => {
