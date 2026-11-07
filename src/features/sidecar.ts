@@ -354,47 +354,50 @@ export async function purgeSidecar(
             stats.pages++;
             stats.sourcesConsidered += page.length;
             for (let cursor = 0; cursor < page.length; ) {
-            if (!shouldContinue()) {
-                stats.budgetExhausted = true;
-                break;
-            }
-            const batch = page.slice(cursor, cursor + batchSize);
-            for (const source of batch) {
-                let chunksDeleted: number;
-                do {
-                    if (!shouldContinue() || overTotalBudget()) {
-                        stats.budgetExhausted = true;
-                        break;
-                    }
-                    const result = db.prepare(
-                        `DELETE FROM context_chunks WHERE rowid IN (
+                if (!shouldContinue()) {
+                    stats.budgetExhausted = true;
+                    break;
+                }
+                const batch = page.slice(cursor, cursor + batchSize);
+                for (const source of batch) {
+                    let chunksDeleted: number;
+                    do {
+                        if (!shouldContinue() || overTotalBudget()) {
+                            stats.budgetExhausted = true;
+                            break;
+                        }
+                        const result = db
+                            .prepare(
+                                `DELETE FROM context_chunks WHERE rowid IN (
                             SELECT rowid FROM context_chunks WHERE source_id = ? LIMIT ?
                         )`
-                    ).run(source.id, PURGE_CHUNK_DELETE_SLAB_SIZE);
-                    chunksDeleted = Number(result.changes ?? 0);
-                    stats.chunksRemoved += chunksDeleted;
-                    if (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE)
-                        await yieldIfNeeded(true);
-                } while (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE);
+                            )
+                            .run(source.id, PURGE_CHUNK_DELETE_SLAB_SIZE);
+                        chunksDeleted = Number(result.changes ?? 0);
+                        stats.chunksRemoved += chunksDeleted;
+                        if (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE)
+                            await yieldIfNeeded(true);
+                    } while (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE);
+                    if (stats.budgetExhausted) break;
+                }
                 if (stats.budgetExhausted) break;
+                const placeholders = batch.map(() => "?").join(",");
+                const sourcesResult = db
+                    .prepare(
+                        `DELETE FROM context_sources WHERE id IN (${placeholders})`
+                    )
+                    .run(...batch.map((row) => row.id));
+                stats.sourcesRemoved += Number(sourcesResult.changes ?? 0);
+                cursor += batch.length;
+                scannedSources += batch.length;
+                await yieldIfNeeded();
+                if (!shouldContinue() || overTotalBudget()) {
+                    stats.budgetExhausted = true;
+                    break;
+                }
             }
-            if (stats.budgetExhausted) break;
-            const placeholders = batch.map(() => "?").join(",");
-            const sourcesResult = db
-                .prepare(
-                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
-                )
-                .run(...batch.map((row) => row.id));
-            stats.sourcesRemoved += Number(sourcesResult.changes ?? 0);
-            cursor += batch.length;
-            scannedSources += batch.length;
-            await yieldIfNeeded();
-            if (!shouldContinue() || overTotalBudget()) {
-                stats.budgetExhausted = true;
+            if (stats.budgetExhausted || page.length < PURGE_SCAN_PAGE_SIZE)
                 break;
-            }
-            }
-            if (stats.budgetExhausted || page.length < PURGE_SCAN_PAGE_SIZE) break;
             await yieldIfNeeded(true);
         }
 

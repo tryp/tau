@@ -160,9 +160,13 @@ export default function (pi: ExtensionAPI) {
                 if (sidecarPurgeTimer === scheduledTimer)
                     sidecarPurgeTimer = undefined;
                 if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
-                    const delay = PURGE_IDLE_RETRY_DELAYS[
-                        Math.min(idleRetries, PURGE_IDLE_RETRY_DELAYS.length - 1)
-                    ];
+                    const delay =
+                        PURGE_IDLE_RETRY_DELAYS[
+                            Math.min(
+                                idleRetries,
+                                PURGE_IDLE_RETRY_DELAYS.length - 1
+                            )
+                        ];
                     scheduleSidecarPurgeForGeneration(
                         generation,
                         delay,

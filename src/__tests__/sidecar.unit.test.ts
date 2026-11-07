@@ -193,7 +193,14 @@ void describe("purgeSidecar", () => {
              VALUES (?, ?, ?, ?, ?, ?)`
         );
         for (let ordinal = 0; ordinal < 5_000; ordinal++) {
-            insert.run(`${sourceId}_${ordinal}`, sourceId, ordinal, "chunk", "x", 1);
+            insert.run(
+                `${sourceId}_${ordinal}`,
+                sourceId,
+                ordinal,
+                "chunk",
+                "x",
+                1
+            );
         }
         db.close();
 
@@ -209,9 +216,12 @@ void describe("purgeSidecar", () => {
                     prepare(sql: string) {
                         const statement = database.prepare(sql);
                         return {
-                            all: (...params: unknown[]) => statement.all(...params),
+                            all: (...params: unknown[]) =>
+                                statement.all(...(params as never[])),
                             run: (...params: unknown[]) => {
-                                const result = statement.run(...params);
+                                const result = statement.run(
+                                    ...(params as never[])
+                                );
                                 if (sql.includes("DELETE FROM context_chunks"))
                                     deleteSizes.push(Number(result.changes));
                                 return result;
@@ -227,9 +237,15 @@ void describe("purgeSidecar", () => {
         });
 
         assert.equal(stats.chunksRemoved, 5_000);
-        assert.ok(deleteSizes.length >= 11, "5000 chunks require 10 slabs plus empty check");
+        assert.ok(
+            deleteSizes.length >= 11,
+            "5000 chunks require 10 slabs plus empty check"
+        );
         assert.ok(deleteSizes.every((count) => count <= 500));
-        assert.ok(yields >= 10, "each full slab must yield before more trigger work");
+        assert.ok(
+            yields >= 10,
+            "each full slab must yield before more trigger work"
+        );
     });
 
     void it("paginates stale-source scans and yields before reading the full set", async () => {
@@ -262,9 +278,10 @@ void describe("purgeSidecar", () => {
                                     )
                                 )
                                     scanPages++;
-                                return statement.all(...params);
+                                return statement.all(...(params as never[]));
                             },
-                            run: (...params: unknown[]) => statement.run(...params),
+                            run: (...params: unknown[]) =>
+                                statement.run(...(params as never[])),
                         };
                     },
                     close: () => database.close(),
@@ -286,7 +303,7 @@ void describe("purgeSidecar", () => {
         });
 
         assert.equal(stats.pages, 3);
-        assert.ok(scanPages > stats.pages, "final empty-page check should be bounded too");
+        assert.equal(scanPages, stats.pages, "each nonempty page is read once");
         assert.ok(
             firstYieldRemaining > 0,
             "first yield must precede reading all stale ids"

@@ -400,6 +400,9 @@ void describe("deferred startup maintenance", () => {
         const oldNodeTestContext = process.env.NODE_TEST_CONTEXT;
         const oldArgv = [...process.argv];
         const oldDebug = console.debug;
+        const oldError = console.error;
+        const sidecarErrors: string[] = [];
+        const sidecarSuccesses: string[] = [];
         const stalePurgeLogs: string[] = [];
         console.debug = (...args: unknown[]) => {
             if (
@@ -408,6 +411,17 @@ void describe("deferred startup maintenance", () => {
                 )
             )
                 stalePurgeLogs.push(String(args[0]));
+        };
+        console.error = (...args: unknown[]) => {
+            const message = String(args[0]);
+            if (message.includes("[tau] sidecar purge failed:"))
+                sidecarErrors.push(message);
+            if (
+                message.includes("[tau] sidecar-purge") &&
+                message.includes("errors=0")
+            )
+                sidecarSuccesses.push(message);
+            oldError(...args);
         };
         const fakeTimers = new FakeTimers();
         let procScans = 0;
@@ -442,7 +456,8 @@ exit 0
             );
             chmodSync(fakeTmux, 0o755);
 
-            const db = new DatabaseSync(join(agentDir, "context.db"));
+            const contextDbPath = join(agentDir, "context.db");
+            const db = new DatabaseSync(contextDbPath);
             db.exec(`
                 CREATE TABLE context_sources (
                     id TEXT PRIMARY KEY,
@@ -866,12 +881,38 @@ exit 0
             await agentStart({}, ctx);
             Date.now = () => oldDateNow() + fakeTimers.now;
             fakeTimers.advance(4_750);
-            Date.now = oldDateNow;
             assert.equal(sidecarSelects, 0, "purge must not run during a turn");
+
+            const validDbBackup = join(dir, "context.db.valid");
+            fs.renameSync(contextDbPath, validDbBackup);
+            mkdirSync(contextDbPath);
             await agentEnd({ messages: [] }, ctx);
             fakeTimers.advance(5_000);
+            await waitFor(() => sidecarErrors.length > 0);
+            assert.equal(
+                sidecarSelects,
+                0,
+                "opening the directory must fail before a SELECT"
+            );
+            assert.ok(
+                fakeTimers.records.some(
+                    (timer) =>
+                        !timer.cleared && timer.due === fakeTimers.now + 5_000
+                ),
+                "a transient purge failure must arm a retry"
+            );
+            fs.rmSync(contextDbPath, { recursive: true, force: true });
+            fs.renameSync(validDbBackup, contextDbPath);
+            fakeTimers.advance(5_000);
             await waitFor(() => sidecarSelects === 1);
-            assert.equal(sidecarSelects, 1);
+            await waitFor(() => sidecarSuccesses.length === 1);
+            await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+            Date.now = oldDateNow;
+            assert.equal(
+                sidecarSelects,
+                1,
+                "the retry must query the restored valid database"
+            );
             const dbAfterPurge = new DatabaseSync(join(agentDir, "context.db"));
             assert.equal(
                 dbAfterPurge
@@ -882,6 +923,19 @@ exit 0
                 0
             );
             dbAfterPurge.close();
+            const timersAfterSuccessfulPurge = fakeTimers.records.length;
+            await agentEnd({ messages: [] }, ctx);
+            assert.equal(
+                fakeTimers.records
+                    .slice(timersAfterSuccessfulPurge)
+                    .filter(
+                        (timer) =>
+                            timer.interval === 0 &&
+                            timer.due === fakeTimers.now + 5_000
+                    ).length,
+                0,
+                "a clean successful pass must not schedule another purge"
+            );
 
             const makeSnapshot = (jobId: string) => [
                 {
@@ -985,6 +1039,7 @@ exit 0
             globalThis.clearTimeout = oldClearTimeout;
             globalThis.clearInterval = oldClearInterval;
             console.debug = oldDebug;
+            console.error = oldError;
             fs.readdirSync = oldReaddirSync;
             fsPromises.readdir = oldReaddir;
             syncBuiltinESMExports();
