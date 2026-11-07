@@ -2022,14 +2022,15 @@ void describe(
             const message = sentMessages[0];
             assert.match(message.content, /restored-partial-job/);
             assert.match(message.content, /exit=1/);
-            assert.doesNotMatch(message.content, /Command:\\s*(?:\\n|$)/);
-            assert.doesNotMatch(message.content, /Output:\\s*(?:\\n|$)/);
+            assert.doesNotMatch(message.content, /<empty>/);
+            assert.doesNotMatch(message.content, /Command:\s*(?:\n|$)/);
+            assert.doesNotMatch(message.content, /Output:\s*(?:\n|$)/);
             assert.doesNotMatch(message.content, /❌\\s+\\(\\)/);
         });
 
         void it("counts and logs unidentifiable completions without rendering them", async () => {
             const state = new TauState();
-            const sentMessages: unknown[] = [];
+            const sentMessages: Array<{ content?: string }> = [];
             const sessionId = `bg-delivery-unidentified-${Date.now()}`;
             const pi = {
                 registerTool() {},
@@ -2039,7 +2040,7 @@ void describe(
                 createBashTool: () => ({
                     execute: async () => ({ content: [] }),
                 }),
-                sendMessage(message: unknown) {
+                sendMessage(message: { content?: string }) {
                     sentMessages.push(message);
                 },
             } as never;
@@ -2074,6 +2075,12 @@ void describe(
             }
 
             assert.equal(sentMessages.length, 0);
+            const rendered = sentMessages
+                .map((message) => message.content ?? "")
+                .join("\n");
+            assert.doesNotMatch(rendered, /<empty>/);
+            assert.doesNotMatch(rendered, /Command:\s*(?:\n|$)/);
+            assert.doesNotMatch(rendered, /Output:\s*(?:\n|$)/);
             assert.equal(
                 getSuppressedUnidentifiableCompletionCount(),
                 before + 1
