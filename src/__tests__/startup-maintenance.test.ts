@@ -7,6 +7,7 @@ import {
 } from "../features/sidecar.ts";
 import registerTau, { resolveMaintenanceDelayMs } from "../index.ts";
 import { forEachWithinTimeBudget } from "../features/tmux-orphan-reaper.ts";
+import { scheduleBackgroundJobRestore } from "../features/startup-maintenance.ts";
 
 const realSetTimeout = globalThis.setTimeout;
 
@@ -96,23 +97,33 @@ void describe("deferred startup maintenance", () => {
         assert.equal(canRunSidecarPurge(false, 5_000, 10_000), true);
     });
 
-    void it("defers and unrefs sidecar purge until its scheduled deadline", () => {
+    void it("defers and unrefs sidecar purge and background-job restore", () => {
         const fakeTimers = new FakeTimers();
         const oldSetTimeout = globalThis.setTimeout;
         const oldClearTimeout = globalThis.clearTimeout;
         globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
         globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
         let purges = 0;
+        let restores = 0;
         try {
             scheduleSidecarPurge(() => {
                 purges++;
             }, 5_000);
+            scheduleBackgroundJobRestore(() => {
+                restores++;
+            });
             assert.equal(purges, 0);
-            assert.equal(fakeTimers.records.length, 1);
-            assert.equal(fakeTimers.records[0].unrefCalled, true);
-            fakeTimers.advance(4_999);
+            assert.equal(restores, 0);
+            assert.equal(fakeTimers.records.length, 2);
+            assert.ok(fakeTimers.records.every((timer) => timer.unrefCalled));
+            assert.ok(fakeTimers.records.every((timer) => timer.due > fakeTimers.now));
+            fakeTimers.advance(99);
             assert.equal(purges, 0);
+            assert.equal(restores, 0);
             fakeTimers.advance(1);
+            assert.equal(restores, 1);
+            assert.equal(purges, 0);
+            fakeTimers.advance(4_900);
             assert.equal(purges, 1);
         } finally {
             globalThis.setTimeout = oldSetTimeout;

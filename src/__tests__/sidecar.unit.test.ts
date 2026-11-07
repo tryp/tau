@@ -1284,6 +1284,51 @@ void describe("sidecar purge maintenance regressions", () => {
         assert.ok(yields > 1, "purge must yield throughout a multi-page pass");
     });
 
+    void it("allows a real timer to fire while purge work remains", async () => {
+        const db = createDb(tmpDir);
+        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
+        for (let index = 0; index < 205; index++)
+            insertSource(db, { id: `timer-${String(index).padStart(3, "0")}`, created_at: cutoff });
+        db.close();
+        const dbPath = join(tmpDir, "context.db");
+        let purgeCompleted = false;
+        let timerFiredWhileWorkRemained = false;
+        let yields = 0;
+        const stats = await purgeSidecar(30, {
+            dbPath,
+            batchSize: 1,
+            sliceBudgetMs: 0,
+            yieldToEventLoop: async () => {
+                yields++;
+                if (yields === 1) {
+                    await new Promise<void>((resolve) => {
+                        setTimeout(() => {
+                            const check = new DatabaseSync(dbPath);
+                            const remaining = check
+                                .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                                .get() as { count: number };
+                            check.close();
+                            timerFiredWhileWorkRemained =
+                                !purgeCompleted && remaining.count > 0;
+                            resolve();
+                        }, 0);
+                    });
+                } else {
+                    await new Promise<void>((resolve) => setImmediate(resolve));
+                }
+            },
+            vacuumPagesPerStep: 0,
+        });
+        purgeCompleted = true;
+        assert.equal(stats.sourcesRemoved, 205);
+        assert.ok(yields > 1, "purge should continue through multiple slices");
+        assert.equal(
+            timerFiredWhileWorkRemained,
+            true,
+            "a real timer must fire before the purge has completed its remaining work"
+        );
+    });
+
     void it("pauses between purge slices when turn processing begins", async () => {
         const db = createDb(tmpDir);
         const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
