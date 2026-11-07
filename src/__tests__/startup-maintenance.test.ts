@@ -1,6 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { schedulePeriodicTmuxRunDirCleanup } from "../features/bash-tmux.ts";
+import {
+    canRunSidecarPurge,
+    scheduleSidecarPurge,
+} from "../features/sidecar.ts";
 import registerTau, { resolveMaintenanceDelayMs } from "../index.ts";
 import { forEachWithinTimeBudget } from "../features/tmux-orphan-reaper.ts";
 
@@ -86,6 +90,36 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 void describe("deferred startup maintenance", () => {
+    void it("permits sidecar purge only after the turn is idle long enough", () => {
+        assert.equal(canRunSidecarPurge(true, 0, 10_000), false);
+        assert.equal(canRunSidecarPurge(false, 5_001, 10_000), false);
+        assert.equal(canRunSidecarPurge(false, 5_000, 10_000), true);
+    });
+
+    void it("defers and unrefs sidecar purge until its scheduled deadline", () => {
+        const fakeTimers = new FakeTimers();
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        let purges = 0;
+        try {
+            scheduleSidecarPurge(() => {
+                purges++;
+            }, 5_000);
+            assert.equal(purges, 0);
+            assert.equal(fakeTimers.records.length, 1);
+            assert.equal(fakeTimers.records[0].unrefCalled, true);
+            fakeTimers.advance(4_999);
+            assert.equal(purges, 0);
+            fakeTimers.advance(1);
+            assert.equal(purges, 1);
+        } finally {
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.clearTimeout = oldClearTimeout;
+        }
+    });
+
     void it("bounds configured maintenance delays to safe timer values", () => {
         assert.equal(resolveMaintenanceDelayMs(30_000), 30_000);
         assert.equal(resolveMaintenanceDelayMs(86_400_000), 86_400_000);
@@ -145,6 +179,59 @@ void describe("deferred startup maintenance", () => {
             idle = true;
             fakeTimers.advance(1_000);
             await waitFor(() => runs === 1);
+        } finally {
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.setInterval = oldSetInterval;
+            globalThis.clearTimeout = oldClearTimeout;
+            globalThis.clearInterval = oldClearInterval;
+        }
+    });
+
+    void it("runs the deferred pass once and schedules recurring sweeps", async () => {
+        const fakeTimers = new FakeTimers();
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldSetInterval = globalThis.setInterval;
+        const oldClearTimeout = globalThis.clearTimeout;
+        const oldClearInterval = globalThis.clearInterval;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.setInterval = fakeTimers.setInterval as typeof setInterval;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        globalThis.clearInterval = fakeTimers.clear as typeof clearInterval;
+        let runs = 0;
+        try {
+            schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs: 1,
+                intervalMs: 10,
+                isTestRunner: false,
+                isIdle: () => true,
+                reapOrphans: async () => ({
+                    examined: 0,
+                    orphaned: 0,
+                    killed: 0,
+                    keptLive: 0,
+                    keptFinished: 0,
+                    keptGrowing: 0,
+                    keptQuiet: 0,
+                    keptUnverified: 0,
+                    skippedBootMismatch: 0,
+                    killEscalated: 0,
+                    wouldKill: [],
+                    wouldKillOmitted: 0,
+                    intervalNotElapsed: 0,
+                    chainAbandoned: 0,
+                    stuckChainCount: 0,
+                    stuckChains: [],
+                }),
+                cleanup: async () => {
+                    runs++;
+                    return { examined: 0, removed: 0, keptAlive: 0, keptUnknown: 0 };
+                },
+            });
+            fakeTimers.advance(1);
+            await waitFor(() => runs === 1);
+            fakeTimers.advance(10);
+            await waitFor(() => runs === 2);
+            assert.equal(runs, 2);
         } finally {
             globalThis.setTimeout = oldSetTimeout;
             globalThis.setInterval = oldSetInterval;
@@ -320,9 +407,10 @@ void describe("deferred startup maintenance", () => {
             const start = events.get("session_start")?.at(-1);
             assert.ok(start);
             await start({}, ctx);
+            assert.ok(fakeTimers.records.length > 0);
             assert.ok(
-                fakeTimers.records.some((timer) => timer.unrefCalled),
-                "real extension startup schedules maintenance for later"
+                fakeTimers.records.every((timer) => timer.unrefCalled),
+                "real extension startup schedules all maintenance timers unref'd"
             );
             assert.equal(
                 fakeTimers.records.some(

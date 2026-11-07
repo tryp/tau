@@ -15,7 +15,12 @@ import { runMaintenanceTask } from "../maintenance/client.ts";
 interface WorkerResult {
     ok: boolean;
     task: string;
-    stats: { filesVisited?: number; cancelled?: boolean };
+    stats: {
+        filesVisited?: number;
+        deletedPaths?: string[];
+        cancelled?: boolean;
+    };
+    type?: "progress";
     durationMs?: number;
 }
 
@@ -24,7 +29,9 @@ function runWorker(directory: string, cancel = false): Promise<WorkerResult> {
         const worker = new Worker(
             new URL("../maintenance/runner.ts", import.meta.url)
         );
-        worker.once("message", (message: WorkerResult) => resolve(message));
+        worker.on("message", (message: WorkerResult) => {
+            if (message.type !== "progress") resolve(message);
+        });
         worker.once("error", reject);
         worker.once("exit", (code: number) => {
             if (code !== 0) reject(new Error(`worker exited ${code}`));
@@ -114,19 +121,25 @@ void it("stops a real stage0 worker after mid-flight cancellation", async () => 
             new URL("../maintenance/runner.ts", import.meta.url)
         );
         const result = new Promise<WorkerResult>((resolve, reject) => {
-            worker.once("message", resolve);
+            worker.on("message", (message: WorkerResult) => {
+                if (message.type === "progress") {
+                    worker.postMessage({ cancel: true });
+                    return;
+                }
+                resolve(message);
+            });
             worker.once("error", reject);
         });
         worker.postMessage({
             task: "stage0-retention",
             options: { directories: [directory], budgetBytes: 1 },
         });
-        await new Promise<void>((resolve) => setTimeout(resolve, 40));
-        worker.postMessage({ cancel: true });
         const completed = await result;
         assert.equal(completed.ok, true);
         assert.equal(completed.stats.cancelled, true);
-        assert.ok((completed.stats.filesVisited ?? count) < count);
+        const filesVisited = completed.stats.filesVisited ?? 0;
+        assert.ok(filesVisited > 0, "worker must visit files before cancellation");
+        assert.ok(filesVisited < count, "cancellation must stop the inventory early");
         await worker.terminate();
     } finally {
         rmSync(directory, { recursive: true, force: true });

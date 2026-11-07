@@ -15,6 +15,7 @@ if (!parentPort) throw new Error("maintenance runner must execute in a worker");
 
 let cancelled = false;
 let started = false;
+let firstProgressSent = false;
 const handleMessage = async (message: Request | { cancel?: boolean }) => {
     if ("cancel" in message && message.cancel) {
         cancelled = true;
@@ -39,6 +40,13 @@ const handleMessage = async (message: Request | { cancel?: boolean }) => {
                 ? await sweepStage0Captures({
                       ...request.options!,
                       shouldContinue: () => !cancelled,
+                      onProgress: (path) => {
+                          // One handshake is enough for responsiveness tests; do not
+                          // turn per-file progress into production message traffic.
+                          if (firstProgressSent) return;
+                          firstProgressSent = true;
+                          parentPort!.postMessage({ type: "progress", path });
+                      },
                   })
                 : {
                       reaper: await reapOrphanedTmuxProcesses({
