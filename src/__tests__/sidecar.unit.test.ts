@@ -1142,6 +1142,35 @@ void describe("indexJobOutputInSidecar", () => {
     });
 });
 
+void describe("sidecar missing-data compatibility", () => {
+    void it("read missing-table and missing-job paths safely", async () => {
+        const db = new DatabaseSync(join(tmpDir, "context.db"), {});
+        db.prepare("CREATE TABLE dummy (id TEXT)").run();
+        db.close();
+        assert.equal(await readJobOutputFromSidecar("job-any"), null);
+
+        createDb(tmpDir);
+        assert.equal(await readJobOutputFromSidecar("job-missing"), null);
+    });
+
+    void it("indexing safely ignores a DB without context_sources", async () => {
+        const db = new DatabaseSync(join(tmpDir, "context.db"), {});
+        db.prepare("CREATE TABLE dummy (id TEXT)").run();
+        db.close();
+        const job: BackgroundJob = {
+            id: "dummy",
+            command: "echo",
+            pid: 1,
+            startTime: 0,
+            status: "completed",
+            logPath: join(tmpDir, "nope.log"),
+            toolCallId: "tc-1",
+            isBackgrounded: true,
+        };
+        await indexJobOutputInSidecar(job, {});
+    });
+});
+
 // ─── Double-close regression tests ─────────────────────────────────
 // These verify the fix for the "database is not open" error caused by
 // explicit db.close() + finally { db.close() } on early-return paths.

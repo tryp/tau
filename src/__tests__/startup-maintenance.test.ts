@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { schedulePeriodicTmuxRunDirCleanup } from "../features/bash-tmux.ts";
-import { resolveMaintenanceDelayMs } from "../index.ts";
+import registerTau, { resolveMaintenanceDelayMs } from "../index.ts";
 import { forEachWithinTimeBudget } from "../features/tmux-orphan-reaper.ts";
 
 const realSetTimeout = globalThis.setTimeout;
@@ -150,6 +150,174 @@ void describe("deferred startup maintenance", () => {
             globalThis.setInterval = oldSetInterval;
             globalThis.clearTimeout = oldClearTimeout;
             globalThis.clearInterval = oldClearInterval;
+        }
+    });
+
+    void it("re-arms the retry ladder after a worker timeout rejection", async () => {
+        const fakeTimers = new FakeTimers();
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldSetInterval = globalThis.setInterval;
+        const oldClearTimeout = globalThis.clearTimeout;
+        const oldClearInterval = globalThis.clearInterval;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.setInterval = fakeTimers.setInterval as typeof setInterval;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        globalThis.clearInterval = fakeTimers.clear as typeof clearInterval;
+        try {
+            schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs: 1,
+                isTestRunner: false,
+                runSweep: async () => {
+                    throw new Error("worker deadline");
+                },
+                isIdle: () => true,
+                record: () => {},
+            });
+            fakeTimers.advance(1);
+            await waitFor(() =>
+                fakeTimers.records.some(
+                    (timer) => timer.due === fakeTimers.now + 5_000
+                )
+            );
+            assert.ok(
+                fakeTimers.records.some(
+                    (timer) => timer.interval === 0 && timer.due === 5_001
+                )
+            );
+        } finally {
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.setInterval = oldSetInterval;
+            globalThis.clearTimeout = oldClearTimeout;
+            globalThis.clearInterval = oldClearInterval;
+        }
+    });
+
+    void it("timer callbacks never write directly to console", async () => {
+        const fakeTimers = new FakeTimers();
+        const originals = {
+            log: console.log,
+            info: console.info,
+            warn: console.warn,
+            error: console.error,
+            debug: console.debug,
+        };
+        let writes = 0;
+        let complete = false;
+        for (const method of Object.keys(originals) as Array<
+            keyof typeof originals
+        >) {
+            console[method] = (() => {
+                writes++;
+            }) as (typeof console)[typeof method];
+        }
+        const oldSetTimeout = globalThis.setTimeout;
+        const oldSetInterval = globalThis.setInterval;
+        const oldClearTimeout = globalThis.clearTimeout;
+        const oldClearInterval = globalThis.clearInterval;
+        globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
+        globalThis.setInterval = fakeTimers.setInterval as typeof setInterval;
+        globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
+        globalThis.clearInterval = fakeTimers.clear as typeof clearInterval;
+        try {
+            schedulePeriodicTmuxRunDirCleanup({
+                firstRunDelayMs: 30_000,
+                isTestRunner: false,
+                reapOrphans: async () => ({
+                    examined: 0,
+                    orphaned: 0,
+                    killed: 0,
+                    keptLive: 0,
+                    keptFinished: 0,
+                    keptGrowing: 0,
+                    keptQuiet: 0,
+                    keptUnverified: 0,
+                    skippedBootMismatch: 0,
+                    killEscalated: 0,
+                    wouldKill: [],
+                    wouldKillOmitted: 0,
+                    intervalNotElapsed: 0,
+                    chainAbandoned: 0,
+                    stuckChainCount: 0,
+                    stuckChains: [],
+                }),
+                cleanup: async () => {
+                    complete = true;
+                    return {
+                        examined: 0,
+                        removed: 0,
+                        keptAlive: 0,
+                        keptUnknown: 0,
+                    };
+                },
+            });
+            fakeTimers.advance(30_000);
+            await waitFor(() => complete);
+            assert.equal(writes, 0);
+        } finally {
+            globalThis.setTimeout = oldSetTimeout;
+            globalThis.setInterval = oldSetInterval;
+            globalThis.clearTimeout = oldClearTimeout;
+            globalThis.clearInterval = oldClearInterval;
+            Object.assign(console, originals);
+        }
+    });
+
+    void it("keeps the real extension startup path nonblocking for maintenance", async () => {
+        const previous = process.env.PI_TAU_MAINTENANCE_DISABLE;
+        process.env.PI_TAU_MAINTENANCE_DISABLE = "1";
+        const events = new Map<
+            string,
+            Array<(...args: unknown[]) => unknown>
+        >();
+        const pi = new Proxy(
+            {
+                on: (event: string, handler: (...args: unknown[]) => unknown) =>
+                    events.set(event, [...(events.get(event) ?? []), handler]),
+                appendEntry: () => {},
+                getAllTools: () => [],
+                getActiveTools: () => [],
+                getFlag: () => undefined,
+                sendMessage: () => {},
+                sendUserMessage: () => {},
+                cancelQueuedMessage: () => false,
+                registerMessageRenderer: () => {},
+                registerTool: () => {},
+                getSessionName: () => "test",
+            },
+            {
+                get: (target, key: string) =>
+                    key in target
+                        ? target[key as keyof typeof target]
+                        : () => {},
+            }
+        );
+        const ctx = {
+            cwd: process.cwd(),
+            hasUI: false,
+            ui: {
+                setStatus() {},
+                notify() {},
+                setWidget() {},
+                setTitle() {},
+                theme: { fg: (_: string, text: string) => text },
+            },
+            sessionManager: {
+                getEntries: () => [],
+                getBranch: () => [],
+                getSessionFile: () => "test.jsonl",
+                getSessionId: () => "test",
+            },
+        };
+        try {
+            registerTau(pi as never);
+            const start = events.get("session_start")?.at(-1);
+            assert.ok(start);
+            await start({}, ctx);
+            assert.ok((events.get("session_shutdown")?.length ?? 0) > 0);
+        } finally {
+            if (previous === undefined)
+                delete process.env.PI_TAU_MAINTENANCE_DISABLE;
+            else process.env.PI_TAU_MAINTENANCE_DISABLE = previous;
         }
     });
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 let entriesDroppedWhenCtxStale = 0;
 let workerTimeouts = 0;
+let pendingWrites = Promise.resolve();
 
 export function recordMaintenanceEvent(
     event: string,
@@ -24,10 +25,15 @@ export function recordMaintenanceEvent(
         entries_dropped_when_ctx_stale: entriesDroppedWhenCtxStale,
         worker_timeouts: workerTimeouts,
     });
-    void appendFile(
-        join(tmpdir(), "pi-tau-maintenance.log"),
-        `${line}\n`
-    ).catch(() => {});
+    pendingWrites = pendingWrites.then(() =>
+        appendFile(join(tmpdir(), "pi-tau-maintenance.log"), `${line}\n`).catch(
+            () => {}
+        )
+    );
+}
+
+export async function flushMaintenanceEvents(): Promise<void> {
+    await pendingWrites;
 }
 
 export function noteMaintenanceWorkerTimeout(): number {

@@ -36,17 +36,25 @@ const handleMessage = async (message: Request | { cancel?: boolean }) => {
         }
         const stats =
             request.task === "stage0-retention"
-                ? sweepStage0Captures(request.options!)
+                ? await sweepStage0Captures({
+                      ...request.options!,
+                      shouldContinue: () => !cancelled,
+                  })
                 : {
                       reaper: await reapOrphanedTmuxProcesses({
                           rootDir: "/tmp",
+                          shouldContinue: () => !cancelled,
                       }),
-                      cleanup: await cleanupStaleTmuxRunDirsAsync(),
+                      cleanup: await cleanupStaleTmuxRunDirsAsync({
+                          shouldContinue: () => !cancelled,
+                      }),
                   };
         parentPort!.postMessage({
             ok: true,
             task: request.task,
-            stats,
+            stats: cancelled
+                ? { ...stats, cancelled: true, budgetExhausted: true }
+                : stats,
             durationMs: performance.now() - startedAt,
         });
         parentPort!.close();

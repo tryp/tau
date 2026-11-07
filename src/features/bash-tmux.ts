@@ -118,6 +118,7 @@ export interface StaleRunDirCleanupOptions {
     runTmux?: (command: string) => string;
     /** Probe for an active wrapper stored in a run directory. */
     wrapperLiveness?: (dir: string) => ProcessLiveness;
+    shouldContinue?: () => boolean;
 }
 
 type ProcessLiveness = "alive" | "dead" | "unknown";
@@ -312,6 +313,7 @@ export async function cleanupStaleTmuxRunDirsAsync(
         return stats;
     }
     await forEachWithinTimeBudget(entries, async (entry) => {
+        if (options.shouldContinue && !options.shouldContinue()) return;
         if (!entry.startsWith("pi-tmux-")) return;
         const suffix = entry.slice("pi-tmux-".length);
         if (!/^\d+$/.test(suffix)) return;
@@ -350,6 +352,7 @@ export async function cleanupStaleTmuxRunDirsAsync(
             }
         }
     });
+    if (options.shouldContinue && !options.shouldContinue()) return stats;
     if (options.runTmux) reapOrphanedTmuxSessions(options.runTmux, isAlive);
     else await reapOrphanedTmuxSessionsAsync(isAlive);
     return stats;

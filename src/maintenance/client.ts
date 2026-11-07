@@ -17,6 +17,12 @@ export function maintenanceWorkerDeadlineMs(task: MaintenanceTask): number {
     return 2 * totalBudgetMs;
 }
 
+const activeWorkers = new Set<Worker>();
+
+export function cancelMaintenanceTasks(): void {
+    for (const worker of activeWorkers) worker.postMessage({ cancel: true });
+}
+
 export function runMaintenanceTask<T>(
     task: MaintenanceTask,
     onWorker?: (worker: Worker) => void,
@@ -26,8 +32,12 @@ export function runMaintenanceTask<T>(
     createWorker: () => Worker = () =>
         new Worker(new URL("./runner.ts", import.meta.url))
 ): Promise<T> {
+    if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") {
+        return Promise.resolve({ cancelled: true } as T);
+    }
     return new Promise<T>((resolve, reject) => {
         const worker = createWorker();
+        activeWorkers.add(worker);
         worker.unref();
         onWorker?.(worker);
         let settled = false;
@@ -49,6 +59,7 @@ export function runMaintenanceTask<T>(
         const finish = (error?: Error, value?: T) => {
             if (settled) return;
             settled = true;
+            activeWorkers.delete(worker);
             clearTimeout(deadline);
             if (error) reject(error);
             else resolve(value!);

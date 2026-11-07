@@ -14,9 +14,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Worker } from "node:worker_threads";
-import { runMaintenanceTask } from "./maintenance/client.ts";
-import { recordMaintenanceEvent } from "./maintenance/events.ts";
+import {
+    cancelMaintenanceTasks,
+    runMaintenanceTask,
+} from "./maintenance/client.ts";
+import {
+    flushMaintenanceEvents,
+    recordMaintenanceEvent,
+} from "./maintenance/events.ts";
 import { appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -128,9 +133,7 @@ export default function (pi: ExtensionAPI) {
     let sessionShuttingDown = false;
     let turnProcessing = false;
     let lastActivityAt = Date.now();
-    let maintenanceWorker: Worker | undefined;
-    const cancelMaintenanceWorker = () =>
-        maintenanceWorker?.postMessage({ cancel: true });
+    const cancelMaintenanceWorker = () => cancelMaintenanceTasks();
     const noteTerminalActivity = () => {
         lastActivityAt = Date.now();
         cancelMaintenanceWorker();
@@ -768,19 +771,11 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
                     runMaintenanceTask<{
                         reaper: import("./features/tmux-orphan-reaper.ts").OrphanReaperStats;
                         cleanup: import("./features/bash-tmux.ts").StaleRunDirCleanupStats;
-                    }>(
-                        "tmux-sweep",
-                        (worker) => (maintenanceWorker = worker),
-                        undefined,
-                        (event, details) =>
-                            recordMaintenanceEvent(
-                                event,
-                                details,
-                                (type, data) => pi.appendEntry(type, data)
-                            )
-                    ).finally(() => {
-                        maintenanceWorker = undefined;
-                    }),
+                    }>("tmux-sweep", undefined, undefined, (event, details) =>
+                        recordMaintenanceEvent(event, details, (type, data) =>
+                            pi.appendEntry(type, data)
+                        )
+                    ),
                 record: (event, details) =>
                     recordMaintenanceEvent(event, details, (type, data) =>
                         pi.appendEntry(type, data)
@@ -844,6 +839,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         state.agentStartTime = undefined;
 
         cleanupTmuxRunDir();
+        await flushMaintenanceEvents();
 
         pi.appendEntry("background-tasks-state", {
             jobs: Array.from(state.backgroundJobs.entries()).map(

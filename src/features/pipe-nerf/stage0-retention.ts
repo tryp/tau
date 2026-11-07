@@ -8,6 +8,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import { stageZeroDirectory } from "./stage0-path.ts";
 
 export const DEFAULT_STAGE0_BUDGET_BYTES = 2 * 1024 * 1024 * 1024;
@@ -21,6 +22,9 @@ export interface Stage0SweepOptions {
     maxFiles?: number;
     maxMs?: number;
     now?: () => number;
+    shouldContinue?: () => boolean;
+    yieldToEventLoop?: () => Promise<void>;
+    onProgress?: (path: string) => void;
 }
 
 export interface Stage0SweepResult {
@@ -29,6 +33,8 @@ export interface Stage0SweepResult {
     complete: boolean;
     deletedPaths: string[];
     removedSiblings: number;
+    cancelled: boolean;
+    budgetExhausted: boolean;
 }
 
 interface IndexedEvidence {
@@ -56,7 +62,9 @@ function statePath(directory: string): string {
 
 function readState(path: string): SweepState {
     try {
-        const value = JSON.parse(readFileSync(path, "utf8")) as Partial<SweepState>;
+        const value = JSON.parse(
+            readFileSync(path, "utf8")
+        ) as Partial<SweepState>;
         if (value.files && typeof value.files === "object") {
             return { files: value.files };
         }
@@ -68,13 +76,18 @@ function readState(path: string): SweepState {
 
 function writeState(path: string, state: SweepState): void {
     const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify(state), {
+        encoding: "utf8",
+        mode: 0o600,
+    });
     renameSync(temporary, path);
 }
 
 function hasIndexEvidence(capturePath: string): boolean {
     try {
-        const value = JSON.parse(readFileSync(indexPath(capturePath), "utf8")) as Partial<IndexedEvidence>;
+        const value = JSON.parse(
+            readFileSync(indexPath(capturePath), "utf8")
+        ) as Partial<IndexedEvidence>;
         return typeof value.sourceId === "string" && value.sourceId.length > 0;
     } catch {
         return false;
@@ -125,9 +138,9 @@ export function markStage0CaptureIndexed(
  * large directories are eventually covered. Deletion only starts after a full
  * inventory, which makes the byte budget and global mtime ordering exact.
  */
-export function sweepStage0Captures(
+export async function sweepStage0Captures(
     options: Stage0SweepOptions
-): Stage0SweepResult {
+): Promise<Stage0SweepResult> {
     const directories = [...new Set(options.directories)];
     const stateDirectory = directories[0] ?? stageZeroDirectory();
     const ledger = statePath(stateDirectory);
@@ -136,11 +149,20 @@ export function sweepStage0Captures(
     const maxMs = options.maxMs ?? 2_000;
     const now = options.now ?? Date.now;
     const startedAt = now();
+    const shouldContinue = options.shouldContinue ?? (() => true);
+    const yieldToEventLoop =
+        options.yieldToEventLoop ?? (() => yieldImmediate());
+    let cancelled = false;
+    let budgetExhausted = false;
     const state = readState(ledger);
     const currentPaths: string[] = [];
     let listingComplete = true;
 
     for (const directory of directories) {
+        if (!shouldContinue()) {
+            cancelled = true;
+            break;
+        }
         let names: string[];
         try {
             names = readdirSync(directory);
@@ -150,8 +172,15 @@ export function sweepStage0Captures(
             continue;
         }
         for (const name of names) {
-            if (CAPTURE_NAME.test(name)) currentPaths.push(join(directory, name));
+            if (!shouldContinue()) {
+                cancelled = true;
+                break;
+            }
+            if (CAPTURE_NAME.test(name))
+                currentPaths.push(join(directory, name));
         }
+        await yieldToEventLoop();
+        if (cancelled) break;
     }
     const current = new Set(currentPaths);
     for (const path of Object.keys(state.files)) {
@@ -160,9 +189,18 @@ export function sweepStage0Captures(
 
     let filesVisited = 0;
     for (const path of currentPaths) {
-        if (state.files[path]) continue;
+        if (!shouldContinue()) {
+            cancelled = true;
+            listingComplete = false;
+            break;
+        }
+        if (state.files[path]) {
+            await yieldToEventLoop();
+            continue;
+        }
         if (filesVisited >= maxFiles || now() - startedAt >= maxMs) {
             listingComplete = false;
+            budgetExhausted = true;
             break;
         }
         filesVisited++;
@@ -177,10 +215,13 @@ export function sweepStage0Captures(
         } catch {
             // Retry unreadable or concurrently changing files on the next pass.
         }
+        options.onProgress?.(path);
+        await yieldToEventLoop();
     }
 
-    const complete =
-        listingComplete && currentPaths.every((path) => Boolean(state.files[path]));
+    let complete =
+        listingComplete &&
+        currentPaths.every((path) => Boolean(state.files[path]));
     const deletedPaths: string[] = [];
     let removedSiblings = 0;
     let observedBytes = Object.values(state.files).reduce(
@@ -188,17 +229,22 @@ export function sweepStage0Captures(
         0
     );
 
-    if (complete && observedBytes > budgetBytes) {
+    if (complete && !cancelled && observedBytes > budgetBytes) {
         const candidates = currentPaths
             .map((path) => ({ path, ...state.files[path] }))
             .filter((file) => file.indexed)
-            .sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path));
+            .sort(
+                (a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path)
+            );
         for (const candidate of candidates) {
             if (observedBytes <= budgetBytes) break;
-            if (
-                deletedPaths.length >= maxFiles ||
-                now() - startedAt >= maxMs
-            ) {
+            if (!shouldContinue()) {
+                cancelled = true;
+                complete = false;
+                break;
+            }
+            if (deletedPaths.length >= maxFiles || now() - startedAt >= maxMs) {
+                budgetExhausted = true;
                 break;
             }
             try {
@@ -222,8 +268,11 @@ export function sweepStage0Captures(
             } catch {
                 // A failed delete remains counted and the next sweep can retry.
             }
+            options.onProgress?.(candidate.path);
+            await yieldToEventLoop();
         }
     }
+    if (cancelled) complete = false;
 
     try {
         mkdirSync(stateDirectory, { recursive: true });
@@ -233,7 +282,15 @@ export function sweepStage0Captures(
         // unindexed content. A later pass can rebuild the inventory.
     }
 
-    return { observedBytes, filesVisited, complete, deletedPaths, removedSiblings };
+    return {
+        observedBytes,
+        filesVisited,
+        complete,
+        deletedPaths,
+        removedSiblings,
+        cancelled,
+        budgetExhausted,
+    };
 }
 
 export function resolveStage0BudgetBytes(

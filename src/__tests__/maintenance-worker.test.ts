@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { recordMaintenanceEvent } from "../maintenance/events.ts";
+import {
+    flushMaintenanceEvents,
+    recordMaintenanceEvent,
+} from "../maintenance/events.ts";
 import { runMaintenanceTask } from "../maintenance/client.ts";
 
 interface WorkerResult {
@@ -52,6 +55,84 @@ void it("runs stage0 maintenance in a worker, returns stats, and honors cancella
     }
 });
 
+void it("does not spawn a worker when maintenance is disabled", async () => {
+    const previous = process.env.PI_TAU_MAINTENANCE_DISABLE;
+    process.env.PI_TAU_MAINTENANCE_DISABLE = "1";
+    let spawned = false;
+    try {
+        const result = await runMaintenanceTask(
+            "stage0-retention",
+            undefined,
+            undefined,
+            undefined,
+            100,
+            () => {
+                spawned = true;
+                throw new Error("worker should not spawn");
+            }
+        );
+        assert.equal(spawned, false);
+        assert.equal((result as { cancelled?: boolean }).cancelled, true);
+    } finally {
+        if (previous === undefined)
+            delete process.env.PI_TAU_MAINTENANCE_DISABLE;
+        else process.env.PI_TAU_MAINTENANCE_DISABLE = previous;
+    }
+});
+
+void it("settles an erroring worker once without later timing out", async () => {
+    const fake = new EventEmitter() as EventEmitter & {
+        unref: () => void;
+        postMessage: (message: unknown) => void;
+        terminate: () => Promise<number>;
+    };
+    fake.unref = () => {};
+    fake.postMessage = () => fake.emit("error", new Error("worker failed"));
+    fake.terminate = async () => 1;
+    await assert.rejects(
+        runMaintenanceTask(
+            "stage0-retention",
+            undefined,
+            undefined,
+            undefined,
+            100,
+            () => fake as unknown as Worker
+        ),
+        /worker failed/
+    );
+    fake.emit("exit", 0);
+});
+
+void it("stops a real stage0 worker after mid-flight cancellation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "tau-maintenance-cancel-"));
+    const count = 1_500;
+    try {
+        for (let index = 0; index < count; index++) {
+            writeFileSync(join(directory, `pi-pipe-stage0-${index}.log`), "x");
+        }
+        const worker = new Worker(
+            new URL("../maintenance/runner.ts", import.meta.url)
+        );
+        const result = new Promise<WorkerResult>((resolve, reject) => {
+            worker.once("message", resolve);
+            worker.once("error", reject);
+        });
+        worker.postMessage({
+            task: "stage0-retention",
+            options: { directories: [directory], budgetBytes: 1 },
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+        worker.postMessage({ cancel: true });
+        const completed = await result;
+        assert.equal(completed.ok, true);
+        assert.equal(completed.stats.cancelled, true);
+        assert.ok((completed.stats.filesVisited ?? count) < count);
+        await worker.terminate();
+    } finally {
+        rmSync(directory, { recursive: true, force: true });
+    }
+});
+
 void it("times out a silent worker and records a stale-context event durably", async () => {
     const fake = new EventEmitter() as EventEmitter & {
         unref: () => void;
@@ -71,10 +152,10 @@ void it("times out a silent worker and records a stale-context event durably", a
             undefined,
             undefined,
             undefined,
-            10,
+            100,
             () => fake as unknown as Worker
         ),
-        /exceeded 10ms deadline/
+        /exceeded 100ms deadline/
     );
     assert.equal(terminated, true);
 
@@ -83,9 +164,10 @@ void it("times out a silent worker and records a stale-context event durably", a
     recordMaintenanceEvent(event, { detail: "test" }, () => {
         throw new Error("stale context");
     });
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await flushMaintenanceEvents();
     const log = readFileSync(logPath, "utf8");
     const recorded = log.split("\n").find((line) => line.includes(event));
     assert.ok(recorded);
     assert.match(recorded, /entries_dropped_when_ctx_stale":\d+/);
+    assert.match(recorded, /worker_timeouts":[1-9]\d*/);
 });
