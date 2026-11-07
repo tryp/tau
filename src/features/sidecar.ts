@@ -21,6 +21,11 @@ import type {
     SidecarIndexStats,
 } from "../types.ts";
 import { countLines, type LogCounts } from "./log-classify.ts";
+import { isStaleCtxError } from "./ctx-guard.ts";
+import {
+    classifyIndexError,
+    retryIndexOperation,
+} from "./sidecar-index-errors.ts";
 
 /** Inline output limits mirror the context sidecar's baseline capture policy. */
 export const INLINE_CONTEXT_MAX_BYTES = 24 * 1024;
@@ -61,14 +66,14 @@ export interface SidecarSourceMatch extends JobOutputIndex {
     inputSummary: string;
 }
 
-const warnedIndexFailures = new Set<string>();
-
 let sidecarIndexStats: SidecarIndexStats = {
     attempts: 0,
     eligible: 0,
     indexed: 0,
     skipped: 0,
     failed: 0,
+    missingLogSkipped: 0,
+    entriesDroppedWhenCtxStale: 0,
     emptySkipped: 0,
     unavailableSkipped: 0,
     schemaSkipped: 0,
@@ -163,6 +168,8 @@ export function resetSidecarIndexStats(): void {
         indexed: 0,
         skipped: 0,
         failed: 0,
+        missingLogSkipped: 0,
+        entriesDroppedWhenCtxStale: 0,
         emptySkipped: 0,
         unavailableSkipped: 0,
         schemaSkipped: 0,
@@ -823,6 +830,8 @@ export interface SidecarIndexOptions {
     useExternalApi?: boolean;
     /** Override log reads for deterministic transient-I/O tests. */
     readLog?: (path: string) => Promise<string>;
+    /** Override the durable failure log path for tests. */
+    failureLogPath?: string;
     /**
      * Index this output even when it is under the ordinary inline threshold.
      *
@@ -1118,7 +1127,8 @@ async function indexViaDirectDb(
 
     const db = new DatabaseSync(dbPath, {
         enableForeignKeyConstraints: true,
-        timeout: 5_000,
+        // Avoid a multi-second main-thread stall; bounded retries handle longer locks.
+        timeout: 250,
     });
 
     try {
@@ -1230,10 +1240,60 @@ async function indexViaDirectDb(
 function getSqliteErrorCode(error: unknown): string | number | undefined {
     if (!error || typeof error !== "object") return undefined;
     const sqliteError = error as { code?: unknown; errcode?: unknown };
-    const code = sqliteError.code ?? sqliteError.errcode;
+    const code = sqliteError.errcode ?? sqliteError.code;
     return typeof code === "string" || typeof code === "number"
         ? code
         : undefined;
+}
+
+function getIndexErrorInput(error: unknown, message: string) {
+    if (!error || typeof error !== "object") return { message };
+    const source = error as {
+        code?: unknown;
+        errno?: unknown;
+        errcode?: unknown;
+    };
+    const code = source.errcode ?? source.code;
+    return {
+        ...(typeof code === "string" || typeof code === "number"
+            ? { code }
+            : {}),
+        ...(typeof source.errno === "string" || typeof source.errno === "number"
+            ? { errno: source.errno }
+            : {}),
+        message,
+    };
+}
+
+async function reportSidecarIndexFailure(
+    ctx: SidecarContext,
+    data: Record<string, unknown>,
+    logPath = join(tmpdir(), "pi-tau-maintenance.log")
+): Promise<void> {
+    const identity = readSessionIdentity(ctx);
+    if (identity.stale) {
+        sidecarIndexStats.entriesDroppedWhenCtxStale += 1;
+    } else {
+        try {
+            ctx.appendEntry?.("sidecar-index-failure", data);
+        } catch (error) {
+            if (isStaleCtxError(error))
+                sidecarIndexStats.entriesDroppedWhenCtxStale += 1;
+        }
+    }
+    const line = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: "sidecar-index-failure",
+        ...data,
+        entries_dropped_when_ctx_stale:
+            sidecarIndexStats.entriesDroppedWhenCtxStale,
+        missing_log_skipped: sidecarIndexStats.missingLogSkipped,
+    });
+    try {
+        await appendFile(logPath, `${line}\n`);
+    } catch {
+        // Diagnostics must never alter the primary background-job result.
+    }
 }
 
 /**
@@ -1279,6 +1339,10 @@ export async function indexJobOutputWithOutcome(
         const errorMessage =
             readError instanceof Error ? readError.message : String(readError);
         const errorCode = getSqliteErrorCode(readError);
+        const classified = classifyIndexError(
+            getIndexErrorInput(readError, errorMessage)
+        );
+        const missingLog = classified.category === "missing";
         let expectedSizeBytes: number | null = null;
         try {
             expectedSizeBytes = (await stat(job.logPath)).size;
@@ -1286,29 +1350,34 @@ export async function indexJobOutputWithOutcome(
             // Unknown when the path is gone or metadata itself is inaccessible.
         }
         const outcome: SidecarIndexOutcome = {
-            status: "failed",
+            status: missingLog ? "skipped" : "failed",
             eligible: false,
-            reason: "read_failed",
-            errorCategory: "io",
+            reason: missingLog ? "log_missing" : "read_failed",
+            errorCategory: classified.category,
             errorMessage,
             ...(errorCode !== undefined ? { errorCode } : {}),
             retryCount: readRetryCount,
         };
-        sidecarIndexStats.failed += 1;
-        try {
-            ctx.appendEntry?.("sidecar-index-failure", {
+        if (missingLog) {
+            sidecarIndexStats.skipped += 1;
+            sidecarIndexStats.missingLogSkipped += 1;
+        } else {
+            sidecarIndexStats.failed += 1;
+        }
+        await reportSidecarIndexFailure(
+            ctx,
+            {
                 jobId: job.id,
-                reason: "read_failed",
-                category: "io",
+                reason: outcome.reason,
+                category: classified.category,
                 errno: errorCode,
                 errorMessage,
                 logPath: job.logPath,
                 expectedSizeBytes,
                 retryCount: readRetryCount,
-            });
-        } catch {
-            // Diagnostic persistence must not replace the completed job result.
-        }
+            },
+            options.failureLogPath
+        );
         return outcome;
     }
 
@@ -1344,50 +1413,33 @@ export async function indexJobOutputWithOutcome(
     }
 
     const startedAt = Date.now();
-    let retryCount = 0;
-    let sourceId: string | undefined;
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= 3; attempt += 1) {
-        try {
-            // Try pi-context's public external-indexing API first.
-            const apiSourceId =
-                options.useExternalApi === false
-                    ? undefined
-                    : await tryIndexViaExternalApi(
-                          text,
-                          job,
-                          ctx,
-                          toolName,
-                          dbPath
-                      );
-            sourceId =
-                apiSourceId ??
-                (await indexViaDirectDb(
-                    text,
-                    job,
-                    ctx,
-                    toolName,
-                    dbPath,
-                    severityCounts
-                ));
-            lastError = undefined;
-            break;
-        } catch (error) {
-            lastError = error;
-            const message =
-                error instanceof Error ? error.message : String(error);
-            const code = getSqliteErrorCode(error);
-            const busy =
-                code === "SQLITE_BUSY" ||
-                /busy|database is locked/i.test(message);
-            if (!busy || attempt === 3) break;
-            retryCount += 1;
-            // Short bounded exponential delay in addition to SQLite's busy_timeout.
-            await new Promise((resolve) =>
-                setTimeout(resolve, 50 * 2 ** attempt)
-            );
-        }
-    }
+    const writeAttempt = await retryIndexOperation(async () => {
+        // Try pi-context's public external-indexing API first.
+        const apiSourceId =
+            options.useExternalApi === false
+                ? undefined
+                : await tryIndexViaExternalApi(
+                      text,
+                      job,
+                      ctx,
+                      toolName,
+                      dbPath
+                  );
+        return (
+            apiSourceId ??
+            (await indexViaDirectDb(
+                text,
+                job,
+                ctx,
+                toolName,
+                dbPath,
+                severityCounts
+            ))
+        );
+    });
+    const retryCount = writeAttempt.retryCount;
+    const sourceId = writeAttempt.ok ? writeAttempt.value : undefined;
+    const lastError = writeAttempt.ok ? undefined : writeAttempt.error;
     const waitMs = Date.now() - startedAt;
     if (!lastError && !sourceId) {
         const outcome: SidecarIndexOutcome = {
@@ -1436,19 +1488,11 @@ export async function indexJobOutputWithOutcome(
     const errorMessage =
         lastError instanceof Error ? lastError.message : String(lastError);
     const errorCode = getSqliteErrorCode(lastError);
-    const normalizedMessage = errorMessage.toLowerCase();
     const errorCategory: SidecarIndexOutcome["errorCategory"] =
         lastError instanceof StaleSessionIdentityError
             ? "stale"
-            : /no such table|no such column|malformed schema|fts5|constraint failed/.test(
-                    normalizedMessage
-                )
-              ? "schema"
-              : /busy|locked|read-only|disk|i\/o|eacces|enotdir/.test(
-                      normalizedMessage
-                  )
-                ? "io"
-                : "unknown";
+            : classifyIndexError(getIndexErrorInput(lastError, errorMessage))
+                  .category;
     const outcome: SidecarIndexOutcome = {
         status: "failed",
         eligible: true,
@@ -1460,28 +1504,19 @@ export async function indexJobOutputWithOutcome(
         waitMs,
     };
     sidecarIndexStats.failed += 1;
-    try {
-        ctx.appendEntry?.("sidecar-index-failure", {
+    await reportSidecarIndexFailure(
+        ctx,
+        {
             jobId: job.id,
+            reason: "index_failed",
             category: errorCategory,
             errorMessage,
             errorCode,
             retryCount,
             waitMs,
-        });
-    } catch {
-        // Diagnostic persistence must not affect the completed job.
-    }
-    // A stale ctx must not turn a reported failure into an unhandled rejection.
-    const sessionKey = readSessionIdentity(ctx).value ?? "unknown-session";
-    const warningKey = `${sessionKey}:${errorCategory}`;
-    if (!warnedIndexFailures.has(warningKey)) {
-        warnedIndexFailures.add(warningKey);
-        console.error(
-            `[tau] sidecar index failed (${errorCategory}): ${errorMessage}; ` +
-                `retries=${retryCount}, wait=${waitMs}ms`
-        );
-    }
+        },
+        options.failureLogPath
+    );
     return outcome;
 }
 

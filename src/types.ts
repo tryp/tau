@@ -43,8 +43,19 @@ export interface SidecarIndexOutcome {
         | "sidecar_unavailable"
         | "schema_unavailable"
         | "read_failed"
+        | "log_missing"
         | "index_failed";
-    errorCategory?: "io" | "schema" | "unavailable" | "stale" | "unknown";
+    errorCategory?:
+        | "busy"
+        | "locked"
+        | "readonly"
+        | "schema"
+        | "unavailable"
+        | "stale"
+        | "missing"
+        | "permission"
+        | "io"
+        | "unknown";
     errorMessage?: string;
     errorCode?: string | number;
     retryCount?: number;
@@ -58,6 +69,10 @@ export interface SidecarIndexStats {
     indexed: number;
     skipped: number;
     failed: number;
+    /** Log files missing when late indexing began; expected completion race. */
+    missingLogSkipped: number;
+    /** appendEntry rejected because the captured extension context was stale. */
+    entriesDroppedWhenCtxStale: number;
     emptySkipped: number;
     unavailableSkipped: number;
     schemaSkipped: number;

@@ -348,13 +348,11 @@ void describe("sidecar indexing under a stale ctx", () => {
         assert.equal(job.sidecarIndexErrorCategory, "stale");
         const { getSidecarIndexStats, resetSidecarIndexStats } =
             await import("../features/sidecar.ts");
-        // Exactly three reads, one per site that needs identity: the external-API
-        // probe, the direct-DB attempt, and the failure-path dedupe key. The exact
-        // count is pinned because it is also the record of *which* sites consult a
-        // guard that can throw: a fourth read added without this number moving
-        // would be a site nobody audited. If you deliberately reduce the reads,
-        // update the number and say so in the commit.
+        // Exactly three reads consult identity: the external-API probe, direct-DB
+        // attempt, and preflight before appendEntry. The preflight detects stale
+        // ctx and records the dropped entry without invoking appendEntry.
         assert.equal(getSidecarIndexStats().staleSessionIdentity, 3);
+        assert.equal(getSidecarIndexStats().entriesDroppedWhenCtxStale, 1);
         resetSidecarIndexStats();
     });
 });

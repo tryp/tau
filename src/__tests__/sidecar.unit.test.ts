@@ -1,6 +1,6 @@
 import { describe, it, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -816,6 +816,8 @@ void describe("indexJobOutputInSidecar", () => {
             indexed: 0,
             skipped: 1,
             failed: 0,
+            missingLogSkipped: 0,
+            entriesDroppedWhenCtxStale: 0,
             emptySkipped: 0,
             unavailableSkipped: 1,
             schemaSkipped: 0,
@@ -854,6 +856,8 @@ void describe("indexJobOutputInSidecar", () => {
             indexed: 1,
             skipped: 0,
             failed: 0,
+            missingLogSkipped: 0,
+            entriesDroppedWhenCtxStale: 0,
             emptySkipped: 0,
             unavailableSkipped: 0,
             schemaSkipped: 0,
@@ -883,12 +887,13 @@ void describe("indexJobOutputInSidecar", () => {
                     );
                     throw error;
                 },
+                failureLogPath: join(tmpDir, "sidecar-failures.jsonl"),
             }
         );
         assert.equal(outcome.status, "failed");
         assert.equal(outcome.eligible, false);
         assert.equal(outcome.reason, "read_failed");
-        assert.equal(outcome.errorCategory, "io");
+        assert.equal(outcome.errorCategory, "permission");
         assert.equal(outcome.errorCode, "EACCES");
         assert.equal(outcome.retryCount, 1);
         assert.match(outcome.errorMessage ?? "", /permission denied/);
@@ -899,7 +904,7 @@ void describe("indexJobOutputInSidecar", () => {
                 data: {
                     jobId: "job-read-failed",
                     reason: "read_failed",
-                    category: "io",
+                    category: "permission",
                     errno: "EACCES",
                     errorMessage: "permission denied",
                     logPath,
@@ -908,6 +913,52 @@ void describe("indexJobOutputInSidecar", () => {
                 },
             },
         ]);
+        const failureLog = readFileSync(
+            join(tmpDir, "sidecar-failures.jsonl"),
+            "utf8"
+        );
+        assert.match(failureLog, /"category":"permission"/);
+    });
+
+    void it("counts ENOENT as an expected missing-log skip, not an I/O failure", async () => {
+        const entries: { type: string; data: Record<string, unknown> }[] = [];
+        const outcome = await indexJobOutputWithOutcome(
+            testJob({
+                id: "job-log-missing",
+                logPath: join(tmpDir, "gone.log"),
+            }),
+            {
+                appendEntry: (type, data) =>
+                    entries.push({
+                        type,
+                        data: data as Record<string, unknown>,
+                    }),
+            },
+            "bash_bg",
+            {
+                readLog: async () => {
+                    throw Object.assign(
+                        new Error("ENOENT: no such file or directory"),
+                        {
+                            code: "ENOENT",
+                            errno: -2,
+                        }
+                    );
+                },
+                failureLogPath: join(tmpDir, "sidecar-failures.jsonl"),
+            }
+        );
+        assert.equal(outcome.status, "skipped");
+        assert.equal(outcome.reason, "log_missing");
+        assert.equal(outcome.errorCategory, "missing");
+        assert.equal(getSidecarIndexStats().failed, 0);
+        assert.equal(getSidecarIndexStats().missingLogSkipped, 1);
+        assert.equal(entries[0]?.data.reason, "log_missing");
+        assert.equal(entries[0]?.data.category, "missing");
+        assert.match(
+            readFileSync(join(tmpDir, "sidecar-failures.jsonl"), "utf8"),
+            /"reason":"log_missing"/
+        );
     });
 
     void it("retries one transient log-read failure and indexes the output", async () => {
@@ -1286,7 +1337,7 @@ void describe("indexJobOutputInSidecar", () => {
             process.execPath,
             [
                 "-e",
-                `const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); process.stdout.write('LOCKED'); setTimeout(() => { db.exec('COMMIT'); db.close(); }, 250);`,
+                `const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); process.stdout.write('LOCKED'); setTimeout(() => { db.exec('COMMIT'); db.close(); }, 400);`,
                 dbPath,
             ],
             { stdio: ["ignore", "pipe", "inherit"] }
@@ -1314,8 +1365,8 @@ void describe("indexJobOutputInSidecar", () => {
             { useExternalApi: false }
         );
         assert.equal(outcome.status, "indexed");
-        assert.equal(outcome.retryCount, 0);
-        assert.ok((outcome.waitMs ?? 0) >= 150, `waitMs=${outcome.waitMs}`);
+        assert.equal(outcome.retryCount, 1);
+        assert.ok((outcome.waitMs ?? 0) >= 300, `waitMs=${outcome.waitMs}`);
         assert.equal(telemetry[0]?.type, "sidecar-index-wait");
         assert.ok(telemetry[0]?.data);
         await new Promise<void>((resolve, reject) => {
@@ -1325,7 +1376,7 @@ void describe("indexJobOutputInSidecar", () => {
         });
     });
 
-    void it("preserves sqlite errors and emits one warning per session/category", async () => {
+    void it("persists every failure when stale appendEntry drops it and counts the drops", async () => {
         const db = createDb(tmpDir);
         db.exec(
             `CREATE TRIGGER reject_chunk BEFORE INSERT ON context_chunks BEGIN SELECT RAISE(ABORT, 'fixture sqlite failure'); END;`
@@ -1335,38 +1386,44 @@ void describe("indexJobOutputInSidecar", () => {
             id: "job-sqlite-error",
             logPath: writeLog("fixture output"),
         });
-        const entries: unknown[] = [];
         const context = {
             sessionManager: { getSessionId: () => "warning-session-fixture" },
-            appendEntry: (_type: string, value: unknown) => entries.push(value),
+            appendEntry: () => {
+                throw new Error(
+                    "This extension ctx is stale after session replacement or reload"
+                );
+            },
         };
-        const errors: string[] = [];
-        const originalError = console.error;
-        console.error = (...args: unknown[]) => errors.push(args.join(" "));
-        try {
-            const first = await indexJobOutputWithOutcome(
-                job,
-                context,
-                "bash",
-                {
-                    useExternalApi: false,
-                }
+        const failureLogPath = join(tmpDir, "sidecar-failures.jsonl");
+        const first = await indexJobOutputWithOutcome(job, context, "bash", {
+            useExternalApi: false,
+            failureLogPath,
+        });
+        const second = await indexJobOutputWithOutcome(
+            { ...job, id: "job-sqlite-error-2" },
+            context,
+            "bash",
+            { useExternalApi: false, failureLogPath }
+        );
+        assert.equal(first.status, "failed");
+        assert.match(first.errorMessage ?? "", /fixture sqlite failure/);
+        assert.ok(first.errorCode);
+        assert.equal(second.status, "failed");
+        assert.equal(getSidecarIndexStats().entriesDroppedWhenCtxStale, 2);
+        const lines = readFileSync(failureLogPath, "utf8")
+            .trim()
+            .split("\n")
+            .map(
+                (line) =>
+                    JSON.parse(line) as {
+                        entries_dropped_when_ctx_stale: number;
+                    }
             );
-            const second = await indexJobOutputWithOutcome(
-                { ...job, id: "job-sqlite-error-2" },
-                context,
-                "bash",
-                { useExternalApi: false }
-            );
-            assert.equal(first.status, "failed");
-            assert.match(first.errorMessage ?? "", /fixture sqlite failure/);
-            assert.ok(first.errorCode);
-            assert.equal(second.status, "failed");
-            assert.equal(errors.length, 1);
-            assert.equal(entries.length, 2);
-        } finally {
-            console.error = originalError;
-        }
+        assert.equal(lines.length, 2);
+        assert.deepEqual(
+            lines.map((line) => line.entries_dropped_when_ctx_stale),
+            [1, 2]
+        );
     });
 
     void it("keeps inline text when a forced index cannot be created", async () => {
