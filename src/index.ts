@@ -160,10 +160,9 @@ export default function (pi: ExtensionAPI) {
                 if (sidecarPurgeTimer === scheduledTimer)
                     sidecarPurgeTimer = undefined;
                 if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
-                    const delay =
-                        PURGE_IDLE_RETRY_DELAYS[
-                            Math.min(idleRetries, PURGE_IDLE_RETRY_DELAYS.length - 1)
-                        ];
+                    const delay = PURGE_IDLE_RETRY_DELAYS[
+                        Math.min(idleRetries, PURGE_IDLE_RETRY_DELAYS.length - 1)
+                    ];
                     scheduleSidecarPurgeForGeneration(
                         generation,
                         delay,
@@ -894,12 +893,7 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         turnProcessing = false;
         lastActivityAt = Date.now();
         if (!sidecarPurgeCompleted && !sidecarPurgeTimer) {
-            scheduleSidecarPurgeForGeneration(
-                startupGeneration,
-                5_000,
-                0,
-                0
-            );
+            scheduleSidecarPurgeForGeneration(startupGeneration, 5_000, 0, 0);
         }
         // Stop timers and clear start time — guaranteed cleanup before
         // any fallible logic below. The interval's self-terminating guard

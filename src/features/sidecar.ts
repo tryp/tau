@@ -188,6 +188,7 @@ export const SIDECAR_PURGE_DELAY_MS = 5_000;
 
 export interface SidecarPurgeStats {
     sourcesConsidered: number;
+    pages: number;
     sourcesRemoved: number;
     chunksRemoved: number;
     slices: number;
@@ -221,7 +222,12 @@ export interface SidecarPurgeOptions {
 const PURGE_SLICE_BUDGET_MS = 10;
 const PURGE_TOTAL_BUDGET_MS = 2_000;
 const PURGE_BATCH_SIZE = 25;
-const PURGE_VACUUM_PAGES = 100;
+const PURGE_SCAN_PAGE_SIZE = 200;
+// 500-row slabs keep trigger-driven FTS deletes bounded below the measured
+// pathological source size of 2,163 chunks.
+const PURGE_CHUNK_DELETE_SLAB_SIZE = 500;
+// Residual atomic vacuum unit: at most 50 pages per statement.
+const PURGE_VACUUM_PAGES = 50;
 export const SIDECAR_PURGE_IDLE_MS = 5_000;
 let vacuumPending = false;
 
@@ -259,6 +265,7 @@ export function scheduleSidecarPurge(
 function emptySidecarPurgeStats(): SidecarPurgeStats {
     return {
         sourcesConsidered: 0,
+        pages: 0,
         sourcesRemoved: 0,
         chunksRemoved: 0,
         slices: 0,
@@ -271,7 +278,7 @@ function emptySidecarPurgeStats(): SidecarPurgeStats {
 function logSidecarPurgeStats(stats: SidecarPurgeStats, ageDays: number): void {
     const line =
         `[tau] sidecar-purge age-days=${ageDays} sources-considered=${stats.sourcesConsidered} ` +
-        `sources-removed=${stats.sourcesRemoved} chunks-removed=${stats.chunksRemoved} ` +
+        `pages=${stats.pages} sources-removed=${stats.sourcesRemoved} chunks-removed=${stats.chunksRemoved} ` +
         `slices=${stats.slices} budget-exhausted=${stats.budgetExhausted} ` +
         `vacuum-steps=${stats.vacuumSteps} errors=${stats.errors}`;
     console.error(line);
@@ -329,32 +336,50 @@ export async function purgeSidecar(
         )(dbPath);
         const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
         const toolList = SIDECAR_TOOL_NAMES.map((t) => `'${t}'`).join(",");
-        const toDelete = db
-            .prepare(
-                `SELECT id FROM context_sources
-             WHERE tool_name IN (${toolList}) AND created_at < ?`
-            )
-            .all(cutoff) as { id: string }[];
-        stats.sourcesConsidered = toDelete.length;
-
-        // A truly empty pass is a no-op (including no vacuum). A previous
-        // budget-limited vacuum is the one exception: finish that bounded work.
-        if (toDelete.length === 0 && !vacuumPending) return stats;
-
-        let cursor = 0;
-        while (cursor < toDelete.length) {
+        const scan = db.prepare(
+            `SELECT id FROM context_sources
+             WHERE tool_name IN (${toolList}) AND created_at < ?
+             ORDER BY created_at, id LIMIT ${PURGE_SCAN_PAGE_SIZE}`
+        );
+        let scannedSources = 0;
+        let foundAny = false;
+        while (true) {
+            if (!shouldContinue() || overTotalBudget()) {
+                stats.budgetExhausted = true;
+                break;
+            }
+            const page = scan.all(cutoff) as { id: string }[];
+            if (page.length === 0) break;
+            foundAny = true;
+            stats.pages++;
+            stats.sourcesConsidered += page.length;
+            for (let cursor = 0; cursor < page.length; ) {
             if (!shouldContinue()) {
                 stats.budgetExhausted = true;
                 break;
             }
-            const batch = toDelete.slice(cursor, cursor + batchSize);
+            const batch = page.slice(cursor, cursor + batchSize);
+            for (const source of batch) {
+                let chunksDeleted: number;
+                do {
+                    if (!shouldContinue() || overTotalBudget()) {
+                        stats.budgetExhausted = true;
+                        break;
+                    }
+                    const result = db.prepare(
+                        `DELETE FROM context_chunks WHERE rowid IN (
+                            SELECT rowid FROM context_chunks WHERE source_id = ? LIMIT ?
+                        )`
+                    ).run(source.id, PURGE_CHUNK_DELETE_SLAB_SIZE);
+                    chunksDeleted = Number(result.changes ?? 0);
+                    stats.chunksRemoved += chunksDeleted;
+                    if (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE)
+                        await yieldIfNeeded(true);
+                } while (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE);
+                if (stats.budgetExhausted) break;
+            }
+            if (stats.budgetExhausted) break;
             const placeholders = batch.map(() => "?").join(",");
-            const chunksResult = db
-                .prepare(
-                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
-                )
-                .run(...batch.map((row) => row.id));
-            stats.chunksRemoved += Number(chunksResult.changes ?? 0);
             const sourcesResult = db
                 .prepare(
                     `DELETE FROM context_sources WHERE id IN (${placeholders})`
@@ -362,18 +387,20 @@ export async function purgeSidecar(
                 .run(...batch.map((row) => row.id));
             stats.sourcesRemoved += Number(sourcesResult.changes ?? 0);
             cursor += batch.length;
+            scannedSources += batch.length;
             await yieldIfNeeded();
-            if (
-                !shouldContinue() ||
-                (overTotalBudget() && cursor < toDelete.length)
-            ) {
+            if (!shouldContinue() || overTotalBudget()) {
                 stats.budgetExhausted = true;
                 break;
             }
+            }
+            if (stats.budgetExhausted || page.length < PURGE_SCAN_PAGE_SIZE) break;
+            await yieldIfNeeded(true);
         }
 
         if (
-            cursor >= toDelete.length &&
+            !stats.budgetExhausted &&
+            (!foundAny || scannedSources === stats.sourcesConsidered) &&
             (stats.sourcesRemoved > 0 || vacuumPending)
         ) {
             vacuumPending = true;
@@ -386,6 +413,7 @@ export async function purgeSidecar(
                 | undefined;
             let remaining = Number(freePages?.freelist_count ?? 0);
             while (remaining > 0 && !overTotalBudget() && shouldContinue()) {
+                // The total-budget check above cannot preempt this residual unit.
                 db.prepare(`PRAGMA incremental_vacuum(${vacuumPages})`).run();
                 stats.vacuumSteps++;
                 // A vacuum step may reclaim less than requested; reread the bound.

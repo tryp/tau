@@ -183,6 +183,117 @@ afterEach(() => {
 // ─── purgeSidecar tests ─────────────────────────────────────────────
 
 void describe("purgeSidecar", () => {
+    void it("deletes large source chunks in bounded slabs and yields between slabs", async () => {
+        const db = createDb(tmpDir);
+        const sourceId = insertSource(db, {
+            created_at: Date.now() - 2 * 24 * 60 * 60 * 1000,
+        });
+        const insert = db.prepare(
+            `INSERT INTO context_chunks (id, source_id, ordinal, title, content, byte_count)
+             VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (let ordinal = 0; ordinal < 5_000; ordinal++) {
+            insert.run(`${sourceId}_${ordinal}`, sourceId, ordinal, "chunk", "x", 1);
+        }
+        db.close();
+
+        const deleteSizes: number[] = [];
+        let yields = 0;
+        const stats = await purgeSidecar(1, {
+            dbPath: join(tmpDir, "context.db"),
+            openDatabase: (path) => {
+                const database = new DatabaseSync(path, {
+                    enableForeignKeyConstraints: true,
+                });
+                return {
+                    prepare(sql: string) {
+                        const statement = database.prepare(sql);
+                        return {
+                            all: (...params: unknown[]) => statement.all(...params),
+                            run: (...params: unknown[]) => {
+                                const result = statement.run(...params);
+                                if (sql.includes("DELETE FROM context_chunks"))
+                                    deleteSizes.push(Number(result.changes));
+                                return result;
+                            },
+                        };
+                    },
+                    close: () => database.close(),
+                };
+            },
+            yieldToEventLoop: async () => {
+                yields++;
+            },
+        });
+
+        assert.equal(stats.chunksRemoved, 5_000);
+        assert.ok(deleteSizes.length >= 11, "5000 chunks require 10 slabs plus empty check");
+        assert.ok(deleteSizes.every((count) => count <= 500));
+        assert.ok(yields >= 10, "each full slab must yield before more trigger work");
+    });
+
+    void it("paginates stale-source scans and yields before reading the full set", async () => {
+        const db = createDb(tmpDir);
+        const old = Date.now() - 2 * 24 * 60 * 60 * 1000;
+        for (let index = 0; index < 450; index++) {
+            insertSource(db, {
+                id: `page-${String(index).padStart(4, "0")}`,
+                created_at: old,
+            });
+        }
+        db.close();
+
+        let scanPages = 0;
+        let firstYieldRemaining = 0;
+        const stats = await purgeSidecar(1, {
+            dbPath: join(tmpDir, "context.db"),
+            openDatabase: (path) => {
+                const database = new DatabaseSync(path, {
+                    enableForeignKeyConstraints: true,
+                });
+                return {
+                    prepare(sql: string) {
+                        const statement = database.prepare(sql);
+                        return {
+                            all: (...params: unknown[]) => {
+                                if (
+                                    sql.startsWith(
+                                        "SELECT id FROM context_sources"
+                                    )
+                                )
+                                    scanPages++;
+                                return statement.all(...params);
+                            },
+                            run: (...params: unknown[]) => statement.run(...params),
+                        };
+                    },
+                    close: () => database.close(),
+                };
+            },
+            yieldToEventLoop: async () => {
+                if (firstYieldRemaining === 0) {
+                    const check = new DatabaseSync(join(tmpDir, "context.db"));
+                    firstYieldRemaining = Number(
+                        check
+                            .prepare(
+                                "SELECT count(*) AS count FROM context_sources"
+                            )
+                            .get()?.count ?? 0
+                    );
+                    check.close();
+                }
+            },
+        });
+
+        assert.equal(stats.pages, 3);
+        assert.ok(scanPages > stats.pages, "final empty-page check should be bounded too");
+        assert.ok(
+            firstYieldRemaining > 0,
+            "first yield must precede reading all stale ids"
+        );
+        assert.equal(stats.sourcesRemoved, 450);
+    });
+
     void it("yields to timers while the purge is still running", async () => {
         const pending = Array.from({ length: 8 }, (_, index) => ({
             id: `slow-${index}`,
