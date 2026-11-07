@@ -161,7 +161,9 @@ export function pipeNoteSections(
         if (observed.stageZeroStatus?.truncated) {
             const status = observed.stageZeroStatus;
             if (status.tail) {
-                const headMiB = (status.bytesWritten / (1024 * 1024)).toFixed(1);
+                const headMiB = (status.bytesWritten / (1024 * 1024)).toFixed(
+                    1
+                );
                 const tailMiB = (status.tail.bytes / (1024 * 1024)).toFixed(1);
                 noticeLines.push(
                     `Stage-0 capture truncated: first ${headMiB} MiB at ${observed.pipeStageZero.path}, last ${tailMiB} MiB at ${observed.pipeStageZero.path}.tail (sed/grep it — the end of the output is often the useful part); ${status.tail.dropped} bytes in between are unavailable.`

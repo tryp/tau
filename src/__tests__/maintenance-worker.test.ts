@@ -138,8 +138,14 @@ void it("stops a real stage0 worker after mid-flight cancellation", async () => 
         assert.equal(completed.ok, true);
         assert.equal(completed.stats.cancelled, true);
         const filesVisited = completed.stats.filesVisited ?? 0;
-        assert.ok(filesVisited > 0, "worker must visit files before cancellation");
-        assert.ok(filesVisited < count, "cancellation must stop the inventory early");
+        assert.ok(
+            filesVisited > 0,
+            "worker must visit files before cancellation"
+        );
+        assert.ok(
+            filesVisited < count,
+            "cancellation must stop the inventory early"
+        );
         await worker.terminate();
     } finally {
         rmSync(directory, { recursive: true, force: true });

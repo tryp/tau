@@ -7,7 +7,10 @@ void describe("OpenCode complete request options", () => {
 
     void it("adds session and client headers for exact provider IDs", () => {
         for (const provider of ["opencode", "opencode-go"]) {
-            const result = opencodeSessionOptions({ ...model, provider }, "session-1");
+            const result = opencodeSessionOptions(
+                { ...model, provider },
+                "session-1"
+            );
             assert.deepEqual(result, {
                 model: { ...model, provider },
                 headers: {
@@ -27,7 +30,10 @@ void describe("OpenCode complete request options", () => {
             ),
             {
                 model: { ...model, baseUrl: "https://opencode.ai/v1" },
-                headers: { "x-opencode-session": "s", "x-opencode-client": "pi" },
+                headers: {
+                    "x-opencode-session": "s",
+                    "x-opencode-client": "pi",
+                },
                 sessionId: "s",
             }
         );
@@ -73,7 +79,11 @@ void describe("OpenCode complete request options", () => {
             provider: "opencode",
             headers: originalModelHeaders,
         };
-        const result = opencodeSessionOptions(sourceModel, "runtime-session", headers);
+        const result = opencodeSessionOptions(
+            sourceModel,
+            "runtime-session",
+            headers
+        );
         assert.deepEqual(result.headers, {
             AUTHORIZATION: "Bearer secret",
             "x-opencode-session": "auth-session",

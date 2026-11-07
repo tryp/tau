@@ -55,7 +55,9 @@ export type HintRule = "sed-range" | "diagnostics" | "job-poll";
  */
 function resultText(event: HintableResultEvent): string {
     return event.content
-        .filter((block) => block.type === "text" && typeof block.text === "string")
+        .filter(
+            (block) => block.type === "text" && typeof block.text === "string"
+        )
         .map((block) => block.text as string)
         .join("\n");
 }
@@ -71,7 +73,8 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
     // is visible as a progression while the number of entries stays bounded.
     const suppressionRecorded = new Set<string>();
 
-    const enabled = (): boolean => !state || isFeatureEnabled(state, "tool-hints");
+    const enabled = (): boolean =>
+        !state || isFeatureEnabled(state, "tool-hints");
 
     const suppress = (rule: HintRule, reason: string): void => {
         const key = `${rule}:${reason}`;
@@ -87,8 +90,8 @@ export function registerToolHints(pi: ExtensionAPI, state?: TauState): void {
         if (event.isError) return;
 
         const e = event as unknown as HintableResultEvent;
-        let hint: string | null = null;
-        let rule: HintRule | null = null;
+        let hint: string | null;
+        let rule: HintRule | null;
 
         if (e.toolName === "bash") {
             const view = matchSedRange(e.input.command);

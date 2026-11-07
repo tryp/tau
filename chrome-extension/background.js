@@ -391,6 +391,8 @@ async function injectConverters(params) {
 }
 
 // ── Shadow DOM-aware click ─────────────────────────────────────────
+
+async function click(params) {
 	const tabId = Number(params.tabId);
 	const result = await executeInPage(tabId, (sel) => {
 		function queryDeep(root, sel) {

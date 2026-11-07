@@ -133,7 +133,10 @@ export function stageZeroStatus(path: string | undefined): {
             return null;
         let tail: { bytes: number; dropped: number } | null = null;
         if (status.tail !== undefined && status.tail !== null) {
-            const candidate = status.tail as { bytes?: unknown; dropped?: unknown };
+            const candidate = status.tail as {
+                bytes?: unknown;
+                dropped?: unknown;
+            };
             if (
                 !Number.isSafeInteger(candidate.bytes) ||
                 !Number.isSafeInteger(candidate.dropped) ||

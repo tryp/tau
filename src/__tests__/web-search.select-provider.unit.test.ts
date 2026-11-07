@@ -11,7 +11,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { selectProvider } from "../features/web-search/select-provider.ts";
-import { isClaudeAvailable } from "../features/web-search/claude.ts";
 
 void describe("selectProvider", () => {
     const originals: Record<string, string | undefined> = {};

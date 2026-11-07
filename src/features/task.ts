@@ -362,17 +362,12 @@ export class TaskListComponent {
 // ─── Tool parameter schema ──────────────────────────────────────────
 
 const TaskParams = Type.Object({
-    action: StringEnum([
-        "list",
-        "add",
-        "update",
-        "remove",
-        "move",
-        "link",
-        "unlink",
-    ] as const, {
-        description: "Action to perform",
-    }),
+    action: StringEnum(
+        ["list", "add", "update", "remove", "move", "link", "unlink"] as const,
+        {
+            description: "Action to perform",
+        }
+    ),
     title: Type.Optional(
         Type.String({ description: "Task title (for add, update)" })
     ),

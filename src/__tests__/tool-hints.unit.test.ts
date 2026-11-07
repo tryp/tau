@@ -182,8 +182,9 @@ void describe("tool-hints registration", () => {
     function hintBlocks(result: unknown): string[] {
         // A handler that returns nothing left the result alone, which is what
         // "suppressed" looks like from the outside; `result` is undefined there.
-        const content = (result as { content?: Array<{ text?: string }> } | undefined)
-            ?.content;
+        const content = (
+            result as { content?: Array<{ text?: string }> } | undefined
+        )?.content;
         return (content ?? [])
             .map((block) => block.text ?? "")
             .filter((text) => text.startsWith(HINT_PREFIX));
@@ -196,10 +197,14 @@ void describe("tool-hints registration", () => {
         assert.ok(handler);
 
         const result = await handler(bashResult("sed -n '10,40p' src/app.ts"));
-        const content = (result as { content: Array<{ text: string }> }).content;
+        const content = (result as { content: Array<{ text: string }> })
+            .content;
         assert.equal(content.length, 2);
         assert.equal(content[0].text, "  10\tline ten");
-        assert.match(content[1].text, /^\[hint\] read does this without a shell/);
+        assert.match(
+            content[1].text,
+            /^\[hint\] read does this without a shell/
+        );
         assert.match(content[1].text, /offset=10, limit=31/);
     });
 
@@ -222,10 +227,10 @@ void describe("tool-hints registration", () => {
             (e) => e.customType === "tool-hints-suppressed"
         );
         assert.equal(suppressed.length, 1);
-        assert.deepEqual(
-            suppressed[0].data as { rule: string; reason: string },
-            { rule: "sed-range", reason: "pending" }
-        );
+        assert.deepEqual(suppressed[0].data, {
+            rule: "sed-range",
+            reason: "pending",
+        });
     });
 
     void it("stays silent on a failed call", async () => {
@@ -312,9 +317,14 @@ void describe("tool-hints registration", () => {
         assert.ok(handler);
 
         let fired = 0;
-        const calls = 1 + DEFAULT_MAX_FIRES + DEFAULT_MAX_FIRES * (DEFAULT_REARM_AFTER + 1);
+        const calls =
+            1 +
+            DEFAULT_MAX_FIRES +
+            DEFAULT_MAX_FIRES * (DEFAULT_REARM_AFTER + 1);
         for (let i = 0; i < calls; i++) {
-            const result = await handler(bashResult(`sed -n '1,${i + 2}p' a.txt`));
+            const result = await handler(
+                bashResult(`sed -n '1,${i + 2}p' a.txt`)
+            );
             if (hintBlocks(result).length > 0) fired++;
         }
         // Exactly the budget: more is noise, fewer means an ignored hint was

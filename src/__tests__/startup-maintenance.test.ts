@@ -116,7 +116,9 @@ void describe("deferred startup maintenance", () => {
             assert.equal(restores, 0);
             assert.equal(fakeTimers.records.length, 2);
             assert.ok(fakeTimers.records.every((timer) => timer.unrefCalled));
-            assert.ok(fakeTimers.records.every((timer) => timer.due > fakeTimers.now));
+            assert.ok(
+                fakeTimers.records.every((timer) => timer.due > fakeTimers.now)
+            );
             fakeTimers.advance(99);
             assert.equal(purges, 0);
             assert.equal(restores, 0);
@@ -235,7 +237,12 @@ void describe("deferred startup maintenance", () => {
                 }),
                 cleanup: async () => {
                     runs++;
-                    return { examined: 0, removed: 0, keptAlive: 0, keptUnknown: 0 };
+                    return {
+                        examined: 0,
+                        removed: 0,
+                        keptAlive: 0,
+                        keptUnknown: 0,
+                    };
                 },
             });
             fakeTimers.advance(1);

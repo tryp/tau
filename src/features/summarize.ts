@@ -232,7 +232,11 @@ export function registerSummarize(
                 },
             ];
 
-            const request = opencodeSessionOptions(model, sessionId, auth.headers);
+            const request = opencodeSessionOptions(
+                model,
+                sessionId,
+                auth.headers
+            );
             const { model: requestModel, ...trackingOptions } = request;
             const response = await dependencies.complete(
                 requestModel,

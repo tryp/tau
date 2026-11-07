@@ -10,6 +10,6 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["src", "*.config.ts"],
+  "include": ["src", "*.config.ts", "index.ts"],
   "exclude": ["commitlint.config.ts"]
 }

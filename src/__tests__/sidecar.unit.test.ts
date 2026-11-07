@@ -1270,11 +1270,14 @@ void describe("sidecar purge maintenance regressions", () => {
         check.close();
         assert.equal(stats.sourcesRemoved, 1);
         assert.equal(stats.chunksRemoved, 501);
-        assert.ok(yields > 0, "large deletion must yield between bounded slabs");
-        assert.deepEqual(remaining.map((row) => row.id), [
-            "fresh-source",
-            "unrelated-tool",
-        ]);
+        assert.ok(
+            yields > 0,
+            "large deletion must yield between bounded slabs"
+        );
+        assert.deepEqual(
+            remaining.map((row) => row.id),
+            ["fresh-source", "unrelated-tool"]
+        );
         assert.equal(chunks.count, 0);
     });
 
@@ -1301,7 +1304,11 @@ void describe("sidecar purge maintenance regressions", () => {
         assert.equal(first.sourcesRemoved, 1);
         let pending = new DatabaseSync(join(tmpDir, "context.db"));
         assert.equal(
-            (pending.prepare("SELECT COUNT(*) AS count FROM context_sources").get() as { count: number }).count,
+            (
+                pending
+                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                    .get() as { count: number }
+            ).count,
             3
         );
         pending.close();
@@ -1313,7 +1320,11 @@ void describe("sidecar purge maintenance regressions", () => {
         assert.equal(resumed.sourcesRemoved, 3);
         pending = new DatabaseSync(join(tmpDir, "context.db"));
         assert.equal(
-            (pending.prepare("SELECT COUNT(*) AS count FROM context_sources").get() as { count: number }).count,
+            (
+                pending
+                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                    .get() as { count: number }
+            ).count,
             0
         );
         pending.close();
@@ -1323,7 +1334,10 @@ void describe("sidecar purge maintenance regressions", () => {
         const db = createDb(tmpDir);
         const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
         for (let index = 0; index < 205; index++)
-            insertSource(db, { id: `paged-${String(index).padStart(3, "0")}`, created_at: cutoff });
+            insertSource(db, {
+                id: `paged-${String(index).padStart(3, "0")}`,
+                created_at: cutoff,
+            });
         db.close();
         let yields = 0;
         const stats = await purgeSidecar(30, {
@@ -1345,7 +1359,10 @@ void describe("sidecar purge maintenance regressions", () => {
         const db = createDb(tmpDir);
         const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
         for (let index = 0; index < 205; index++)
-            insertSource(db, { id: `timer-${String(index).padStart(3, "0")}`, created_at: cutoff });
+            insertSource(db, {
+                id: `timer-${String(index).padStart(3, "0")}`,
+                created_at: cutoff,
+            });
         db.close();
         const dbPath = join(tmpDir, "context.db");
         let purgeCompleted = false;
@@ -1362,7 +1379,9 @@ void describe("sidecar purge maintenance regressions", () => {
                         setTimeout(() => {
                             const check = new DatabaseSync(dbPath);
                             const remaining = check
-                                .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                                .prepare(
+                                    "SELECT COUNT(*) AS count FROM context_sources"
+                                )
                                 .get() as { count: number };
                             check.close();
                             timerFiredWhileWorkRemained =
@@ -1408,7 +1427,11 @@ void describe("sidecar purge maintenance regressions", () => {
         assert.equal(first.sourcesRemoved, 1);
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         assert.equal(
-            (check.prepare("SELECT COUNT(*) AS count FROM context_sources").get() as { count: number }).count,
+            (
+                check
+                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                    .get() as { count: number }
+            ).count,
             2
         );
         check.close();
@@ -1458,7 +1481,11 @@ void describe("sidecar purge maintenance regressions", () => {
         assert.equal(allFresh.sourcesRemoved, 0);
         const verify = new DatabaseSync(join(tmpDir, "context.db"));
         assert.equal(
-            (verify.prepare("SELECT COUNT(*) AS count FROM context_sources").get() as { count: number }).count,
+            (
+                verify
+                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
+                    .get() as { count: number }
+            ).count,
             1
         );
         verify.close();
@@ -1480,7 +1507,13 @@ void describe("sidecar purge maintenance regressions", () => {
             assert.equal(stats.sourcesRemoved, 0);
             const check = new DatabaseSync(join(tmpDir, "context.db"));
             assert.equal(
-                (check.prepare("SELECT COUNT(*) AS count FROM context_sources").get() as { count: number }).count,
+                (
+                    check
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM context_sources"
+                        )
+                        .get() as { count: number }
+                ).count,
                 1
             );
             check.close();

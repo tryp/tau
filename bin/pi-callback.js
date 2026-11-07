@@ -31,7 +31,7 @@ if (args.length < 2) {
 const sessionId = args[0];
 const source = args[1];
 
-let payload: { message: string; source?: string };
+let payload;
 
 if (source === "--file") {
     const filePath = args[2];
@@ -40,16 +40,16 @@ if (source === "--file") {
         process.exit(1);
     }
     const raw = readFileSync(filePath, "utf-8");
-    payload = JSON.parse(raw) as { message: string; source?: string };
+    payload = JSON.parse(raw);
 } else if (source === "-") {
     // Read from stdin (synchronous for simplicity)
-    const chunks: Buffer[] = [];
-    let chunk: Buffer;
+    const chunks = [];
+    let chunk;
     while ((chunk = process.stdin.read()) !== null) {
         chunks.push(chunk);
     }
     const raw = Buffer.concat(chunks).toString("utf-8");
-    payload = JSON.parse(raw) as { message: string; source?: string };
+    payload = JSON.parse(raw);
 } else {
     // Message is the remaining arguments joined
     payload = { message: args.slice(1).join(" "), source: "external-cli" };

@@ -5,7 +5,11 @@ import { registerHandoff } from "../features/handoff.ts";
 import { registerSummarize } from "../features/summarize.ts";
 import { TauState } from "../state.ts";
 
-type Invocation = { model: unknown; context: unknown; options: Record<string, unknown> };
+type Invocation = {
+    model: unknown;
+    context: unknown;
+    options: Record<string, unknown>;
+};
 const response = {
     role: "assistant",
     content: [{ type: "text", text: "generated text" }],
@@ -22,7 +26,10 @@ function commandRegistrar() {
     return {
         handlers,
         pi: {
-            registerCommand(name: string, command: { handler: (...args: never[]) => Promise<unknown> }) {
+            registerCommand(
+                name: string,
+                command: { handler: (...args: never[]) => Promise<unknown> }
+            ) {
                 handlers.set(name, command.handler);
             },
         } as never,
@@ -30,23 +37,25 @@ function commandRegistrar() {
 }
 
 function completeCapture(invocations: Invocation[]) {
-    const completeRequest = async (model: unknown, context: unknown, options: Record<string, unknown>) => {
+    const completeRequest = async (
+        model: unknown,
+        context: unknown,
+        options: Record<string, unknown>
+    ) => {
         invocations.push({ model, context, options });
         return response;
     };
     return completeRequest as typeof complete;
 }
 
-function sessionAssertions(
-    invocation: Invocation,
-    id: string,
-    client = "pi"
-) {
+function sessionAssertions(invocation: Invocation, id: string, client = "pi") {
     assert.equal(invocation.options.sessionId, id);
     const headers = invocation.options.headers as Record<string, string>;
     assert.equal(headers["x-opencode-session"], id);
     assert.equal(
-        Object.entries(headers).find(([name]) => name.toLowerCase() === "x-opencode-client")?.[1],
+        Object.entries(headers).find(
+            ([name]) => name.toLowerCase() === "x-opencode-client"
+        )?.[1],
         client
     );
     assert.equal(headers.Authorization, "Bearer test");
@@ -56,7 +65,9 @@ void describe("OpenCode command completion wiring", () => {
     void it("summarize passes each invocation's session and merged headers to complete", async () => {
         const invocations: Invocation[] = [];
         let currentSession = "source-one";
-        let authHeaders: Record<string, string> = { Authorization: "Bearer test" };
+        let authHeaders: Record<string, string> = {
+            Authorization: "Bearer test",
+        };
         const model = {
             provider: "opencode",
             id: "test-model",
@@ -75,7 +86,10 @@ void describe("OpenCode command completion wiring", () => {
             sessionManager: {
                 getSessionId: () => currentSession,
                 getBranch: () => [
-                    { type: "message", message: { role: "user", content: "hello" } },
+                    {
+                        type: "message",
+                        message: { role: "user", content: "hello" },
+                    },
                 ],
             },
             modelRegistry: {
@@ -104,9 +118,9 @@ void describe("OpenCode command completion wiring", () => {
         await handler("" as never, ctx);
 
         assert.equal(invocations.length, 3);
-        sessionAssertions(invocations[0]!, "source-one");
-        sessionAssertions(invocations[1]!, "source-two");
-        const request = invocations[2]!;
+        sessionAssertions(invocations[0], "source-one");
+        sessionAssertions(invocations[1], "source-two");
+        const request = invocations[2];
         assert.equal(request.options.sessionId, "source-three");
         assert.deepEqual(request.options.headers, {
             Authorization: "Bearer test",
@@ -158,7 +172,11 @@ void describe("OpenCode command completion wiring", () => {
                         id: "entry-1",
                         parentId: null,
                         timestamp: new Date().toISOString(),
-                        message: { role: "user", content: "hello", timestamp: Date.now() },
+                        message: {
+                            role: "user",
+                            content: "hello",
+                            timestamp: Date.now(),
+                        },
                     },
                 ],
                 getSessionFile: () => "/tmp/source-session.jsonl",
@@ -175,30 +193,44 @@ void describe("OpenCode command completion wiring", () => {
             },
             ui: {
                 notify() {},
-                custom: async (factory: (tui: unknown, theme: unknown, kb: unknown, done: (value: string | null) => void) => unknown) =>
+                custom: async (
+                    factory: (
+                        tui: unknown,
+                        theme: unknown,
+                        kb: unknown,
+                        done: (value: string | null) => void
+                    ) => unknown
+                ) =>
                     new Promise<string | null>((resolve, reject) => {
+                        let component: { dispose?: () => void } | undefined;
+                        const done = (value: string | null) => {
+                            component?.dispose?.();
+                            resolve(value);
+                        };
                         try {
-                            let component: { dispose?: () => void } | undefined;
                             component = factory(
-                                { requestRender() {} } as never,
+                                { requestRender() {} },
                                 {
                                     fg: (_color: string, text: string) => text,
                                     bold: (text: string) => text,
-                                } as never,
-                                {} as never,
-                                (value) => {
-                                    component?.dispose?.();
-                                    resolve(value);
-                                }
+                                },
+                                {},
+                                done
                             ) as { dispose?: () => void };
                         } catch (error) {
-                            reject(error);
+                            reject(
+                                error instanceof Error
+                                    ? error
+                                    : new Error(String(error))
+                            );
                         }
                     }),
                 editor: async (_label: string, value: string) => value,
                 setEditorText() {},
             },
-            newSession: async (options: { withSession: (ctx: unknown) => Promise<void> }) => {
+            newSession: async (options: {
+                withSession: (ctx: unknown) => Promise<void>;
+            }) => {
                 currentSession = "destination-session";
                 await options.withSession({
                     ui: { setEditorText() {}, notify() {} },
@@ -210,7 +242,7 @@ void describe("OpenCode command completion wiring", () => {
         await handler("transfer this" as never, ctx);
 
         assert.equal(invocations.length, 1);
-        const request = invocations[0]!;
+        const request = invocations[0];
         assert.equal(request.options.sessionId, "handoff-source");
         assert.deepEqual(request.options.headers, {
             Authorization: "Bearer test",
@@ -244,27 +276,33 @@ void describe("OpenCode command completion wiring", () => {
             complete: completeCapture(invocations),
             getModel: (() => model) as never,
         });
-        await handlers.get("summarize")!("" as never, {
-            hasUI: false,
-            sessionManager: {
-                getSessionId: () => "ordinary-session",
-                getBranch: () => [
-                    { type: "message", message: { role: "user", content: "hello" } },
-                ],
-            },
-            modelRegistry: {
-                getApiKeyAndHeaders: async () => ({
-                    ok: true,
-                    apiKey: "fake-key",
-                    headers: { Authorization: "Bearer test" },
-                }),
-            },
-            ui: { notify() {} },
-        } as never);
+        await handlers.get("summarize")!(
+            "" as never,
+            {
+                hasUI: false,
+                sessionManager: {
+                    getSessionId: () => "ordinary-session",
+                    getBranch: () => [
+                        {
+                            type: "message",
+                            message: { role: "user", content: "hello" },
+                        },
+                    ],
+                },
+                modelRegistry: {
+                    getApiKeyAndHeaders: async () => ({
+                        ok: true,
+                        apiKey: "fake-key",
+                        headers: { Authorization: "Bearer test" },
+                    }),
+                },
+                ui: { notify() {} },
+            } as never
+        );
 
         assert.equal(invocations.length, 1);
-        assert.equal(invocations[0]!.options.sessionId, "ordinary-session");
-        assert.deepEqual(invocations[0]!.options.headers, {
+        assert.equal(invocations[0].options.sessionId, "ordinary-session");
+        assert.deepEqual(invocations[0].options.headers, {
             Authorization: "Bearer test",
         });
     });

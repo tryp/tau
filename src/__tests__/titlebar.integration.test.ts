@@ -106,7 +106,7 @@ void describe("agent timer", () => {
         state.agentStartTime = Date.now() - 5000;
         state.agentTimer = setInterval(() => {}, 10000);
         const statuses: { name: string; content: unknown }[] = [];
-        const ctx = {
+        const _ctx = {
             ui: {
                 setStatus: (name: string, content: unknown) =>
                     statuses.push({ name, content }),

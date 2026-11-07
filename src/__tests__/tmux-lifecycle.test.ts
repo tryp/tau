@@ -155,9 +155,17 @@ void describe("tmux window lifecycle", TMUX_SUITE_OPTIONS, () => {
         const specialDir = `${TEST_RUN_DIR};quoted dir`;
         mkdirSync(specialDir, { recursive: true });
         try {
-            const result = spawnInTmux("pwd", specialDir, specialDir, TEST_SESSION);
+            const result = spawnInTmux(
+                "pwd",
+                specialDir,
+                specialDir,
+                TEST_SESSION
+            );
             assert.equal(await waitForExitCode(result.exitCodeFile), 0);
-            assert.match(readFileSync(result.outputFile, "utf-8"), new RegExp(specialDir));
+            assert.match(
+                readFileSync(result.outputFile, "utf-8"),
+                new RegExp(specialDir)
+            );
         } finally {
             rmSync(specialDir, { recursive: true, force: true });
         }
