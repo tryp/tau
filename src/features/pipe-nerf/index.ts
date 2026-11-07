@@ -167,9 +167,12 @@ function pipelineExitLines(plan: PipePlan): string[] {
     }
     const lines: string[] = [];
     for (const record of records) {
-        const [segmentText, codesText] = record.split("\t", 2);
+        const [segmentText, codesText, effectiveText, sourceText] =
+            record.split("\t");
         const segment = Number(segmentText);
         const codes = codesText?.split(/\s+/).map(Number);
+        const effective = Number(effectiveText?.replace(/^effective=/, ""));
+        const source = Number(sourceText?.replace(/^stage=/, ""));
         const commands = plan.pipelineExitCommands[segment - 1];
         if (
             !commands ||
@@ -177,15 +180,22 @@ function pipelineExitLines(plan: PipePlan): string[] {
             codes.some((code) => !Number.isInteger(code))
         )
             continue;
-        const statuses = codes.map((code, index) => {
-            const command = commands[index] ?? "unknown stage";
-            const label = command.includes("stage0-capture.mjs")
+        const stageLabel = (command: string) =>
+            command.includes("stage0-capture.mjs")
                 ? "pipe-hoist capture"
                 : JSON.stringify(command.slice(0, 120));
-            return `stage ${index + 1} ${label}=${code}`;
+        const statuses = codes.map((code, index) => {
+            const command = commands[index] ?? "unknown stage";
+            return `stage ${index + 1} ${stageLabel(command)}=${code}`;
         });
+        const effectiveLabel =
+            Number.isInteger(effective) && Number.isInteger(source)
+                ? source > 0
+                    ? ` Effective exit=${effective} from stage ${source} ${stageLabel(commands[source - 1] ?? "unknown stage")} (first nonzero stage).`
+                    : ` Effective exit=${effective} (all stages succeeded).`
+                : "";
         lines.push(
-            `Pipeline exits (segment ${segment}): ${statuses.join(", ")}.`
+            `Pipeline exits (segment ${segment}): ${statuses.join(", ")}.${effectiveLabel}`
         );
     }
     return lines;

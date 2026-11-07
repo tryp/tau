@@ -85,14 +85,14 @@ function splitPipelineStages(command: string): string[] {
     return stages;
 }
 
-/** Capture PIPESTATUS without changing the pipeline's observable exit code. */
+/** Record every PIPESTATUS and make the first failed stage authoritative. */
 function recordPipelineExit(
     segment: string,
     path: string,
     index: number
 ): string {
     const exitPath = shellQuote(path);
-    return `( ${segment}; __pi_pipe_rc=$? __pi_pipe_status=("\${PIPESTATUS[@]}"); printf '%s\\t%s\\n' ${index} "\${__pi_pipe_status[*]}" >> ${exitPath}; exit "$__pi_pipe_rc" )`;
+    return `( ${segment}; __pi_pipe_status=("\${PIPESTATUS[@]}"); __pi_pipe_effective=0 __pi_pipe_source=0; for ((__pi_pipe_i=0; __pi_pipe_i<\${#__pi_pipe_status[@]}; __pi_pipe_i++)); do if (( __pi_pipe_status[__pi_pipe_i] != 0 )); then __pi_pipe_effective=\${__pi_pipe_status[__pi_pipe_i]}; __pi_pipe_source=$((__pi_pipe_i + 1)); break; fi; done; printf '%s\\t%s\\teffective=%s\\tstage=%s\\n' ${index} "\${__pi_pipe_status[*]}" "$__pi_pipe_effective" "$__pi_pipe_source" >> ${exitPath}; exit "$__pi_pipe_effective" )`;
 }
 
 function instrumentPipelineExits(
