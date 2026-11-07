@@ -47,7 +47,11 @@ import {
     restoreBackgroundJobs,
 } from "./features/background.ts";
 import { scheduleBackgroundJobRestore } from "./features/startup-maintenance.ts";
-import { purgeSidecar, scheduleSidecarPurge } from "./features/sidecar.ts";
+import {
+    canRunSidecarPurge,
+    purgeSidecar,
+    scheduleSidecarPurge,
+} from "./features/sidecar.ts";
 import { registerBackgroundCommands } from "./features/background-commands.ts";
 import { registerAgentBackground } from "./features/agent-background.ts";
 import {
@@ -130,18 +134,81 @@ export default function (pi: ExtensionAPI) {
         lastActivityAt = Date.now();
     };
     let sidecarPurgeCompleted = false;
+    let sidecarPurgeTimer: ReturnType<typeof setTimeout> | undefined;
+    const MAX_STALE_PURGE_REARMS = 3;
+    const MAX_IDLE_PURGE_RETRIES = 12;
     const isStartupActive = (generation: number) =>
         generation === startupGeneration && !sessionShuttingDown;
-    const scheduleSidecarPurgeForGeneration = (generation: number) => {
-        if (sidecarPurgeCompleted) return;
-        scheduleSidecarPurge(
-            () => {
+    const scheduleSidecarPurgeForGeneration = (
+        generation: number,
+        delayMs?: number,
+        staleRearms = 0,
+        idleRetries = 0
+    ) => {
+        if (
+            sidecarPurgeCompleted ||
+            sessionShuttingDown ||
+            process.env.PI_TAU_MAINTENANCE_DISABLE === "1"
+        )
+            return;
+        if (sidecarPurgeTimer) clearTimeout(sidecarPurgeTimer);
+        const scheduledTimer = scheduleSidecarPurge(
+            async () => {
+                if (sidecarPurgeTimer === scheduledTimer)
+                    sidecarPurgeTimer = undefined;
+                if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
+                    if (idleRetries < MAX_IDLE_PURGE_RETRIES) {
+                        scheduleSidecarPurgeForGeneration(
+                            generation,
+                            5_000,
+                            staleRearms,
+                            idleRetries + 1
+                        );
+                    } else {
+                        console.debug(
+                            "[tau] sidecar purge deferred until a later session: idle retry limit"
+                        );
+                    }
+                    return;
+                }
+                const stats = await purgeSidecar(undefined, {
+                    shouldContinue: () =>
+                        isStartupActive(generation) &&
+                        canRunSidecarPurge(turnProcessing, lastActivityAt),
+                });
+                if (!isStartupActive(generation)) return;
+                if (stats.budgetExhausted) {
+                    scheduleSidecarPurgeForGeneration(
+                        generation,
+                        5_000,
+                        staleRearms,
+                        0
+                    );
+                    return;
+                }
                 sidecarPurgeCompleted = true;
-                purgeSidecar();
             },
-            undefined,
-            () => isStartupActive(generation)
+            delayMs,
+            () => isStartupActive(generation),
+            () => {
+                if (
+                    sessionShuttingDown ||
+                    sidecarPurgeCompleted ||
+                    staleRearms >= MAX_STALE_PURGE_REARMS
+                )
+                    return;
+                if (sidecarPurgeTimer && sidecarPurgeTimer !== scheduledTimer)
+                    clearTimeout(sidecarPurgeTimer);
+                sidecarPurgeTimer = undefined;
+                scheduleSidecarPurgeForGeneration(
+                    startupGeneration,
+                    undefined,
+                    staleRearms + 1,
+                    idleRetries
+                );
+            }
         );
+        sidecarPurgeTimer = scheduledTimer;
     };
 
     // ── Compact renderer for job-completion messages ──────────────────
@@ -221,8 +288,8 @@ export default function (pi: ExtensionAPI) {
     // ── Register all features ─────────────────────────────────────────
 
     // Purge sidecar entries after startup so SQLite maintenance cannot delay
-    // extension loading or first prompt readiness. Session starts replace this
-    // registration-generation timer if it becomes stale before it fires.
+    // extension loading or first prompt readiness. session_start replaces this
+    // registration-generation timer with one bound to the active generation.
     scheduleSidecarPurgeForGeneration(startupGeneration);
 
     registerBackgroundJobs(pi, state);
@@ -579,6 +646,10 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
 
     pi.on("session_start", async (_event, ctx) => {
         const generation = ++startupGeneration;
+        if (sidecarPurgeTimer) {
+            clearTimeout(sidecarPurgeTimer);
+            sidecarPurgeTimer = undefined;
+        }
         if (tmuxRunDirSweepTimer) {
             clearInterval(tmuxRunDirSweepTimer);
             tmuxRunDirSweepTimer = undefined;
@@ -825,6 +896,10 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
         if (tmuxRunDirSweepTimer) {
             clearInterval(tmuxRunDirSweepTimer);
             tmuxRunDirSweepTimer = undefined;
+        }
+        if (sidecarPurgeTimer) {
+            clearTimeout(sidecarPurgeTimer);
+            sidecarPurgeTimer = undefined;
         }
         stopTitlebarSpinner(pi, state, ctx);
         stopAgentTimer(state);

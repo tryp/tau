@@ -16,7 +16,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { scheduleBackgroundJobRestore } from "../features/startup-maintenance.ts";
 import { schedulePeriodicTmuxRunDirCleanup } from "../features/bash-tmux.ts";
-import { scheduleSidecarPurge } from "../features/sidecar.ts";
+import {
+    canRunSidecarPurge,
+    scheduleSidecarPurge,
+} from "../features/sidecar.ts";
 import { resolveMaintenanceDelayMs } from "../index.ts";
 import {
     forEachWithinTimeBudget,
@@ -105,6 +108,12 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 void describe("deferred startup maintenance", () => {
+    void it("does not permit sidecar purge while a turn is processing", () => {
+        assert.equal(canRunSidecarPurge(true, 0, 10_000), false);
+        assert.equal(canRunSidecarPurge(false, 5_001, 10_000), false);
+        assert.equal(canRunSidecarPurge(false, 5_000, 10_000), true);
+    });
+
     void it("bounds configured maintenance delays to safe timer values", () => {
         assert.equal(resolveMaintenanceDelayMs(30_000), 30_000);
         assert.equal(resolveMaintenanceDelayMs(86_400_000), 86_400_000);
@@ -390,6 +399,16 @@ void describe("deferred startup maintenance", () => {
         )!.value as typeof DatabaseSync.prototype.prepare;
         const oldNodeTestContext = process.env.NODE_TEST_CONTEXT;
         const oldArgv = [...process.argv];
+        const oldDebug = console.debug;
+        const stalePurgeLogs: string[] = [];
+        console.debug = (...args: unknown[]) => {
+            if (
+                String(args[0]).includes(
+                    "sidecar purge skipped for stale startup"
+                )
+            )
+                stalePurgeLogs.push(String(args[0]));
+        };
         const fakeTimers = new FakeTimers();
         let procScans = 0;
         let tmpSweeps = 0;
@@ -541,6 +560,13 @@ exit 0
                 }
             );
             registerTau(pi as never);
+            const registrationPurgeTimer = fakeTimers.records.find(
+                (timer) => timer.due === 5_000 && timer.interval === 0
+            );
+            assert.ok(
+                registrationPurgeTimer,
+                "extension-load purge timer is registered"
+            );
             const assertRestoreIdle = () => {
                 const terminalRecords = appended.filter(
                     (entry) =>
@@ -688,6 +714,28 @@ exit 0
             assert.equal(sidecarSelects, 0);
             await startupA;
             assertRestoreIdle();
+            assert.equal(
+                registrationPurgeTimer.cleared,
+                true,
+                "session_start cancels the registration timer"
+            );
+            assert.equal(
+                stalePurgeLogs.length,
+                0,
+                "normal startup must not take the stale callback path"
+            );
+            const startupAPurgeTimer = fakeTimers.records
+                .filter(
+                    (timer) =>
+                        timer.due === 5_000 &&
+                        timer.interval === 0 &&
+                        !timer.cleared
+                )
+                .at(-1);
+            assert.ok(
+                startupAPurgeTimer,
+                "session A schedules its generation-bound purge"
+            );
 
             // Shutdown A after it has scheduled all maintenance, then start B
             // before any of A's timers can fire.
@@ -695,6 +743,36 @@ exit 0
             const startupB = mainStart({}, ctx) as Promise<void>;
             await startupB;
             assertRestoreIdle();
+            const startupBPurgeTimer = fakeTimers.records
+                .filter(
+                    (timer) =>
+                        timer.due === 5_000 &&
+                        timer.interval === 0 &&
+                        !timer.cleared
+                )
+                .at(-1);
+            assert.ok(
+                startupBPurgeTimer,
+                "session B schedules its current-generation purge"
+            );
+            startupAPurgeTimer.cleared = true;
+            startupAPurgeTimer.callback(); // emulate a callback already queued at the cancellation boundary
+            assert.equal(stalePurgeLogs.length, 1);
+            assert.equal(
+                startupBPurgeTimer.cleared,
+                true,
+                "stale callback replaces the pending old-generation timer"
+            );
+            assert.ok(
+                fakeTimers.records.some(
+                    (timer) =>
+                        timer.due === 5_000 &&
+                        timer.interval === 0 &&
+                        !timer.cleared &&
+                        timer !== startupBPurgeTimer
+                ),
+                "stale callback re-arms the purge for the current generation"
+            );
 
             const maintenanceTimer = fakeTimers.records
                 .filter(
@@ -780,7 +858,9 @@ exit 0
                 "orphaned reminder restoration must still deliver its notice"
             );
 
+            Date.now = () => oldDateNow() + fakeTimers.now;
             fakeTimers.advance(4_750);
+            Date.now = oldDateNow;
             await waitFor(() => sidecarSelects === 1);
             assert.equal(sidecarSelects, 1);
             const dbAfterPurge = new DatabaseSync(join(agentDir, "context.db"));
@@ -895,6 +975,7 @@ exit 0
             globalThis.setInterval = oldSetInterval;
             globalThis.clearTimeout = oldClearTimeout;
             globalThis.clearInterval = oldClearInterval;
+            console.debug = oldDebug;
             fs.readdirSync = oldReaddirSync;
             fsPromises.readdir = oldReaddir;
             syncBuiltinESMExports();

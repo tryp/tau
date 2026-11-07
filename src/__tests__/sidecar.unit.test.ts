@@ -20,11 +20,14 @@ import {
     trackJobOutputIndex,
 } from "../features/background.ts";
 import {
+    canRunSidecarPurge,
     chunkText,
     formatSidecarReceipt,
     INLINE_CONTEXT_MAX_LINES,
     INLINE_FALLBACK_MAX_CHARS,
     prepareInlineOutput,
+    scheduleSidecarPurge,
+    type SidecarPurgeOptions,
 } from "../features/sidecar.ts";
 import type { BackgroundJob } from "../types.ts";
 import { planPipeNerf } from "../features/pipe-nerf/parse.ts";
@@ -180,38 +183,228 @@ afterEach(() => {
 // ─── purgeSidecar tests ─────────────────────────────────────────────
 
 void describe("purgeSidecar", () => {
-    void it("succeeds silently when context.db does not exist", () => {
-        // PI_CODING_AGENT_DIR points to an empty dir; no context.db present
-        purgeSidecar(1);
-        // No throw — pass
+    void it("yields to timers while the purge is still running", async () => {
+        const pending = Array.from({ length: 8 }, (_, index) => ({
+            id: `slow-${index}`,
+        }));
+        let clock = 0;
+        let finished = false;
+        let monitorFiredDuringPurge = false;
+        const options: SidecarPurgeOptions = {
+            dbPath: "injected",
+            batchSize: 1,
+            sliceBudgetMs: 10,
+            totalBudgetMs: 2_000,
+            now: () => clock,
+            openDatabase: () => ({
+                prepare(sql: string) {
+                    return {
+                        all() {
+                            if (
+                                sql.startsWith("SELECT id FROM context_sources")
+                            )
+                                return [...pending];
+                            return [{ freelist_count: 0 }];
+                        },
+                        run(...ids: unknown[]) {
+                            clock += 6;
+                            if (sql.startsWith("DELETE FROM context_sources")) {
+                                const id = String(ids[0]);
+                                const index = pending.findIndex(
+                                    (row) => row.id === id
+                                );
+                                if (index >= 0) pending.splice(index, 1);
+                                return { changes: Number(index >= 0) };
+                            }
+                            return { changes: 1 };
+                        },
+                    };
+                },
+                close() {},
+            }),
+        };
+        setTimeout(() => {
+            monitorFiredDuringPurge = !finished && pending.length > 0;
+        }, 0);
+
+        const stats = await purgeSidecar(1, options);
+        finished = true;
+        assert.ok(
+            monitorFiredDuringPurge,
+            "timer should run between purge slices"
+        );
+        assert.ok(stats.slices > 0);
+        assert.equal(stats.sourcesRemoved, 8);
     });
 
-    void it("succeeds silently when context.db exists but has no bash_bg entries", () => {
-        createDb(tmpDir); // creates empty DB with schema
-        purgeSidecar(1);
-        // No "database is not open" — this was the bug
+    void it("stops at its pass budget and resumes remaining sources on the next pass", async () => {
+        const pending = Array.from({ length: 4 }, (_, index) => ({
+            id: `budget-${index}`,
+        }));
+        let clock = 0;
+        const options: SidecarPurgeOptions = {
+            dbPath: "injected",
+            batchSize: 1,
+            sliceBudgetMs: 10,
+            totalBudgetMs: 40,
+            now: () => clock,
+            openDatabase: () => ({
+                prepare(sql: string) {
+                    return {
+                        all() {
+                            return sql.startsWith(
+                                "SELECT id FROM context_sources"
+                            )
+                                ? [...pending]
+                                : [{ freelist_count: 0 }];
+                        },
+                        run(...ids: unknown[]) {
+                            clock += 15;
+                            if (sql.startsWith("DELETE FROM context_sources")) {
+                                const index = pending.findIndex(
+                                    (row) => row.id === String(ids[0])
+                                );
+                                if (index >= 0) pending.splice(index, 1);
+                                return { changes: Number(index >= 0) };
+                            }
+                            return { changes: 1 };
+                        },
+                    };
+                },
+                close() {},
+            }),
+        };
+        const first = await purgeSidecar(1, options);
+        assert.equal(first.budgetExhausted, true);
+        assert.equal(first.sourcesConsidered, 4);
+        assert.equal(first.sourcesRemoved, 2);
+        assert.equal(pending.length, 2);
+
+        const second = await purgeSidecar(1, {
+            ...options,
+            totalBudgetMs: 100,
+        });
+        assert.equal(second.budgetExhausted, false);
+        assert.equal(second.sourcesConsidered, 2);
+        assert.equal(second.sourcesRemoved, 2);
+        assert.equal(pending.length, 0);
     });
 
-    void it("does not throw when there are no stale entries (all entries are young)", () => {
+    void it("pauses between slices when turn processing begins", async () => {
+        const pending = Array.from({ length: 3 }, (_, index) => ({
+            id: `turn-${index}`,
+        }));
+        let clock = 0;
+        let turnProcessing = false;
+        let pausedOnce = false;
+        let databaseOpens = 0;
+        const options: SidecarPurgeOptions = {
+            dbPath: "injected",
+            batchSize: 1,
+            sliceBudgetMs: 10,
+            now: () => clock,
+            shouldContinue: () => canRunSidecarPurge(turnProcessing, 0, 10_000),
+            yieldToEventLoop: async () => {
+                if (!pausedOnce) {
+                    pausedOnce = true;
+                    turnProcessing = true;
+                }
+            },
+            openDatabase: () => {
+                databaseOpens++;
+                return {
+                    prepare(sql: string) {
+                        return {
+                            all() {
+                                return sql.startsWith(
+                                    "SELECT id FROM context_sources"
+                                )
+                                    ? [...pending]
+                                    : [{ freelist_count: 0 }];
+                            },
+                            run(...ids: unknown[]) {
+                                clock += 6;
+                                if (
+                                    sql.startsWith(
+                                        "DELETE FROM context_sources"
+                                    )
+                                ) {
+                                    const index = pending.findIndex(
+                                        (row) => row.id === String(ids[0])
+                                    );
+                                    if (index >= 0) pending.splice(index, 1);
+                                    return { changes: Number(index >= 0) };
+                                }
+                                return { changes: 1 };
+                            },
+                        };
+                    },
+                    close() {},
+                };
+            },
+        };
+        const first = await purgeSidecar(1, options);
+        assert.equal(first.budgetExhausted, true);
+        assert.equal(first.sourcesRemoved, 1);
+        assert.equal(pending.length, 2);
+
+        const opensBeforeBusyCall = databaseOpens;
+        const whileBusy = await purgeSidecar(1, options);
+        assert.equal(whileBusy.sourcesConsidered, 0);
+        assert.equal(
+            databaseOpens,
+            opensBeforeBusyCall,
+            "busy turn must not open the database"
+        );
+
+        turnProcessing = false;
+        const resumed = await purgeSidecar(1, options);
+        assert.equal(resumed.sourcesRemoved, 2);
+        assert.equal(pending.length, 0);
+    });
+
+    void it("does not schedule when maintenance is disabled", () => {
+        const previous = process.env.PI_TAU_MAINTENANCE_DISABLE;
+        process.env.PI_TAU_MAINTENANCE_DISABLE = "1";
+        try {
+            assert.equal(
+                scheduleSidecarPurge(() => {}),
+                undefined
+            );
+        } finally {
+            if (previous === undefined)
+                delete process.env.PI_TAU_MAINTENANCE_DISABLE;
+            else process.env.PI_TAU_MAINTENANCE_DISABLE = previous;
+        }
+    });
+
+    void it("succeeds silently when context.db does not exist", async () => {
+        await purgeSidecar(1);
+    });
+
+    void it("succeeds silently when context.db exists but has no bash_bg entries", async () => {
+        createDb(tmpDir);
+        await purgeSidecar(1);
+    });
+
+    void it("does not throw when there are no stale entries (all entries are young)", async () => {
         const db = createDb(tmpDir);
         insertSource(db, { created_at: Date.now() });
         db.close();
 
-        purgeSidecar(1); // purge entries older than 1 day
-        // No throw — pass
+        await purgeSidecar(1);
     });
 
-    void it("removes stale bash_bg entries older than the cutoff", () => {
+    void it("removes stale bash_bg entries older than the cutoff", async () => {
         const db = createDb(tmpDir);
         const oldId = insertSource(db, {
-            created_at: Date.now() - 2 * 24 * 60 * 60 * 1000, // 2 days ago
+            created_at: Date.now() - 2 * 24 * 60 * 60 * 1000,
         });
         insertChunk(db, oldId, 1, "stale output");
         db.close();
 
-        purgeSidecar(1); // purge entries older than 1 day
+        await purgeSidecar(1);
 
-        // Verify source was deleted
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
             .prepare(
@@ -222,7 +415,7 @@ void describe("purgeSidecar", () => {
         assert.equal(remaining.length, 0);
     });
 
-    void it("removes only stale entries, keeping fresh ones", () => {
+    void it("removes only stale entries, keeping fresh ones", async () => {
         const db = createDb(tmpDir);
         const oldId = insertSource(db, {
             id: "old",
@@ -238,7 +431,7 @@ void describe("purgeSidecar", () => {
         insertChunk(db, freshId, 1, "fresh data");
         db.close();
 
-        purgeSidecar(1);
+        await purgeSidecar(1);
 
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
@@ -251,7 +444,7 @@ void describe("purgeSidecar", () => {
         assert.equal(remaining[0].id, "fresh");
     });
 
-    void it("handles chunked deletion of >100 stale entries", () => {
+    void it("handles chunked deletion of >100 stale entries", async () => {
         const db = createDb(tmpDir);
         const cutoff = Date.now() - 2 * 24 * 60 * 60 * 1000;
         for (let i = 0; i < 150; i++) {
@@ -264,7 +457,7 @@ void describe("purgeSidecar", () => {
         }
         db.close();
 
-        purgeSidecar(1);
+        await purgeSidecar(1);
 
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
@@ -276,9 +469,8 @@ void describe("purgeSidecar", () => {
         assert.equal(remaining.cnt, 0);
     });
 
-    void it("skips non-bash_bg tool entries (only purges its own)", () => {
+    void it("skips non-bash_bg tool entries (only purges its own)", async () => {
         const db = createDb(tmpDir);
-        // Insert a non-bash_bg entry
         db.prepare(
             `INSERT INTO context_sources
              (id, tool_name, input_summary, created_at, byte_count, line_count, content_hash)
@@ -294,7 +486,7 @@ void describe("purgeSidecar", () => {
         );
         db.close();
 
-        purgeSidecar(1);
+        await purgeSidecar(1);
 
         const check = new DatabaseSync(join(tmpDir, "context.db"));
         const remaining = check
@@ -1279,20 +1471,17 @@ void describe("indexJobOutputInSidecar", () => {
 // explicit db.close() + finally { db.close() } on early-return paths.
 
 void describe("double-close regression", () => {
-    void it("purgeSidecar: empty DB does not throw 'database is not open'", () => {
+    void it("purgeSidecar: empty DB does not throw 'database is not open'", async () => {
         createDb(tmpDir);
-        // This was the original bug: when there's nothing to purge, the
-        // early-return path called db.close() then finally called it again.
-        purgeSidecar(1);
-        // If we reach here without uncaught error, the fix works.
+        await purgeSidecar(1);
     });
 
-    void it("purgeSidecar: all-fresh entries does not throw", () => {
+    void it("purgeSidecar: all-fresh entries does not throw", async () => {
         const db = createDb(tmpDir);
         insertSource(db, { created_at: Date.now() });
         db.close();
 
-        purgeSidecar(1);
+        await purgeSidecar(1);
     });
 
     void it("readJobOutputFromSidecar: missing table does not throw", async () => {

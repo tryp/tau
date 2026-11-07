@@ -9,9 +9,10 @@
  */
 
 import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type {
@@ -185,81 +186,235 @@ export function sidecarDbPath(): string {
  */
 export const SIDECAR_PURGE_DELAY_MS = 5_000;
 
+export interface SidecarPurgeStats {
+    sourcesConsidered: number;
+    sourcesRemoved: number;
+    chunksRemoved: number;
+    slices: number;
+    budgetExhausted: boolean;
+    vacuumSteps: number;
+    errors: number;
+}
+
+interface SidecarPurgeStatement {
+    all(...params: unknown[]): unknown[];
+    run(...params: unknown[]): { changes?: number | bigint };
+}
+
+interface SidecarPurgeDatabase {
+    prepare(sql: string): SidecarPurgeStatement;
+    close(): void;
+}
+
+export interface SidecarPurgeOptions {
+    dbPath?: string;
+    openDatabase?: (path: string) => SidecarPurgeDatabase;
+    now?: () => number;
+    yieldToEventLoop?: () => Promise<void>;
+    sliceBudgetMs?: number;
+    totalBudgetMs?: number;
+    batchSize?: number;
+    vacuumPagesPerStep?: number;
+    shouldContinue?: () => boolean;
+}
+
+const PURGE_SLICE_BUDGET_MS = 10;
+const PURGE_TOTAL_BUDGET_MS = 2_000;
+const PURGE_BATCH_SIZE = 25;
+const PURGE_VACUUM_PAGES = 100;
+export const SIDECAR_PURGE_IDLE_MS = 5_000;
+let vacuumPending = false;
+
+export function canRunSidecarPurge(
+    turnProcessing: boolean,
+    lastActivityAt: number,
+    now = Date.now()
+): boolean {
+    return !turnProcessing && now - lastActivityAt >= SIDECAR_PURGE_IDLE_MS;
+}
+
 export function scheduleSidecarPurge(
-    purge: () => void = () => purgeSidecar(),
+    purge: () => unknown = () => purgeSidecar(),
     delayMs = SIDECAR_PURGE_DELAY_MS,
-    shouldRun?: () => boolean
-): ReturnType<typeof setTimeout> {
+    shouldRun?: () => boolean,
+    onStale?: () => void
+): ReturnType<typeof setTimeout> | undefined {
+    if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return undefined;
     const timer = setTimeout(() => {
         if (shouldRun && !shouldRun()) {
             console.debug("[tau] sidecar purge skipped for stale startup");
+            onStale?.();
             return;
         }
-        purge();
+        void Promise.resolve(purge()).catch((error: unknown) => {
+            console.error(
+                `[tau] sidecar purge failed: ${error instanceof Error ? error.message : String(error)}`
+            );
+        });
     }, delayMs);
     timer.unref?.();
     return timer;
 }
 
-export function purgeSidecar(ageDays: number = SIDECAR_PURGE_AGE_DAYS): void {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return;
+function emptySidecarPurgeStats(): SidecarPurgeStats {
+    return {
+        sourcesConsidered: 0,
+        sourcesRemoved: 0,
+        chunksRemoved: 0,
+        slices: 0,
+        budgetExhausted: false,
+        vacuumSteps: 0,
+        errors: 0,
+    };
+}
 
-    const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
+function logSidecarPurgeStats(stats: SidecarPurgeStats, ageDays: number): void {
+    const line =
+        `[tau] sidecar-purge age-days=${ageDays} sources-considered=${stats.sourcesConsidered} ` +
+        `sources-removed=${stats.sourcesRemoved} chunks-removed=${stats.chunksRemoved} ` +
+        `slices=${stats.slices} budget-exhausted=${stats.budgetExhausted} ` +
+        `vacuum-steps=${stats.vacuumSteps} errors=${stats.errors}`;
+    console.error(line);
+    if (process.env.NODE_TEST_CONTEXT === undefined) {
+        void appendFile(
+            join(tmpdir(), "pi-tau-maintenance.log"),
+            `${line}\n`
+        ).catch(() => {});
+    }
+}
+
+export async function purgeSidecar(
+    ageDays: number = SIDECAR_PURGE_AGE_DAYS,
+    options: SidecarPurgeOptions = {}
+): Promise<SidecarPurgeStats> {
+    const stats = emptySidecarPurgeStats();
+    const dbPath = options.dbPath ?? sidecarDbPath();
+    const now = options.now ?? (() => performance.now());
+    const yieldToEventLoop =
+        options.yieldToEventLoop ?? (() => yieldImmediate());
+    const sliceBudgetMs = options.sliceBudgetMs ?? PURGE_SLICE_BUDGET_MS;
+    const totalBudgetMs = options.totalBudgetMs ?? PURGE_TOTAL_BUDGET_MS;
+    const batchSize = options.batchSize ?? PURGE_BATCH_SIZE;
+    const vacuumPages = options.vacuumPagesPerStep ?? PURGE_VACUUM_PAGES;
+    const started = now();
+    let db: SidecarPurgeDatabase | undefined;
+    let lastYieldAt = started;
+
+    const yieldIfNeeded = async (force = false) => {
+        if (force || now() - lastYieldAt >= sliceBudgetMs) {
+            await yieldToEventLoop();
+            stats.slices++;
+            lastYieldAt = now();
+        }
+    };
+    const overTotalBudget = () => now() - started >= totalBudgetMs;
+    const shouldContinue = options.shouldContinue ?? (() => true);
 
     try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-            timeout: 5_000,
-        });
-        try {
-            // Select IDs to delete so we can log the count
-            const toolList = SIDECAR_TOOL_NAMES.map((t) => `'${t}'`).join(",");
-            const toDelete = db
-                .prepare(
-                    `SELECT id FROM context_sources
-                     WHERE tool_name IN (${toolList})
-                       AND created_at < ?`
-                )
-                .all(cutoff) as { id: string }[];
-
-            if (toDelete.length === 0) {
-                return;
-            }
-
-            // Delete chunks first (FTS triggers fire properly), then sources.
-            // Use chunked batches to keep the WAL manageable.
-            const ids = toDelete.map((r) => r.id);
-            const batchSize = 100;
-            for (let i = 0; i < ids.length; i += batchSize) {
-                const batch = ids.slice(i, i + batchSize);
-                const placeholders = batch.map(() => "?").join(",");
-
-                db.prepare(
-                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
-                ).run(...batch);
-
-                db.prepare(
-                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
-                ).run(...batch);
-            }
-
-            // Reclaim free pages incrementally without rewriting the full DB.
-            db.prepare("PRAGMA incremental_vacuum(1000)").run();
-
-            // Minimal logging — visible in pi startup output
-            console.error(
-                `[tau] purged ${toDelete.length} sidecar entries older than ${ageDays} days, ` +
-                    `incremental vacuum ran`
-            );
-        } finally {
-            db.close();
+        if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return stats;
+        if (!shouldContinue()) {
+            stats.budgetExhausted = true;
+            return stats;
         }
-    } catch (err) {
+        if (!options.openDatabase && !existsSync(dbPath)) return stats;
+
+        db = (
+            options.openDatabase ??
+            ((path) =>
+                new DatabaseSync(path, {
+                    enableForeignKeyConstraints: true,
+                    // Fail/retry on a later idle pass instead of blocking the TUI on a writer lock.
+                    timeout: 25,
+                }))
+        )(dbPath);
+        const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
+        const toolList = SIDECAR_TOOL_NAMES.map((t) => `'${t}'`).join(",");
+        const toDelete = db
+            .prepare(
+                `SELECT id FROM context_sources
+             WHERE tool_name IN (${toolList}) AND created_at < ?`
+            )
+            .all(cutoff) as { id: string }[];
+        stats.sourcesConsidered = toDelete.length;
+
+        // A truly empty pass is a no-op (including no vacuum). A previous
+        // budget-limited vacuum is the one exception: finish that bounded work.
+        if (toDelete.length === 0 && !vacuumPending) return stats;
+
+        let cursor = 0;
+        while (cursor < toDelete.length) {
+            if (!shouldContinue()) {
+                stats.budgetExhausted = true;
+                break;
+            }
+            const batch = toDelete.slice(cursor, cursor + batchSize);
+            const placeholders = batch.map(() => "?").join(",");
+            const chunksResult = db
+                .prepare(
+                    `DELETE FROM context_chunks WHERE source_id IN (${placeholders})`
+                )
+                .run(...batch.map((row) => row.id));
+            stats.chunksRemoved += Number(chunksResult.changes ?? 0);
+            const sourcesResult = db
+                .prepare(
+                    `DELETE FROM context_sources WHERE id IN (${placeholders})`
+                )
+                .run(...batch.map((row) => row.id));
+            stats.sourcesRemoved += Number(sourcesResult.changes ?? 0);
+            cursor += batch.length;
+            await yieldIfNeeded();
+            if (
+                !shouldContinue() ||
+                (overTotalBudget() && cursor < toDelete.length)
+            ) {
+                stats.budgetExhausted = true;
+                break;
+            }
+        }
+
+        if (
+            cursor >= toDelete.length &&
+            (stats.sourcesRemoved > 0 || vacuumPending)
+        ) {
+            vacuumPending = true;
+            if (!shouldContinue()) {
+                stats.budgetExhausted = true;
+                return stats;
+            }
+            const freePages = db.prepare("PRAGMA freelist_count").all()[0] as
+                | { freelist_count?: number }
+                | undefined;
+            let remaining = Number(freePages?.freelist_count ?? 0);
+            while (remaining > 0 && !overTotalBudget() && shouldContinue()) {
+                db.prepare(`PRAGMA incremental_vacuum(${vacuumPages})`).run();
+                stats.vacuumSteps++;
+                // A vacuum step may reclaim less than requested; reread the bound.
+                const current = db.prepare("PRAGMA freelist_count").all()[0] as
+                    | { freelist_count?: number }
+                    | undefined;
+                const next = Number(current?.freelist_count ?? 0);
+                if (next >= remaining) break;
+                remaining = next;
+                await yieldIfNeeded(true);
+            }
+            vacuumPending = remaining > 0;
+            if (vacuumPending && (overTotalBudget() || !shouldContinue()))
+                stats.budgetExhausted = true;
+        }
+    } catch (error) {
+        stats.errors++;
         console.error(
-            `[tau] sidecar purge failed: ${err instanceof Error ? err.message : String(err)}`
+            `[tau] sidecar purge failed: ${error instanceof Error ? error.message : String(error)}`
         );
+    } finally {
+        try {
+            db?.close();
+        } catch {
+            stats.errors++;
+        }
+        logSidecarPurgeStats(stats, ageDays);
     }
+    return stats;
 }
 
 function sidecarToolListSql(): string {
