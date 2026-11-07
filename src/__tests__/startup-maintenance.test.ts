@@ -858,9 +858,18 @@ exit 0
                 "orphaned reminder restoration must still deliver its notice"
             );
 
+            const agentStart = events.get("agent_start")?.at(-1);
+            const agentEnd = events.get("agent_end")?.at(-1);
+            if (!agentStart || !agentEnd) {
+                throw new Error("agent lifecycle handlers were not registered");
+            }
+            await agentStart({}, ctx);
             Date.now = () => oldDateNow() + fakeTimers.now;
             fakeTimers.advance(4_750);
             Date.now = oldDateNow;
+            assert.equal(sidecarSelects, 0, "purge must not run during a turn");
+            await agentEnd({ messages: [] }, ctx);
+            fakeTimers.advance(5_000);
             await waitFor(() => sidecarSelects === 1);
             assert.equal(sidecarSelects, 1);
             const dbAfterPurge = new DatabaseSync(join(agentDir, "context.db"));

@@ -136,7 +136,10 @@ export default function (pi: ExtensionAPI) {
     let sidecarPurgeCompleted = false;
     let sidecarPurgeTimer: ReturnType<typeof setTimeout> | undefined;
     const MAX_STALE_PURGE_REARMS = 3;
-    const MAX_IDLE_PURGE_RETRIES = 12;
+    const MAX_PURGE_ERROR_RETRIES = 3;
+    const PURGE_ERROR_RETRY_DELAYS = [5_000, 15_000, 45_000] as const;
+    const PURGE_IDLE_RETRY_DELAYS = [5_000, 15_000, 45_000, 120_000] as const;
+    let sidecarPurgeErrors = 0;
     const isStartupActive = (generation: number) =>
         generation === startupGeneration && !sessionShuttingDown;
     const scheduleSidecarPurgeForGeneration = (
@@ -157,18 +160,16 @@ export default function (pi: ExtensionAPI) {
                 if (sidecarPurgeTimer === scheduledTimer)
                     sidecarPurgeTimer = undefined;
                 if (!canRunSidecarPurge(turnProcessing, lastActivityAt)) {
-                    if (idleRetries < MAX_IDLE_PURGE_RETRIES) {
-                        scheduleSidecarPurgeForGeneration(
-                            generation,
-                            5_000,
-                            staleRearms,
-                            idleRetries + 1
-                        );
-                    } else {
-                        console.debug(
-                            "[tau] sidecar purge deferred until a later session: idle retry limit"
-                        );
-                    }
+                    const delay =
+                        PURGE_IDLE_RETRY_DELAYS[
+                            Math.min(idleRetries, PURGE_IDLE_RETRY_DELAYS.length - 1)
+                        ];
+                    scheduleSidecarPurgeForGeneration(
+                        generation,
+                        delay,
+                        staleRearms,
+                        idleRetries + 1
+                    );
                     return;
                 }
                 const stats = await purgeSidecar(undefined, {
@@ -177,6 +178,27 @@ export default function (pi: ExtensionAPI) {
                         canRunSidecarPurge(turnProcessing, lastActivityAt),
                 });
                 if (!isStartupActive(generation)) return;
+                if (stats.errors > 0) {
+                    sidecarPurgeErrors += stats.errors;
+                    if (sidecarPurgeErrors <= MAX_PURGE_ERROR_RETRIES) {
+                        const delay =
+                            PURGE_ERROR_RETRY_DELAYS[sidecarPurgeErrors - 1];
+                        console.error(
+                            `[tau] sidecar purge error retry=${sidecarPurgeErrors}/${MAX_PURGE_ERROR_RETRIES} errors=${sidecarPurgeErrors} delay-ms=${delay}`
+                        );
+                        scheduleSidecarPurgeForGeneration(
+                            generation,
+                            delay,
+                            staleRearms,
+                            0
+                        );
+                    } else {
+                        console.error(
+                            `[tau] sidecar purge retry limit reached failures=${sidecarPurgeErrors}`
+                        );
+                    }
+                    return;
+                }
                 if (stats.budgetExhausted) {
                     scheduleSidecarPurgeForGeneration(
                         generation,
@@ -871,6 +893,14 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     pi.on("agent_end", async (event, ctx) => {
         turnProcessing = false;
         lastActivityAt = Date.now();
+        if (!sidecarPurgeCompleted && !sidecarPurgeTimer) {
+            scheduleSidecarPurgeForGeneration(
+                startupGeneration,
+                5_000,
+                0,
+                0
+            );
+        }
         // Stop timers and clear start time — guaranteed cleanup before
         // any fallible logic below. The interval's self-terminating guard
         // will also catch a surviving interval on its next tick.
