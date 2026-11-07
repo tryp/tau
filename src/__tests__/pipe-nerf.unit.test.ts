@@ -1031,10 +1031,10 @@ void describe("pipe-nerf stage-0 capture", () => {
         }
     });
 
-    void it("records every rewritten pipeline process exit without changing final status", () => {
+    void it("uses the first nonzero stage as the rewritten pipeline exit", () => {
         const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-exits-"));
         const capture = join(dir, "stage-zero.log");
-        const plan = planPipeNerf("printf 'x\\n' | grep absent | tail -1", {
+        const plan = planPipeNerf("false | cat | tail -1", {
             stageZeroPath: capture,
         });
         try {
@@ -1044,12 +1044,94 @@ void describe("pipe-nerf stage-0 capture", () => {
             assert.equal(result.status, 1);
             assert.equal(
                 readFileSync(`${capture}.exits`, "utf8").trim(),
-                "1\t0 0 1"
+                "1\t1 0 0\teffective=1\tstage=1"
             );
             assert.equal(plan.pipelineExitCommands?.[0].length, 3);
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
+    });
+
+    void it("surfaces capture-stage failure even when the limiter succeeds", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-capture-exit-"));
+        const capture = join(dir, "stage-zero.log");
+        const plan = planPipeNerf("true | cat | tail -1", {
+            stageZeroPath: capture,
+        });
+        const helper = new URL(
+            "../features/pipe-nerf/stage0-capture.mjs",
+            import.meta.url
+        ).pathname;
+        const failingCapture = plan.rewritten.replace(
+            `${JSON.stringify(process.execPath)} ${JSON.stringify(helper)} ${JSON.stringify(capture)}`,
+            "/bin/false"
+        );
+        try {
+            const result = spawnSync("bash", ["-c", failingCapture], {
+                encoding: "utf8",
+            });
+            assert.equal(result.status, 1);
+            assert.equal(
+                readFileSync(`${capture}.exits`, "utf8").trim(),
+                "1\t0 1 0\teffective=1\tstage=2"
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("records effective zero when every rewritten stage succeeds", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-exits-ok-"));
+        const capture = join(dir, "stage-zero.log");
+        const plan = planPipeNerf("printf 'x\\n' | cat | tail -1", {
+            stageZeroPath: capture,
+        });
+        try {
+            const result = spawnSync("bash", ["-c", plan.rewritten], {
+                encoding: "utf8",
+            });
+            assert.equal(result.status, 0);
+            assert.equal(
+                readFileSync(`${capture}.exits`, "utf8").trim(),
+                "1\t0 0 0\teffective=0\tstage=0"
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("stops an && chain after a rewritten pipeline's upstream failure", () => {
+        const dir = mkdtempSync(join(tmpdir(), "pipe-nerf-chain-"));
+        const capture = join(dir, "stage-zero.log");
+        const plan = planPipeNerf("true && false | cat | tail -2", {
+            stageZeroPath: capture,
+        });
+        try {
+            const result = spawnSync(
+                "bash",
+                ["-c", `(${plan.rewritten}) && echo SHOULD_NOT_PRINT`],
+                { encoding: "utf8" }
+            );
+            assert.equal(result.status, 1);
+            assert.doesNotMatch(result.stdout, /SHOULD_NOT_PRINT/);
+            assert.equal(
+                readFileSync(`${capture}.exits`, "utf8").trim(),
+                "1\t1 0 0\teffective=1\tstage=1"
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("leaves preserved filtering pipelines with ordinary shell semantics", () => {
+        const command = "printf 'x\\n' | grep absent";
+        const plan = planPipeNerf(command, { stageZeroPath: PATH_0 });
+        assert.equal(plan.rewritten, command);
+        assert.equal(plan.action, "skip");
+        const result = spawnSync("bash", ["-c", command], {
+            encoding: "utf8",
+        });
+        assert.equal(result.status, 1);
     });
 
     void it("does NOT tee when removing the limiter already leaves one command", () => {
@@ -1440,7 +1522,7 @@ void describe("pipe-nerf note", () => {
                     },
                 },
                 pipelineExitLines: [
-                    'Pipeline exits (segment 1): stage 1 "make test 2>&1"=0, stage 2 pipe-hoist capture=0, stage 3 "grep FAILED"=0.',
+                    'Pipeline exits (segment 1): stage 1 "make test 2>&1"=1, stage 2 pipe-hoist capture=0, stage 3 "grep FAILED"=0. Effective exit=1 from stage 1 "make test 2>&1" (first nonzero stage).',
                 ],
                 receiptLines: [
                     `- Search it first: context_search query:"..." source_id:"ctx_bg_post"`,
@@ -1461,7 +1543,10 @@ void describe("pipe-nerf note", () => {
             captured,
             /Stage-0 capture truncated: first 1\.0 MiB at .*last 2\.0 MiB at .*\.tail.*1024 bytes in between are unavailable/
         );
-        assert.match(captured, /Pipeline exits \(segment 1\)/);
+        assert.match(
+            captured,
+            /Pipeline exits \(segment 1\).*Effective exit=1 from stage 1 "make test 2>&1" \(first nonzero stage\)/
+        );
         assert.match(
             captured,
             /Inspect stage-0 with context_search\/context_get\/context_export/
