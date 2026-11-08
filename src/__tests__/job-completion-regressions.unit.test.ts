@@ -1117,3 +1117,125 @@ void describe("job completion regression coverage", () => {
         }
     });
 });
+
+void describe("completion notice audit trail", () => {
+    const telemetry = (
+        entries: { customType: string; data: Record<string, unknown> }[]
+    ) =>
+        entries
+            .filter(
+                (entry) =>
+                    entry.customType === "background-completion-telemetry"
+            )
+            .map((entry) => entry.data);
+
+    void it("stamps a delivered completion with its queue key and a first-send kind", () => {
+        const state = new TauState();
+        const {
+            pi,
+            sentMessages,
+            queuedMessages,
+            processQueuedMessages,
+            appendedEntries,
+        } = registerTestTools(state, { holdFollowUps: true });
+        const job = makeJob({
+            id: "job-audit-first",
+            status: "failed",
+            exitCode: 1,
+        });
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(queuedMessages.length, 1);
+        processQueuedMessages();
+        assert.equal(sentMessages.length, 1);
+
+        const records = telemetry(appendedEntries);
+        const queued = records.find((data) => data.event === "queued");
+        const terminal = records.find(
+            (data) =>
+                data.event === "delivery-terminal" && data.jobId === job.id
+        );
+        assert.ok(queued, "the send must record a queued entry");
+        assert.ok(
+            terminal,
+            "the completed delivery must record a terminal entry"
+        );
+        assert.equal(terminal.reason, "delivered");
+        assert.equal(terminal.sendKind, "first");
+        assert.equal(
+            terminal.queueKey,
+            queued.queueKey,
+            "the terminal record must be joinable to the send that produced it"
+        );
+        const notified = records.find(
+            (data) => data.event === "notify-called" && data.jobId === job.id
+        );
+        assert.equal(notified?.sendKind, "first");
+    });
+
+    void it("labels a restore re-notice and a later re-notification as such", () => {
+        const state = new TauState();
+        const { pi, appendedEntries } = registerTestTools(state, {
+            holdFollowUps: true,
+        });
+        const restored = makeJob({ id: "job-audit-restore", status: "killed" });
+        notifyCompletion(
+            restored,
+            state,
+            pi as never,
+            notificationContext(),
+            "restore"
+        );
+        flushCompletionBatch();
+
+        const late = makeJob({
+            id: "job-audit-renotify",
+            status: "failed",
+            exitCode: 2,
+        });
+        notifyCompletion(late, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        notifyCompletion(late, state, pi as never, notificationContext());
+        flushCompletionBatch();
+
+        const records = telemetry(appendedEntries).filter(
+            (data) => data.event === "notify-called"
+        );
+        assert.equal(
+            records.find((data) => data.jobId === restored.id)?.sendKind,
+            "restore"
+        );
+        const lateRecords = records.filter((data) => data.jobId === late.id);
+        assert.deepEqual(
+            lateRecords.map((data) => data.sendKind),
+            ["first", "renotify"]
+        );
+    });
+
+    void it("keeps one telemetry schema for completion notices", () => {
+        const state = new TauState();
+        const { pi, appendedEntries } = registerTestTools(state, {
+            holdFollowUps: true,
+        });
+        const job = makeJob({
+            id: "job-audit-schema",
+            status: "completed",
+            exitCode: 0,
+        });
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+
+        const unknownTypes = appendedEntries
+            .map((entry) => entry.customType)
+            .filter(
+                (customType) =>
+                    customType !== "background-completion-telemetry" &&
+                    !customType.startsWith("background-")
+            );
+        assert.deepEqual(
+            unknownTypes,
+            [],
+            "completion notices must not grow a second record type"
+        );
+    });
+});

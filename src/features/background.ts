@@ -1755,6 +1755,15 @@ type CompletionBatchItem = {
     /** Session owning this completion, captured before async indexing. */
     sessionId: string;
     /**
+     * Why this notification attempt exists. `first` is the ordinary path,
+     * `restore` is a rearm from a restored/resumed session or a re-armed
+     * trigger, and `renotify` is a later attempt for a job already notified in
+     * this process. Recorded on the telemetry entries so that two terminal
+     * notices for one job read as "restored" or "re-notified" rather than as
+     * an unexplained duplicate.
+     */
+    sendKind: "first" | "restore" | "renotify";
+    /**
      * Jobs still running when THIS job completed, captured here because
      * delivery can be deferred by an agent-busy window for minutes. Counting
      * at delivery time made a notice report a world minutes newer than the
@@ -1962,6 +1971,7 @@ function recordCompletionTelemetry(
         exitCode?: number;
         trigger?: CompletionTrigger;
         observedBy?: CompletionTrigger;
+        sendKind?: CompletionBatchItem["sendKind"];
         outstandingJobs?: number;
         delivery?: "immediate" | "deferred-batch" | "suppressed";
     } = {}
@@ -2017,6 +2027,7 @@ function recordCompletionTelemetry(
                 : {}),
             ...(fields.trigger ? { trigger: fields.trigger } : {}),
             ...(fields.observedBy ? { observedBy: fields.observedBy } : {}),
+            ...(fields.sendKind ? { sendKind: fields.sendKind } : {}),
             ...(fields.outstandingJobs !== undefined
                 ? { outstandingJobs: fields.outstandingJobs }
                 : {}),
@@ -2283,6 +2294,8 @@ function completeCompletionDeliveryHandoff(
                 reason: "cancelled",
                 status: item.job.status,
                 exitCode: item.job.exitCode,
+                queueKey: delivery.queueKey,
+                sendKind: item.sendKind,
             });
         }
         return;
@@ -2304,6 +2317,8 @@ function completeCompletionDeliveryHandoff(
         recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
             reason: "delivered",
             batchSize: delivery.jobs.length,
+            queueKey: delivery.queueKey,
+            sendKind: item.sendKind,
             ageMs:
                 job.endTime === undefined
                     ? undefined
@@ -3211,6 +3226,16 @@ export function notifyCompletion(
         deliveredCompletionIdentities.has(attemptIdentity);
     const suppressed = completionNotifiedJobs.has(job) || alreadyDelivered;
     const rearmTrigger = completionRearmTriggers.get(job);
+    // Computed once and carried on the item, so every downstream record for this
+    // attempt explains the same thing: was this the ordinary notice, a restored
+    // session re-arming it, or a later re-notification of a job already notified
+    // in this process?
+    const sendKind: CompletionBatchItem["sendKind"] =
+        rearmTrigger === "restore" || observedBy === "restore"
+            ? "restore"
+            : notifyGeneration === 1
+              ? "first"
+              : "renotify";
     recordCompletionTelemetry(pi, "notify-called", {
         jobId: job.id,
         sessionId,
@@ -3218,6 +3243,7 @@ export function notifyCompletion(
         jobGeneration: stableGeneration,
         trigger: rearmTrigger ?? observedBy,
         ...(rearmTrigger ? { observedBy } : {}),
+        sendKind,
         outstandingJobs: countOutstandingJobs(state, job.id),
         delivery: suppressed ? "suppressed" : "deferred-batch",
     });
@@ -3308,6 +3334,7 @@ export function notifyCompletion(
             generation: notifyGeneration,
             jobGeneration: stableGeneration,
             sessionId,
+            sendKind,
             outstandingJobs: outstandingJobsAtCompletion,
         });
         completionBatch.pi = pi;
