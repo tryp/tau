@@ -619,10 +619,52 @@ void describe("pipe-nerf compound pipelines", () => {
         for (const command of [
             "seq 1 10 | tail -2; echo done",
             "seq 1 10 | head -2 && echo done",
+            "seq 1 10 | tail -2 || echo fallback",
         ]) {
             const result = plan(command);
             assert.equal(result.action, "skip", command);
             assert.equal(result.rewritten, command);
+        }
+    });
+
+    void it("passes grouped shell commands through unchanged", () => {
+        for (const command of [
+            "(seq 1 10; echo done) | tail -2",
+            "echo $(seq 1 10) | tail -2",
+            "{ seq 1 10; } | tail -2",
+        ]) {
+            const result = plan(command);
+            assert.equal(result.action, "skip", command);
+            assert.equal(result.reason, "grouped-command", command);
+            assert.equal(result.rewritten, command);
+        }
+    });
+
+    void it("passes limiter-stage redirects through unchanged", () => {
+        for (const command of [
+            "seq 1 10 | tail -2 > output.txt",
+            "seq 1 10 | head -n 2 2>&1",
+            "seq 1 10 | sed -n '1,2p' < input.txt",
+        ]) {
+            const result = plan(command);
+            assert.equal(result.action, "skip", command);
+            assert.equal(result.reason, "redirected-limiter", command);
+            assert.equal(result.rewritten, command);
+        }
+    });
+
+    void it("still removes ordinary trailing output limits", () => {
+        for (const command of [
+            "seq 1 10 | tail -2",
+            "seq 1 10 | head -n 2",
+            "seq 1 10 | sed -n '1,2p'",
+        ]) {
+            const result = plan(command);
+            assert.equal(result.action, "rewrite", command);
+            assert.equal(
+                result.rewritten,
+                command.slice(0, command.indexOf(" |"))
+            );
         }
     });
 });
