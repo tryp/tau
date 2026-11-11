@@ -195,6 +195,8 @@ export type SkipReason =
     | `pipe-outside-scope:segment-${number}`
     /** A shell here-document makes the remaining command text data, not code. */
     | "heredoc"
+    | "grouped-command"
+    | "redirected-limiter"
     /** The command scans the directory where pipe-hoist would write its capture. */
     | "capture-directory-reference";
 
@@ -910,11 +912,47 @@ function hasHeredocOperator(command: string): boolean {
     return false;
 }
 
+/** Conservative shell-syntax guard: leave subshells and brace groups alone. */
+function hasShellGroupingSyntax(command: string): boolean {
+    let quote = "";
+    for (let i = 0; i < command.length; i++) {
+        const ch = command[i];
+        if (quote) {
+            if (ch === "\\" && quote !== "'" && i + 1 < command.length) {
+                i += 1;
+            } else if (ch === quote) {
+                quote = "";
+            }
+            continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "\\" && i + 1 < command.length) {
+            i += 1;
+            continue;
+        }
+        if (ch === "(" || ch === ")") return true;
+        if (
+            (ch === "{" || ch === "}") &&
+            (i === 0 || /[\s;&|]/.test(command[i - 1])) &&
+            (i + 1 === command.length || /[\s;&|]/.test(command[i + 1]))
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function planPipeNerfCore(
     command: string,
     options: PipeOptions = {}
 ): PipePlan {
     if (hasHeredocOperator(command)) return skipped(command, "heredoc");
+    if (hasShellGroupingSyntax(command) && lastPipeOperator(command) >= 0) {
+        return skipped(command, "grouped-command");
+    }
 
     // A compound call has more than one independently filtered stream. Removing
     // one limiter and applying its view to the concatenated result would delete
@@ -1038,6 +1076,12 @@ function planPipeNerfCore(
 
     const invocation = findPipeInvocation(command);
     if (!invocation) return skipped(command, "no-pipe");
+
+    // A redirect on the limiter stage belongs to that command, not to the
+    // capture. Removing it would change where the bounded output is sent.
+    const limiterStage = command.slice(invocation.stageStart);
+    if (/[<>]/.test(limiterStage))
+        return skipped(command, "redirected-limiter", invocation);
 
     if (options.enabled === false)
         return skipped(command, "disabled", invocation);

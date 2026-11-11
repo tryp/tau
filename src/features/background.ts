@@ -3847,6 +3847,7 @@ export function registerBackgroundJobs(
                         () => ""
                     );
                     const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
+                    state.pipeHoistedCalls.delete(toolCallId);
                     const stageZero = state.pipeStageZeroCalls.get(toolCallId);
                     const prepared = await prepareInlineOutput(
                         {
@@ -3867,9 +3868,6 @@ export function registerBackgroundJobs(
                         // Index it even when it is under the inline threshold.
                         { force: forcedIndex }
                     );
-                    // The index decision has been made; do not let the flag
-                    // survive to affect a later call.
-                    state.pipeHoistedCalls.delete(toolCallId);
                     let stageZeroSourceId: string | null = null;
                     if (stageZero) {
                         state.pipeStageZeroCalls.delete(toolCallId);
@@ -4051,6 +4049,8 @@ export function registerBackgroundJobs(
                 state.backgroundJobs.delete(jobId);
 
                 const output = await readFile(logPath, "utf-8").catch(() => "");
+                const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
+                state.pipeHoistedCalls.delete(toolCallId);
                 const stageZero = state.pipeStageZeroCalls.get(toolCallId);
                 const prepared = await prepareInlineOutput(
                     {
@@ -4063,7 +4063,7 @@ export function registerBackgroundJobs(
                     ctx,
                     output,
                     "bash",
-                    { force: state.pipeHoistedCalls.has(toolCallId) }
+                    { force: forcedIndex }
                 );
                 // Stage 0 is indexed even when the command FAILED: a failed
                 // build's pre-filter output is still what a re-run would want,
@@ -4083,11 +4083,7 @@ export function registerBackgroundJobs(
                 }
 
                 const details = {
-                    ...preparedOutputDetails(
-                        prepared,
-                        logPath,
-                        state.pipeHoistedCalls.has(toolCallId)
-                    ),
+                    ...preparedOutputDetails(prepared, logPath, forcedIndex),
                     ...(stageZero
                         ? {
                               pipeStageZero: {
@@ -5367,6 +5363,8 @@ async function executeTmuxForeground(
                 2000,
                 tmuxCtx.outputFile
             );
+            const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
+            state.pipeHoistedCalls.delete(toolCallId);
             const prepared = await prepareInlineOutput(
                 {
                     id: jobId,
@@ -5378,7 +5376,7 @@ async function executeTmuxForeground(
                 ctx,
                 output,
                 "bash",
-                { force: state.pipeHoistedCalls.has(toolCallId) }
+                { force: forcedIndex }
             );
             // Stage 0's pre-filter capture, indexed on the same terms as the
             // command's own output. The tmux backend is the default when tmux
@@ -5405,11 +5403,7 @@ async function executeTmuxForeground(
             // deadlocks (child exits but parent waitpid never returns).
             killWindow(tmuxCtx.windowId);
             const tmuxDetails = {
-                ...preparedOutputDetails(
-                    prepared,
-                    logPath,
-                    state.pipeHoistedCalls.has(toolCallId)
-                ),
+                ...preparedOutputDetails(prepared, logPath, forcedIndex),
                 ...(tmuxStageZero
                     ? {
                           pipeStageZero: {
@@ -5646,6 +5640,8 @@ async function executeTmuxForeground(
             2000,
             tmuxCtx.outputFile
         );
+        const forcedIndex = state.pipeHoistedCalls.has(toolCallId);
+        state.pipeHoistedCalls.delete(toolCallId);
         const raceStageZero = state.pipeStageZeroCalls.get(toolCallId);
         const prepared = await prepareInlineOutput(
             {
@@ -5658,7 +5654,7 @@ async function executeTmuxForeground(
             ctx,
             output,
             "bash",
-            { force: state.pipeHoistedCalls.has(toolCallId) }
+            { force: forcedIndex }
         );
         let raceStageZeroSourceId: string | null = null;
         if (raceStageZero) {
@@ -5677,11 +5673,7 @@ async function executeTmuxForeground(
         // state accumulation that causes waitpid deadlocks.
 
         const raceDetails = {
-            ...preparedOutputDetails(
-                prepared,
-                logPath,
-                state.pipeHoistedCalls.has(toolCallId)
-            ),
+            ...preparedOutputDetails(prepared, logPath, forcedIndex),
             ...(raceStageZero
                 ? {
                       pipeStageZero: {
