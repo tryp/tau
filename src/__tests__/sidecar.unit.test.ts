@@ -1,11 +1,17 @@
 import { describe, it, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { spawn } from "node:child_process";
+import { register_context_sidecar_owner } from "@spences10/pi-context";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
@@ -19,12 +25,10 @@ import {
     trackJobOutputIndex,
 } from "../features/background.ts";
 import {
-    chunkText,
     formatSidecarReceipt,
     INLINE_CONTEXT_MAX_LINES,
     INLINE_FALLBACK_MAX_CHARS,
     prepareInlineOutput,
-    purgeSidecar,
 } from "../features/sidecar.ts";
 import type { BackgroundJob } from "../types.ts";
 import { planPipeNerf } from "../features/pipe-nerf/parse.ts";
@@ -85,6 +89,9 @@ END;
 `;
 
 let tmpDir: string;
+let closeOwner: (() => Promise<void>) | undefined;
+const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+const priorContextDb = process.env.MY_PI_CONTEXT_DB;
 
 /** Create a temp directory for an isolated context.db. */
 function setupTempDir(): string {
@@ -170,10 +177,17 @@ beforeEach(() => {
     resetSidecarIndexStats();
     tmpDir = setupTempDir();
     process.env.PI_CODING_AGENT_DIR = tmpDir;
+    process.env.MY_PI_CONTEXT_DB = join(tmpDir, "context.db");
+    closeOwner = register_context_sidecar_owner();
 });
 
-afterEach(() => {
-    delete process.env.PI_CODING_AGENT_DIR;
+afterEach(async () => {
+    await closeOwner?.();
+    closeOwner = undefined;
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    if (priorContextDb === undefined) delete process.env.MY_PI_CONTEXT_DB;
+    else process.env.MY_PI_CONTEXT_DB = priorContextDb;
     rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -316,7 +330,7 @@ void describe("indexJobOutputInSidecar", () => {
             job,
             { cwd: tmpDir },
             "bash_bg",
-            { useExternalApi: false }
+            {}
         );
         assert.equal(outcome.status, "indexed");
         assert.ok(outcome.source, "the job must have a sidecar source");
@@ -341,7 +355,7 @@ void describe("indexJobOutputInSidecar", () => {
             job,
             { cwd: tmpDir },
             "bash_bg",
-            { useExternalApi: false }
+            {}
         );
         assert.equal(outcome.status, "indexed");
         assert.equal(
@@ -350,28 +364,47 @@ void describe("indexJobOutputInSidecar", () => {
         );
     });
 
-    void it("classifies an unavailable sidecar without failing the job", async () => {
+    void it("persists an unavailable-owner skip counter without opening the DB", async () => {
+        await closeOwner?.();
+        closeOwner = undefined;
+        const entries: { type: string; data: Record<string, unknown> }[] = [];
+        const failureLogPath = join(tmpDir, "owner-unavailable.jsonl");
         const job = testJob({ id: "job-skip-1", logPath: writeLog("hello") });
-        const outcome = await indexJobOutputWithOutcome(job, {});
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            {
+                appendEntry: (type, data) =>
+                    entries.push({
+                        type,
+                        data: data as Record<string, unknown>,
+                    }),
+            },
+            "bash_bg",
+            { failureLogPath }
+        );
         assert.deepEqual(outcome, {
             status: "skipped",
             eligible: true,
             reason: "sidecar_unavailable",
             errorCategory: "unavailable",
         });
-        assert.deepEqual(getSidecarIndexStats(), {
-            attempts: 1,
-            eligible: 1,
-            indexed: 0,
-            skipped: 1,
-            failed: 0,
-            missingLogSkipped: 0,
-            entriesDroppedWhenCtxStale: 0,
-            emptySkipped: 0,
-            unavailableSkipped: 1,
-            schemaSkipped: 0,
-            staleSessionIdentity: 0,
-        });
+        assert.equal(getSidecarIndexStats().unavailableSkipped, 1);
+        assert.deepEqual(entries, [
+            {
+                type: "sidecar-index-owner-unavailable",
+                data: {
+                    jobId: "job-skip-1",
+                    reason: "owner_unavailable",
+                    detail: "pi-context owner descriptor unavailable",
+                    unavailableSkipped: 1,
+                },
+            },
+        ]);
+        assert.match(
+            readFileSync(failureLogPath, "utf8"),
+            /"unavailableSkipped":1/
+        );
+        assert.equal(existsSync(join(tmpDir, "context.db")), false);
     });
 
     void it("classifies empty output as intentionally ineligible", async () => {
@@ -384,7 +417,6 @@ void describe("indexJobOutputInSidecar", () => {
             reason: "empty_output",
         });
         assert.equal(getSidecarIndexStats().emptySkipped, 1);
-        assert.equal(getSidecarIndexStats().schemaSkipped, 0);
         assert.equal(getSidecarIndexStats().eligible, 0);
     });
 
@@ -409,7 +441,6 @@ void describe("indexJobOutputInSidecar", () => {
             entriesDroppedWhenCtxStale: 0,
             emptySkipped: 0,
             unavailableSkipped: 0,
-            schemaSkipped: 0,
             staleSessionIdentity: 0,
         });
     });
@@ -535,12 +566,12 @@ void describe("indexJobOutputInSidecar", () => {
         assert.ok(outcome.source?.sourceId);
     });
 
-    void it("keeps the legacy source-only API compatible", async () => {
+    void it("keeps the legacy source-only API compatible through the owner", async () => {
         const job = testJob({
             id: "job-skip-legacy",
             logPath: writeLog("hello"),
         });
-        assert.equal(await indexJobOutputInSidecar(job, {}), undefined);
+        assert.ok(await indexJobOutputInSidecar(job, {}));
     });
 
     void it("skips silently when context_sources table does not exist", async () => {
@@ -582,19 +613,13 @@ void describe("indexJobOutputInSidecar", () => {
         });
         await indexJobOutputInSidecar(job, { cwd: tmpDir });
 
-        // When the pi-context external API is available it applies the full
-        // schema and writes successfully (1 source). In environments without
-        // pi-context the direct fallback rolls back (0 sources). Both outcomes
-        // are acceptable — the important thing is no uncaught exception.
+        // The owner repairs the schema and indexes the source through its store.
         const check = new DatabaseSync(join(tmpDir, "context.db"), {});
         const count = check
             .prepare("SELECT COUNT(*) AS count FROM context_sources")
             .get() as { count: number };
         check.close();
-        assert.ok(
-            count.count === 0 || count.count === 1,
-            `expected 0 or 1 source, got ${count.count}`
-        );
+        assert.equal(count.count, 1);
     });
 
     void it("skips empty log files", async () => {
@@ -613,24 +638,13 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(count.cnt, 0);
     });
 
-    void it("chunks long lines without dropping text", () => {
-        const text = "prefix\n" + "x".repeat(5000) + "\ntrailing";
-        const chunks = chunkText(text, "ctx_bg_test");
-        assert.equal(chunks.map((chunk) => chunk.content).join(""), text);
-        assert.ok(chunks.every((chunk) => chunk.byteCount <= 4096));
-        assert.deepEqual(
-            chunks.map((chunk) => chunk.ordinal),
-            chunks.map((_, index) => index + 1)
-        );
-    });
-
     void it("indexes a job's output as source + chunks", async () => {
         createDb(tmpDir);
         const output = "hello world\nsecond line\nthird line";
         const job = testJob({ id: "job-index-1", logPath: writeLog(output) });
         const sourceId = await indexJobOutputInSidecar(job, { cwd: tmpDir });
-        assert.ok(sourceId?.startsWith("ctx_bg_"));
-        assert.equal(findJobSourceIdInSidecar(job.id), sourceId);
+        assert.ok(sourceId?.startsWith("ctx_"));
+        assert.equal(await findJobSourceIdInSidecar(job.id), sourceId);
 
         // Check source was inserted
         const check = new DatabaseSync(join(tmpDir, "context.db"));
@@ -666,7 +680,10 @@ void describe("indexJobOutputInSidecar", () => {
 
     void it("indexes output larger than the former 4 MiB cap", async () => {
         createDb(tmpDir);
-        const output = `agent-large-token ${"x".repeat(4 * 1024 * 1024 + 1)}`;
+        const output = `agent-large-token\n${Array.from(
+            { length: 8_192 },
+            (_, index) => `log event ${index} ${"x".repeat(500)}`
+        ).join("\n")}`;
         const job = testJob({
             id: "job-large-agent",
             command: "agent --inspect",
@@ -684,7 +701,7 @@ void describe("indexJobOutputInSidecar", () => {
             (await readJobOutputFromSidecar(job.id))?.length,
             output.length
         );
-        const matches = searchSidecarSources("agent-large-token", {
+        const matches = await searchSidecarSources("agent-large-token", {
             toolNames: ["agent_bg"],
         });
         assert.equal(matches.length, 1);
@@ -721,7 +738,11 @@ void describe("indexJobOutputInSidecar", () => {
 
     void it("returns a compact receipt for large foreground output", async () => {
         createDb(tmpDir);
-        const output = `ERROR: foreground-large-token\n${"x".repeat(40_000)}`;
+        const output = Array.from(
+            { length: 200 },
+            (_, index) =>
+                `${index === 0 ? "ERROR: foreground-large-token" : `line ${index}`} ${"x".repeat(190)}`
+        ).join("\n");
         const job = testJob({
             id: "job-large-foreground",
             logPath: writeLog(output),
@@ -732,17 +753,17 @@ void describe("indexJobOutputInSidecar", () => {
             { cwd: tmpDir },
             output,
             "bash",
-            { useExternalApi: false }
+            {}
         );
 
         assert.equal(prepared.truncated, true);
         assert.equal(prepared.partial, true);
         assert.equal(prepared.byteCount, Buffer.byteLength(output, "utf8"));
-        assert.equal(prepared.totalLines, 2);
+        assert.equal(prepared.totalLines, 200);
         assert.equal(prepared.empty, false);
         assert.ok(prepared.source);
         assert.match(prepared.text, /\[context-sidecar\]/);
-        assert.match(prepared.text, /Severity: 1 err, 0 warn of 2 lines/);
+        assert.match(prepared.text, /Severity: 1 err, 0 warn of 200 lines/);
         assert.ok(prepared.text.length < 10_000);
         assert.equal(await readJobOutputFromSidecar(job.id), output);
         const check = new DatabaseSync(join(tmpDir, "context.db"));
@@ -759,15 +780,16 @@ void describe("indexJobOutputInSidecar", () => {
             | undefined;
         assert.equal(severity?.err_line_count, 1);
         assert.equal(severity?.warn_line_count, 0);
-        assert.equal(severity?.classified_line_count, 2);
+        assert.equal(severity?.classified_line_count, 200);
         check.close();
     });
 
-    void it("keeps indexing when the severity table is unavailable", async () => {
-        const db = createDb(tmpDir);
-        db.exec("DROP TABLE context_source_severity");
-        db.close();
-        const output = `ERROR: old sidecar schema\n${"x".repeat(40_000)}`;
+    void it("lets the owner initialize its schema when no database exists", async () => {
+        const output = Array.from(
+            { length: 200 },
+            (_, index) =>
+                `${index === 0 ? "ERROR: owner-initialized-schema" : `line ${index}`} ${"x".repeat(190)}`
+        ).join("\n");
         const job = testJob({
             id: "job-severity-write-failure",
             logPath: writeLog(output),
@@ -777,18 +799,20 @@ void describe("indexJobOutputInSidecar", () => {
             { cwd: tmpDir },
             output,
             "bash",
-            {
-                useExternalApi: false,
-            }
+            {}
         );
         assert.ok(prepared.source);
-        assert.match(prepared.text, /Severity: 1 err, 0 warn of 2 lines/);
+        assert.match(prepared.text, /Severity: 1 err, 0 warn of 200 lines/);
         assert.equal(await readJobOutputFromSidecar(job.id), output);
     });
 
     void it("keeps indexing and the legacy receipt when classification throws", async () => {
         createDb(tmpDir);
-        const output = `ERROR: classifier test\n${"x".repeat(40_000)}`;
+        const output = Array.from(
+            { length: 200 },
+            (_, index) =>
+                `${index === 0 ? "ERROR: classifier test" : `line ${index}`} ${"x".repeat(190)}`
+        ).join("\n");
         const job = testJob({
             id: "job-classify-failure",
             logPath: writeLog(output),
@@ -799,7 +823,6 @@ void describe("indexJobOutputInSidecar", () => {
             output,
             "bash",
             {
-                useExternalApi: false,
                 classify: () => {
                     throw new Error("classifier unavailable");
                 },
@@ -816,7 +839,9 @@ void describe("indexJobOutputInSidecar", () => {
                 "SELECT COUNT(*) AS count FROM context_source_severity WHERE source_id = ?"
             )
             .get(prepared.source?.sourceId) as { count: number };
-        assert.equal(severity.count, 0);
+        // The owner store classifies and persists severities independently of
+        // tau's optional receipt classifier.
+        assert.equal(severity.count, 1);
         check.close();
     });
 
@@ -865,72 +890,9 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(await readJobOutputFromSidecar(job.id), output);
     });
 
-    void it("waits for a concurrent writer and records the retry wait", async () => {
-        const db = createDb(tmpDir);
-        db.close();
-        const configured = new DatabaseSync(join(tmpDir, "context.db"), {
-            enableForeignKeyConstraints: true,
-            timeout: 5_000,
-        });
-        assert.equal(
-            (
-                configured.prepare("PRAGMA busy_timeout").get() as {
-                    timeout: number;
-                }
-            ).timeout,
-            5_000
-        );
-        configured.close();
-        const dbPath = join(tmpDir, "context.db");
-        const holder = spawn(
-            process.execPath,
-            [
-                "-e",
-                `const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); process.stdout.write('LOCKED'); setTimeout(() => { db.exec('COMMIT'); db.close(); }, 400);`,
-                dbPath,
-            ],
-            { stdio: ["ignore", "pipe", "inherit"] }
-        );
-        await new Promise<void>((resolve, reject) => {
-            let output = "";
-            holder.stdout.on("data", (chunk: Buffer) => {
-                output += chunk.toString();
-                if (output.includes("LOCKED")) resolve();
-            });
-            holder.once("error", reject);
-            holder.once("exit", (code) => {
-                if (code !== 0) reject(new Error(`lock holder exited ${code}`));
-            });
-        });
-        const job = testJob({
-            id: "job-lock-wait",
-            logPath: writeLog("waited output"),
-        });
-        const telemetry: { type: string; data: unknown }[] = [];
-        const outcome = await indexJobOutputWithOutcome(
-            job,
-            { appendEntry: (type, data) => telemetry.push({ type, data }) },
-            "bash",
-            { useExternalApi: false }
-        );
-        assert.equal(outcome.status, "indexed");
-        assert.equal(outcome.retryCount, 1);
-        assert.ok((outcome.waitMs ?? 0) >= 300, `waitMs=${outcome.waitMs}`);
-        assert.equal(telemetry[0]?.type, "sidecar-index-wait");
-        assert.ok(telemetry[0]?.data);
-        await new Promise<void>((resolve, reject) => {
-            holder.once("exit", (code) =>
-                code === 0 ? resolve() : reject(new Error(`exit ${code}`))
-            );
-        });
-    });
-
-    void it("persists every failure when stale appendEntry drops it and counts the drops", async () => {
-        const db = createDb(tmpDir);
-        db.exec(
-            `CREATE TRIGGER reject_chunk BEFORE INSERT ON context_chunks BEGIN SELECT RAISE(ABORT, 'fixture sqlite failure'); END;`
-        );
-        db.close();
+    void it("counts unavailable-owner skips when stale appendEntry rejects entries", async () => {
+        await closeOwner?.();
+        closeOwner = undefined;
         const job = testJob({
             id: "job-sqlite-error",
             logPath: writeLog("fixture output"),
@@ -945,19 +907,18 @@ void describe("indexJobOutputInSidecar", () => {
         };
         const failureLogPath = join(tmpDir, "sidecar-failures.jsonl");
         const first = await indexJobOutputWithOutcome(job, context, "bash", {
-            useExternalApi: false,
             failureLogPath,
         });
         const second = await indexJobOutputWithOutcome(
             { ...job, id: "job-sqlite-error-2" },
             context,
             "bash",
-            { useExternalApi: false, failureLogPath }
+            { failureLogPath }
         );
-        assert.equal(first.status, "failed");
-        assert.match(first.errorMessage ?? "", /fixture sqlite failure/);
-        assert.ok(first.errorCode);
-        assert.equal(second.status, "failed");
+        assert.equal(first.status, "skipped");
+        assert.equal(first.reason, "sidecar_unavailable");
+        assert.equal(second.status, "skipped");
+        assert.equal(getSidecarIndexStats().unavailableSkipped, 2);
         assert.equal(getSidecarIndexStats().entriesDroppedWhenCtxStale, 2);
         const lines = readFileSync(failureLogPath, "utf8")
             .trim()
@@ -965,12 +926,12 @@ void describe("indexJobOutputInSidecar", () => {
             .map(
                 (line) =>
                     JSON.parse(line) as {
-                        entries_dropped_when_ctx_stale: number;
+                        unavailableSkipped: number;
                     }
             );
         assert.equal(lines.length, 2);
         assert.deepEqual(
-            lines.map((line) => line.entries_dropped_when_ctx_stale),
+            lines.map((line) => line.unavailableSkipped),
             [1, 2]
         );
     });
@@ -979,6 +940,8 @@ void describe("indexJobOutputInSidecar", () => {
         // A forced index must never make the result worse: if the sidecar is
         // unavailable, the output is returned as-is rather than replaced by a
         // receipt that points nowhere.
+        await closeOwner?.();
+        closeOwner = undefined;
         const output = Array.from(
             { length: 60 },
             (_, i) => `line-${i + 1}`
@@ -998,7 +961,9 @@ void describe("indexJobOutputInSidecar", () => {
     });
 
     void it("bounds large foreground output when the sidecar is unavailable", async () => {
-        const output = `fallback-token\n${"x".repeat(40_000)}`;
+        await closeOwner?.();
+        closeOwner = undefined;
+        const output = `fallback-token\n${Array.from({ length: 200 }, (_, i) => `line-${i}-${"x".repeat(180)}`).join("\n")}`;
         const job = testJob({
             id: "job-large-fallback",
             logPath: writeLog(output),
@@ -1030,8 +995,9 @@ void describe("indexJobOutputInSidecar", () => {
             )
             .all() as { id: string; returned_byte_count: number }[];
         assert.equal(sources.length, 1);
-        // Indexing is internal maintenance, not a context read.
-        assert.equal(sources[0].returned_byte_count, 0);
+        // The owner returns the stable source ID; reading it through the client
+        // may update its own retrieval accounting, which tau does not own.
+        assert.ok(sources[0].returned_byte_count >= 0);
         check.close();
     });
 
@@ -1050,9 +1016,9 @@ void describe("indexJobOutputInSidecar", () => {
         assert.ok(first);
         assert.ok(second);
         assert.notEqual(first, second);
-        assert.equal(findJobSourceIdInSidecar(firstJob.id), first);
-        assert.equal(findJobSourceIdInSidecar(secondJob.id), second);
-        const details = findJobSourceDetailsInSidecar(secondJob.id);
+        assert.equal(await findJobSourceIdInSidecar(firstJob.id), first);
+        assert.equal(await findJobSourceIdInSidecar(secondJob.id), second);
+        const details = await findJobSourceDetailsInSidecar(secondJob.id);
         assert.deepEqual(details?.chunkIds.length, 1);
     });
 
@@ -1063,7 +1029,7 @@ void describe("indexJobOutputInSidecar", () => {
             logPath: writeLog("searchable diagnostic output"),
         });
         const sourceId = await indexJobOutputInSidecar(job, { cwd: tmpDir });
-        const matches = searchSidecarSources("diagnostic", {
+        const matches = await searchSidecarSources("diagnostic", {
             toolNames: ["bash_bg"],
         });
         assert.equal(matches.length, 1);
@@ -1080,7 +1046,7 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(ftsMatches.length, 1);
         db.close();
 
-        const noMatch = searchSidecarSources("diagnostic", {
+        const noMatch = await searchSidecarSources("diagnostic", {
             toolNames: ["agent_bg"],
         });
         assert.equal(noMatch.length, 0);
@@ -1226,302 +1192,6 @@ void describe("sidecar missing-data compatibility", () => {
             isBackgrounded: true,
         };
         await indexJobOutputInSidecar(job, {});
-    });
-});
-
-void describe("sidecar purge maintenance regressions", () => {
-    void it("deletes stale sources and their chunks in bounded slabs, retaining fresh and unrelated rows", async () => {
-        const db = createDb(tmpDir);
-        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
-        const staleId = insertSource(db, {
-            id: "stale-with-many-chunks",
-            created_at: cutoff,
-        });
-        for (let ordinal = 0; ordinal < 501; ordinal++)
-            insertChunk(db, staleId, ordinal, `chunk-${ordinal}`);
-        insertSource(db, {
-            id: "fresh-source",
-            created_at: Date.now(),
-        });
-        db.prepare(
-            `INSERT INTO context_sources
-             (id, session_id, project_path, tool_name, input_summary, created_at,
-              byte_count, line_count, content_hash, preview_byte_count, returned_byte_count)
-             VALUES ('unrelated-tool', NULL, NULL, 'other', '{}', ?, 1, 1, 'other', 0, 0)`
-        ).run(cutoff);
-        db.close();
-        let yields = 0;
-
-        const stats = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-            sliceBudgetMs: 0,
-            yieldToEventLoop: async () => {
-                yields++;
-            },
-            vacuumPagesPerStep: 0,
-        });
-        const check = new DatabaseSync(join(tmpDir, "context.db"));
-        const remaining = check
-            .prepare("SELECT id FROM context_sources ORDER BY id")
-            .all() as Array<{ id: string }>;
-        const chunks = check
-            .prepare("SELECT COUNT(*) AS count FROM context_chunks")
-            .get() as { count: number };
-        check.close();
-        assert.equal(stats.sourcesRemoved, 1);
-        assert.equal(stats.chunksRemoved, 501);
-        assert.ok(
-            yields > 0,
-            "large deletion must yield between bounded slabs"
-        );
-        assert.deepEqual(
-            remaining.map((row) => row.id),
-            ["fresh-source", "unrelated-tool"]
-        );
-        assert.equal(chunks.count, 0);
-    });
-
-    void it("resumes stale-source cleanup after its pass budget is exhausted", async () => {
-        const db = createDb(tmpDir);
-        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
-        for (let index = 0; index < 4; index++)
-            insertSource(db, { id: `budget-${index}`, created_at: cutoff });
-        db.close();
-        let now = 0;
-        const options = {
-            dbPath: join(tmpDir, "context.db"),
-            batchSize: 1,
-            sliceBudgetMs: 0,
-            totalBudgetMs: 1,
-            now: () => now,
-            yieldToEventLoop: async () => {
-                now++;
-            },
-            vacuumPagesPerStep: 0,
-        };
-        const first = await purgeSidecar(30, options);
-        assert.equal(first.budgetExhausted, true);
-        assert.equal(first.sourcesRemoved, 1);
-        let pending = new DatabaseSync(join(tmpDir, "context.db"));
-        assert.equal(
-            (
-                pending
-                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
-                    .get() as { count: number }
-            ).count,
-            3
-        );
-        pending.close();
-
-        const resumed = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-            vacuumPagesPerStep: 0,
-        });
-        assert.equal(resumed.sourcesRemoved, 3);
-        pending = new DatabaseSync(join(tmpDir, "context.db"));
-        assert.equal(
-            (
-                pending
-                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
-                    .get() as { count: number }
-            ).count,
-            0
-        );
-        pending.close();
-    });
-
-    void it("paginates a large stale-source set and yields between pages", async () => {
-        const db = createDb(tmpDir);
-        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
-        for (let index = 0; index < 205; index++)
-            insertSource(db, {
-                id: `paged-${String(index).padStart(3, "0")}`,
-                created_at: cutoff,
-            });
-        db.close();
-        let yields = 0;
-        const stats = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-            batchSize: 50,
-            sliceBudgetMs: 0,
-            yieldToEventLoop: async () => {
-                yields++;
-            },
-            vacuumPagesPerStep: 0,
-        });
-        assert.equal(stats.pages, 2);
-        assert.equal(stats.sourcesConsidered, 205);
-        assert.equal(stats.sourcesRemoved, 205);
-        assert.ok(yields > 1, "purge must yield throughout a multi-page pass");
-    });
-
-    void it("allows a real timer to fire while purge work remains", async () => {
-        const db = createDb(tmpDir);
-        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
-        for (let index = 0; index < 205; index++)
-            insertSource(db, {
-                id: `timer-${String(index).padStart(3, "0")}`,
-                created_at: cutoff,
-            });
-        db.close();
-        const dbPath = join(tmpDir, "context.db");
-        let purgeCompleted = false;
-        let timerFiredWhileWorkRemained = false;
-        let yields = 0;
-        const stats = await purgeSidecar(30, {
-            dbPath,
-            batchSize: 1,
-            sliceBudgetMs: 0,
-            yieldToEventLoop: async () => {
-                yields++;
-                if (yields === 1) {
-                    await new Promise<void>((resolve) => {
-                        setTimeout(() => {
-                            const check = new DatabaseSync(dbPath);
-                            const remaining = check
-                                .prepare(
-                                    "SELECT COUNT(*) AS count FROM context_sources"
-                                )
-                                .get() as { count: number };
-                            check.close();
-                            timerFiredWhileWorkRemained =
-                                !purgeCompleted && remaining.count > 0;
-                            resolve();
-                        }, 0);
-                    });
-                } else {
-                    await new Promise<void>((resolve) => setImmediate(resolve));
-                }
-            },
-            vacuumPagesPerStep: 0,
-        });
-        purgeCompleted = true;
-        assert.equal(stats.sourcesRemoved, 205);
-        assert.ok(yields > 1, "purge should continue through multiple slices");
-        assert.equal(
-            timerFiredWhileWorkRemained,
-            true,
-            "a real timer must fire before the purge has completed its remaining work"
-        );
-    });
-
-    void it("pauses between purge slices when turn processing begins", async () => {
-        const db = createDb(tmpDir);
-        const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
-        for (let index = 0; index < 3; index++)
-            insertSource(db, { id: `pause-${index}`, created_at: cutoff });
-        db.close();
-        let canContinue = true;
-        const first = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-            batchSize: 1,
-            sliceBudgetMs: 0,
-            totalBudgetMs: 100,
-            shouldContinue: () => canContinue,
-            yieldToEventLoop: async () => {
-                canContinue = false;
-            },
-            vacuumPagesPerStep: 0,
-        });
-        assert.equal(first.budgetExhausted, true);
-        assert.equal(first.sourcesRemoved, 1);
-        const check = new DatabaseSync(join(tmpDir, "context.db"));
-        assert.equal(
-            (
-                check
-                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
-                    .get() as { count: number }
-            ).count,
-            2
-        );
-        check.close();
-    });
-
-    void it("does not scan a database containing no stale bash_bg sources", async () => {
-        const db = createDb(tmpDir);
-        db.prepare(
-            `INSERT INTO context_sources
-             (id, session_id, project_path, tool_name, input_summary, created_at,
-              byte_count, line_count, content_hash, preview_byte_count, returned_byte_count)
-             VALUES ('only-other-tool', NULL, NULL, 'other', '{}', ?, 1, 1, 'other', 0, 0)`
-        ).run(Date.now() - 31 * 24 * 60 * 60 * 1000);
-        db.close();
-        const stats = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-        });
-        assert.equal(stats.sourcesConsidered, 0);
-        assert.equal(stats.sourcesRemoved, 0);
-    });
-
-    void it("returns harmlessly when the sidecar database does not exist", async () => {
-        const stats = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "missing-context.db"),
-        });
-        assert.equal(stats.errors, 0);
-        assert.equal(stats.sourcesRemoved, 0);
-
-        const db = createDb(tmpDir);
-        db.close();
-        const empty = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-        });
-        assert.equal(empty.errors, 0);
-        assert.equal(empty.sourcesRemoved, 0);
-
-        const freshDb = new DatabaseSync(join(tmpDir, "context.db"));
-        insertSource(freshDb, {
-            id: "all-fresh-source",
-            created_at: Date.now(),
-        });
-        freshDb.close();
-        const allFresh = await purgeSidecar(30, {
-            dbPath: join(tmpDir, "context.db"),
-        });
-        assert.equal(allFresh.errors, 0);
-        assert.equal(allFresh.sourcesRemoved, 0);
-        const verify = new DatabaseSync(join(tmpDir, "context.db"));
-        assert.equal(
-            (
-                verify
-                    .prepare("SELECT COUNT(*) AS count FROM context_sources")
-                    .get() as { count: number }
-            ).count,
-            1
-        );
-        verify.close();
-    });
-
-    void it("does not start a direct purge while maintenance is disabled", async () => {
-        const previous = process.env.PI_TAU_MAINTENANCE_DISABLE;
-        process.env.PI_TAU_MAINTENANCE_DISABLE = "1";
-        try {
-            const db = createDb(tmpDir);
-            insertSource(db, {
-                id: "disabled-stale",
-                created_at: Date.now() - 31 * 24 * 60 * 60 * 1000,
-            });
-            db.close();
-            const stats = await purgeSidecar(30, {
-                dbPath: join(tmpDir, "context.db"),
-            });
-            assert.equal(stats.sourcesRemoved, 0);
-            const check = new DatabaseSync(join(tmpDir, "context.db"));
-            assert.equal(
-                (
-                    check
-                        .prepare(
-                            "SELECT COUNT(*) AS count FROM context_sources"
-                        )
-                        .get() as { count: number }
-                ).count,
-                1
-            );
-            check.close();
-        } finally {
-            if (previous === undefined)
-                delete process.env.PI_TAU_MAINTENANCE_DISABLE;
-            else process.env.PI_TAU_MAINTENANCE_DISABLE = previous;
-        }
     });
 });
 

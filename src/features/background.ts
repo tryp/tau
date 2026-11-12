@@ -37,10 +37,10 @@ import { recordMaintenanceEvent } from "../maintenance/events.ts";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
+    deleteSidecarSource,
     getSidecarIndexStats,
     indexJobOutputInSidecar,
     indexJobOutputWithOutcome,
-    purgeSidecar,
     resetSidecarIndexStats,
     readJobOutputDetailsFromSidecar,
     prepareInlineOutput,
@@ -50,12 +50,12 @@ import {
 } from "./sidecar.ts";
 
 export {
+    deleteSidecarSource,
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
     getSidecarIndexStats,
     indexJobOutputInSidecar,
     indexJobOutputWithOutcome,
-    purgeSidecar,
     resetSidecarIndexStats,
     readJobOutputDetailsFromSidecar,
     prepareInlineOutput,
@@ -1420,7 +1420,7 @@ async function sourceDetailsForJob(
     if (job.sourceId) {
         return { sourceId: job.sourceId, chunkIds: job.chunkIds ?? [] };
     }
-    return findJobSourceDetailsInSidecar(job.id) ?? undefined;
+    return (await findJobSourceDetailsInSidecar(job.id)) ?? undefined;
 }
 
 function outputDetails(
@@ -1621,7 +1621,7 @@ async function indexStageZeroCapture(
             },
             ctx,
             "bash",
-            { force: true, useExternalApi: false }
+            { force: true }
         );
         const sourceId = outcome.source?.sourceId ?? null;
         if (sourceId) {

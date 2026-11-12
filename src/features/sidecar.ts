@@ -2,19 +2,21 @@
  * Context sidecar integration — shared by bash_bg, agent_bg, and tmux
  * background paths.
  *
- * Writes job output directly to the pi-context sidecar's context.db using
- * the same schema, so context_search / context_get / context_list can find
- * completed job output. Skips silently if the DB or sidecar tables don't
- * exist (sidecar not loaded).
+ * Uses pi-context's owner client for indexing and retrieval. Tau never opens
+ * or inspects the owner database; when the owner is absent, indexing is skipped
+ * and the unavailable counter is persisted with the session entry.
  */
 
-import { existsSync } from "node:fs";
 import { appendFile, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
-import { setImmediate as yieldImmediate } from "node:timers/promises";
-import { createHash, randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { tmpdir } from "node:os";
+import type {
+    ContextExternalSource,
+    ContextPurgeDetails,
+    ContextSidecarClient,
+    SidecarOwnerResult,
+    StoreContextInput,
+} from "@spences10/pi-context";
 import type {
     JobOutputIndex,
     SidecarIndexOutcome,
@@ -32,11 +34,8 @@ export const INLINE_CONTEXT_MAX_BYTES = 24 * 1024;
 export const INLINE_CONTEXT_MAX_LINES = 300;
 export const INLINE_FALLBACK_MAX_CHARS = 12_000;
 
-/** Default age (days) for purging sidecar entries at startup. */
-const SIDECAR_PURGE_AGE_DAYS = 10;
-
-/** Tool names this module owns for retention/purge. */
-const SIDECAR_TOOL_NAMES = ["bash_bg", "agent_bg"] as const;
+/** Tool names this module indexes and searches. */
+const SIDECAR_TOOL_NAMES = ["bash", "bash_bg", "agent_bg"] as const;
 /** Tool names searchable through this adapter, including foreground bash. */
 const SIDECAR_SEARCH_TOOL_NAMES = ["bash", ...SIDECAR_TOOL_NAMES] as const;
 
@@ -76,7 +75,6 @@ let sidecarIndexStats: SidecarIndexStats = {
     entriesDroppedWhenCtxStale: 0,
     emptySkipped: 0,
     unavailableSkipped: 0,
-    schemaSkipped: 0,
     staleSessionIdentity: 0,
 };
 
@@ -172,481 +170,223 @@ export function resetSidecarIndexStats(): void {
         entriesDroppedWhenCtxStale: 0,
         emptySkipped: 0,
         unavailableSkipped: 0,
-        schemaSkipped: 0,
         staleSessionIdentity: 0,
     };
 }
 
-/**
- * Build the path to the context sidecar's SQLite database.
- */
-export function sidecarDbPath(): string {
-    const agentDir =
-        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-    return join(agentDir, "context.db");
-}
-
-/**
- * Purge sidecar entries older than `ageDays` days. Runs at startup to
- * prevent unbounded growth. Scoped to entries this module owns
- * (bash_bg, agent_bg).
- */
-export const SIDECAR_PURGE_DELAY_MS = 5_000;
-
-export interface SidecarPurgeStats {
-    sourcesConsidered: number;
-    pages: number;
-    sourcesRemoved: number;
-    chunksRemoved: number;
-    slices: number;
-    budgetExhausted: boolean;
-    vacuumSteps: number;
-    errors: number;
-}
-
-interface SidecarPurgeStatement {
-    all(...params: unknown[]): unknown[];
-    run(...params: unknown[]): { changes?: number | bigint };
-}
-
-interface SidecarPurgeDatabase {
-    prepare(sql: string): SidecarPurgeStatement;
-    close(): void;
-}
-
-export interface SidecarPurgeOptions {
-    dbPath?: string;
-    openDatabase?: (path: string) => SidecarPurgeDatabase;
-    now?: () => number;
-    yieldToEventLoop?: () => Promise<void>;
-    sliceBudgetMs?: number;
-    totalBudgetMs?: number;
-    batchSize?: number;
-    vacuumPagesPerStep?: number;
-    shouldContinue?: () => boolean;
-}
-
-const PURGE_SLICE_BUDGET_MS = 10;
-const PURGE_TOTAL_BUDGET_MS = 2_000;
-const PURGE_BATCH_SIZE = 25;
-const PURGE_SCAN_PAGE_SIZE = 200;
-// 500-row slabs keep trigger-driven FTS deletes bounded below the measured
-// pathological source size of 2,163 chunks.
-const PURGE_CHUNK_DELETE_SLAB_SIZE = 500;
-// Residual atomic vacuum unit: at most 50 pages per statement.
-const PURGE_VACUUM_PAGES = 50;
-export const SIDECAR_PURGE_IDLE_MS = 5_000;
-let vacuumPending = false;
-
-export function canRunSidecarPurge(
-    turnProcessing: boolean,
-    lastActivityAt: number,
-    now = Date.now()
-): boolean {
-    return !turnProcessing && now - lastActivityAt >= SIDECAR_PURGE_IDLE_MS;
-}
-
-export function scheduleSidecarPurge(
-    purge: () => unknown = () => purgeSidecar(),
-    delayMs = SIDECAR_PURGE_DELAY_MS,
-    shouldRun?: () => boolean,
-    onStale?: () => void
-): ReturnType<typeof setTimeout> | undefined {
-    if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return undefined;
-    const timer = setTimeout(() => {
-        if (shouldRun && !shouldRun()) {
-            console.debug("[tau] sidecar purge skipped for stale startup");
-            onStale?.();
-            return;
-        }
-        void Promise.resolve(purge()).catch((error: unknown) => {
-            console.error(
-                `[tau] sidecar purge failed: ${error instanceof Error ? error.message : String(error)}`
-            );
-        });
-    }, delayMs);
-    timer.unref?.();
-    return timer;
-}
-
-function emptySidecarPurgeStats(): SidecarPurgeStats {
-    return {
-        sourcesConsidered: 0,
-        pages: 0,
-        sourcesRemoved: 0,
-        chunksRemoved: 0,
-        slices: 0,
-        budgetExhausted: false,
-        vacuumSteps: 0,
-        errors: 0,
-    };
-}
-
-function logSidecarPurgeStats(stats: SidecarPurgeStats, ageDays: number): void {
-    const line =
-        `[tau] sidecar-purge age-days=${ageDays} sources-considered=${stats.sourcesConsidered} ` +
-        `pages=${stats.pages} sources-removed=${stats.sourcesRemoved} chunks-removed=${stats.chunksRemoved} ` +
-        `slices=${stats.slices} budget-exhausted=${stats.budgetExhausted} ` +
-        `vacuum-steps=${stats.vacuumSteps} errors=${stats.errors}`;
-    console.error(line);
-    if (process.env.NODE_TEST_CONTEXT === undefined) {
-        void appendFile(
-            join(tmpdir(), "pi-tau-maintenance.log"),
-            `${line}\n`
-        ).catch(() => {});
-    }
-}
-
-export async function purgeSidecar(
-    ageDays: number = SIDECAR_PURGE_AGE_DAYS,
-    options: SidecarPurgeOptions = {}
-): Promise<SidecarPurgeStats> {
-    const stats = emptySidecarPurgeStats();
-    const dbPath = options.dbPath ?? sidecarDbPath();
-    const now = options.now ?? (() => performance.now());
-    const yieldToEventLoop =
-        options.yieldToEventLoop ?? (() => yieldImmediate());
-    const sliceBudgetMs = options.sliceBudgetMs ?? PURGE_SLICE_BUDGET_MS;
-    const totalBudgetMs = options.totalBudgetMs ?? PURGE_TOTAL_BUDGET_MS;
-    const batchSize = options.batchSize ?? PURGE_BATCH_SIZE;
-    const vacuumPages = options.vacuumPagesPerStep ?? PURGE_VACUUM_PAGES;
-    const started = now();
-    let db: SidecarPurgeDatabase | undefined;
-    let lastYieldAt = started;
-
-    const yieldIfNeeded = async (force = false) => {
-        if (force || now() - lastYieldAt >= sliceBudgetMs) {
-            await yieldToEventLoop();
-            stats.slices++;
-            lastYieldAt = now();
-        }
-    };
-    const overTotalBudget = () => now() - started >= totalBudgetMs;
-    const shouldContinue = options.shouldContinue ?? (() => true);
-
+/** Load and validate the owner's versioned package client. Importing the package
+ * does not open the database; an absent extension is an ordinary unavailable
+ * result. */
+async function getSidecarOwnerClient(): Promise<
+    ContextSidecarClient | undefined
+> {
     try {
-        if (process.env.PI_TAU_MAINTENANCE_DISABLE === "1") return stats;
-        if (!shouldContinue()) {
-            stats.budgetExhausted = true;
-            return stats;
-        }
-        if (!options.openDatabase && !existsSync(dbPath)) return stats;
-
-        db = (
-            options.openDatabase ??
-            ((path) =>
-                new DatabaseSync(path, {
-                    enableForeignKeyConstraints: true,
-                    // Fail/retry on a later idle pass instead of blocking the TUI on a writer lock.
-                    timeout: 25,
-                }))
-        )(dbPath);
-        const cutoff = Date.now() - ageDays * 24 * 60 * 60 * 1000;
-        const toolList = SIDECAR_TOOL_NAMES.map((t) => `'${t}'`).join(",");
-        const scan = db.prepare(
-            `SELECT id FROM context_sources
-             WHERE tool_name IN (${toolList}) AND created_at < ?
-             ORDER BY created_at, id LIMIT ${PURGE_SCAN_PAGE_SIZE}`
-        );
-        let scannedSources = 0;
-        let foundAny = false;
-        while (true) {
-            if (!shouldContinue() || overTotalBudget()) {
-                stats.budgetExhausted = true;
-                break;
-            }
-            const page = scan.all(cutoff) as { id: string }[];
-            if (page.length === 0) break;
-            foundAny = true;
-            stats.pages++;
-            stats.sourcesConsidered += page.length;
-            for (let cursor = 0; cursor < page.length; ) {
-                if (!shouldContinue()) {
-                    stats.budgetExhausted = true;
-                    break;
-                }
-                const batch = page.slice(cursor, cursor + batchSize);
-                for (const source of batch) {
-                    let chunksDeleted: number;
-                    do {
-                        if (!shouldContinue() || overTotalBudget()) {
-                            stats.budgetExhausted = true;
-                            break;
-                        }
-                        const result = db
-                            .prepare(
-                                `DELETE FROM context_chunks WHERE rowid IN (
-                            SELECT rowid FROM context_chunks WHERE source_id = ? LIMIT ?
-                        )`
-                            )
-                            .run(source.id, PURGE_CHUNK_DELETE_SLAB_SIZE);
-                        chunksDeleted = Number(result.changes ?? 0);
-                        stats.chunksRemoved += chunksDeleted;
-                        if (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE)
-                            await yieldIfNeeded(true);
-                    } while (chunksDeleted >= PURGE_CHUNK_DELETE_SLAB_SIZE);
-                    if (stats.budgetExhausted) break;
-                }
-                if (stats.budgetExhausted) break;
-                const placeholders = batch.map(() => "?").join(",");
-                const sourcesResult = db
-                    .prepare(
-                        `DELETE FROM context_sources WHERE id IN (${placeholders})`
-                    )
-                    .run(...batch.map((row) => row.id));
-                stats.sourcesRemoved += Number(sourcesResult.changes ?? 0);
-                cursor += batch.length;
-                scannedSources += batch.length;
-                await yieldIfNeeded();
-                if (!shouldContinue() || overTotalBudget()) {
-                    stats.budgetExhausted = true;
-                    break;
-                }
-            }
-            if (stats.budgetExhausted || page.length < PURGE_SCAN_PAGE_SIZE)
-                break;
-            await yieldIfNeeded(true);
-        }
-
+        const owner = await import("@spences10/pi-context");
+        const descriptor = owner.CONTEXT_SIDECAR_CLIENT_API;
         if (
-            !stats.budgetExhausted &&
-            (!foundAny || scannedSources === stats.sourcesConsidered) &&
-            (stats.sourcesRemoved > 0 || vacuumPending)
-        ) {
-            vacuumPending = true;
-            if (!shouldContinue()) {
-                stats.budgetExhausted = true;
-                return stats;
-            }
-            const freePages = db.prepare("PRAGMA freelist_count").all()[0] as
-                | { freelist_count?: number }
-                | undefined;
-            let remaining = Number(freePages?.freelist_count ?? 0);
-            while (remaining > 0 && !overTotalBudget() && shouldContinue()) {
-                // The total-budget check above cannot preempt this residual unit.
-                db.prepare(`PRAGMA incremental_vacuum(${vacuumPages})`).run();
-                stats.vacuumSteps++;
-                // A vacuum step may reclaim less than requested; reread the bound.
-                const current = db.prepare("PRAGMA freelist_count").all()[0] as
-                    | { freelist_count?: number }
-                    | undefined;
-                const next = Number(current?.freelist_count ?? 0);
-                if (next >= remaining) break;
-                remaining = next;
-                await yieldIfNeeded(true);
-            }
-            vacuumPending = remaining > 0;
-            if (vacuumPending && (overTotalBudget() || !shouldContinue()))
-                stats.budgetExhausted = true;
-        }
-    } catch (error) {
-        stats.errors++;
-        console.error(
-            `[tau] sidecar purge failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-    } finally {
-        try {
-            db?.close();
-        } catch {
-            stats.errors++;
-        }
-        logSidecarPurgeStats(stats, ageDays);
-    }
-    return stats;
-}
-
-function sidecarToolListSql(): string {
-    return SIDECAR_SEARCH_TOOL_NAMES.map((tool) => `'${tool}'`).join(",");
-}
-
-function findJobSourceRow(
-    db: DatabaseSync,
-    jobId: string
-): { id: string; input_summary: string } | undefined {
-    return db
-        .prepare(
-            `SELECT id, input_summary FROM context_sources
-             WHERE tool_name IN (${sidecarToolListSql()})
-               AND json_valid(input_summary)
-               AND json_extract(input_summary, '$.jobId') = ?
-             ORDER BY created_at DESC LIMIT 1`
+            descriptor?.id !== "@spences10/pi-context/sidecar-owner" ||
+            descriptor.version !== 1 ||
+            descriptor.operations.join(",") !==
+                "indexOutput,findSources,deleteSources"
         )
-        .get(jobId) as { id: string; input_summary: string } | undefined;
+            return undefined;
+        const client = owner.get_context_sidecar_client();
+        if (
+            !client ||
+            client.descriptor.id !== descriptor.id ||
+            client.descriptor.version !== descriptor.version ||
+            client.descriptor.operations.join(",") !==
+                descriptor.operations.join(",")
+        )
+            return undefined;
+        return client;
+    } catch {
+        return undefined;
+    }
 }
 
-function chunkIdsForSource(db: DatabaseSync, sourceId: string): string[] {
-    return (
-        db
-            .prepare(
-                `SELECT id FROM context_chunks
-                 WHERE source_id = ? ORDER BY ordinal ASC`
-            )
-            .all(sourceId) as { id: string }[]
-    ).map((chunk) => chunk.id);
+function ownerError(
+    error: { code: string; message: string; retryable: boolean },
+    receipt: string
+): Error & { code?: string; ownerCode: string; retryable: boolean } {
+    const code = error.code === "busy" ? "SQLITE_BUSY" : undefined;
+    return Object.assign(new Error(`${receipt}: ${error.message}`), {
+        ...(code ? { code } : {}),
+        ownerCode: error.code,
+        retryable: error.retryable,
+    });
 }
 
-/**
- * Find indexed output and stable source/chunk IDs for a completed job.
- * Returns null when the sidecar is unavailable or no matching source exists.
- */
-export function findJobSourceDetailsInSidecar(
-    jobId: string
-): JobOutputIndex | null {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return null;
+function requireOwnerResult<T>(result: SidecarOwnerResult<T>): T {
+    if (!result.ok) {
+        const error = ownerError(result.error, result.receipt);
+        if (
+            result.error.code === "owner_unavailable" ||
+            result.error.code === "disabled"
+        )
+            Object.assign(error, { ownerCode: "owner_unavailable" });
+        throw error;
+    }
+    return result.result;
+}
 
-    try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-            timeout: 5_000,
-        });
+async function recordOwnerUnavailableSkip(
+    ctx: SidecarContext | undefined,
+    jobId: string,
+    reason: string,
+    logPath = join(tmpdir(), "pi-tau-maintenance.log")
+): Promise<void> {
+    sidecarIndexStats.skipped += 1;
+    sidecarIndexStats.unavailableSkipped += 1;
+    const event = {
+        jobId,
+        reason: "owner_unavailable",
+        detail: reason,
+        unavailableSkipped: sidecarIndexStats.unavailableSkipped,
+    };
+    const identity = readSessionIdentity(ctx);
+    if (identity.stale) {
+        sidecarIndexStats.entriesDroppedWhenCtxStale += 1;
+    } else {
         try {
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) return null;
-
-            const source = findJobSourceRow(db, jobId);
-            if (!source) return null;
-            return {
-                sourceId: source.id,
-                chunkIds: chunkIdsForSource(db, source.id),
-            };
-        } finally {
-            db.close();
+            ctx?.appendEntry?.("sidecar-index-owner-unavailable", event);
+        } catch (error) {
+            if (isStaleCtxError(error))
+                sidecarIndexStats.entriesDroppedWhenCtxStale += 1;
         }
+    }
+    const line = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: "sidecar-index-owner-unavailable",
+        ...event,
+    });
+    try {
+        await appendFile(logPath, `${line}\n`);
+    } catch {
+        // Sidecar diagnostics must not change the background job result.
+    }
+}
+
+/** Find the stable source/chunk IDs for a job through the owner API. */
+export async function findJobSourceDetailsInSidecar(
+    jobId: string
+): Promise<JobOutputIndex | null> {
+    const client = await getSidecarOwnerClient();
+    if (!client) return null;
+    try {
+        const sources = requireOwnerResult(
+            await client.findSources({
+                job_id: jobId,
+                tool_names: SIDECAR_TOOL_NAMES,
+                limit: 100,
+            })
+        );
+        const source = sources[0];
+        return source
+            ? { sourceId: source.source_id, chunkIds: source.chunk_ids }
+            : null;
     } catch {
         return null;
     }
 }
 
-/**
- * Search indexed output by tool family and free-text query. This is a small
- * synchronous helper for callers that need source/chunk IDs without invoking
- * the full context-search tool.
- */
-export function searchSidecarSources(
+/** Search indexed output by tool family and free-text query via pi-context. */
+export async function searchSidecarSources(
     query: string,
     options: { toolNames?: readonly string[]; limit?: number } = {}
-): SidecarSourceMatch[] {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return [];
-
+): Promise<SidecarSourceMatch[]> {
+    const client = await getSidecarOwnerClient();
+    if (!client) return [];
     const toolNames = options.toolNames?.length
         ? options.toolNames
         : SIDECAR_SEARCH_TOOL_NAMES;
     const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
     try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-            timeout: 5_000,
-        });
-        try {
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) return [];
-
-            const placeholders = toolNames.map(() => "?").join(",");
-            const pattern = `%${query}%`;
-            const rows = db
-                .prepare(
-                    `SELECT id, tool_name, created_at, input_summary
-                     FROM context_sources
-                     WHERE tool_name IN (${placeholders})
-                       AND (
-                         ? = '' OR input_summary LIKE ? OR id IN (
-                           SELECT source_id FROM context_chunks WHERE content LIKE ?
-                         )
-                       )
-                     ORDER BY created_at DESC LIMIT ?`
-                )
-                .all(...toolNames, query, pattern, pattern, limit) as {
-                id: string;
-                tool_name: string;
-                created_at: number;
-                input_summary: string;
-            }[];
-            return rows.map((row) => ({
-                sourceId: row.id,
-                chunkIds: chunkIdsForSource(db, row.id),
-                toolName: row.tool_name,
-                createdAt: row.created_at,
-                inputSummary: row.input_summary,
-            }));
-        } finally {
-            db.close();
-        }
+        return requireOwnerResult(
+            await client.findSources({ query, tool_names: toolNames, limit })
+        ).map((source: ContextExternalSource) => ({
+            sourceId: source.source_id,
+            chunkIds: source.chunk_ids,
+            toolName: source.tool_name,
+            createdAt: source.created_at,
+            inputSummary: source.input_summary,
+        }));
     } catch {
         return [];
     }
 }
 
 /** Backward-compatible source-only lookup. */
-export function findJobSourceIdInSidecar(jobId: string): string | null {
-    return findJobSourceDetailsInSidecar(jobId)?.sourceId ?? null;
+export async function findJobSourceIdInSidecar(
+    jobId: string
+): Promise<string | null> {
+    return (await findJobSourceDetailsInSidecar(jobId))?.sourceId ?? null;
 }
 
-/**
- * Look up a completed job's output and stable IDs from the context sidecar.
- */
+/** Read output and stable IDs for a job through the owner's retrieval API. */
 export async function readJobOutputDetailsFromSidecar(
     jobId: string
 ): Promise<SidecarJobOutput | null> {
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) return null;
-
+    const client = await getSidecarOwnerClient();
+    if (!client) return null;
     try {
-        const db = new DatabaseSync(dbPath, {
-            enableForeignKeyConstraints: true,
-            timeout: 5_000,
-        });
+        const sources = requireOwnerResult(
+            await client.findSources({
+                job_id: jobId,
+                tool_names: SIDECAR_TOOL_NAMES,
+                limit: 100,
+            })
+        );
+        const match = sources[0];
+        if (!match) return null;
+        const [source] = requireOwnerResult(
+            await client.findSources({ source_id: match.source_id, limit: 1 })
+        );
+        if (!source?.text) return null;
+        let logPath: string | undefined;
         try {
-            const tableCheck = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-                )
-                .get();
-            if (!tableCheck) return null;
-
-            const source = findJobSourceRow(db, jobId);
-            if (!source) return null;
-
-            let logPath: string | undefined;
-            try {
-                const summary = JSON.parse(source.input_summary) as {
-                    logPath?: string;
-                };
-                logPath = summary.logPath;
-            } catch {
-                // Old records may lack logPath; keep it undefined.
-            }
-
-            const chunks = db
-                .prepare(
-                    `SELECT id, content FROM context_chunks
-                     WHERE source_id = ? ORDER BY ordinal ASC`
-                )
-                .all(source.id) as { id: string; content: string }[];
-            if (chunks.length === 0) return null;
-
-            return {
-                sourceId: source.id,
-                chunkIds: chunks.map((chunk) => chunk.id),
-                // chunkText() is lossless, so do not inject separators while
-                // reconstructing the original output.
-                text: chunks.map((chunk) => chunk.content).join(""),
-                logPath,
-            };
-        } finally {
-            db.close();
+            logPath = (JSON.parse(source.input_summary) as { logPath?: string })
+                .logPath;
+        } catch {
+            // Older records may not contain a JSON input summary.
         }
+        return {
+            sourceId: source.source_id,
+            chunkIds: source.chunk_ids,
+            text: source.text,
+            ...(logPath ? { logPath } : {}),
+        };
     } catch {
         return null;
+    }
+}
+
+/** Delete one explicitly selected source through the owner API. */
+export async function deleteSidecarSource(
+    sourceId: string,
+    ctx?: SidecarContext
+): Promise<ContextPurgeDetails | undefined> {
+    const client = await getSidecarOwnerClient();
+    if (!client) {
+        await recordOwnerUnavailableSkip(ctx, sourceId, "deleteSources");
+        return undefined;
+    }
+    try {
+        return requireOwnerResult(await client.deleteSources(sourceId));
+    } catch (error) {
+        if (
+            error &&
+            typeof error === "object" &&
+            (error as { ownerCode?: string }).ownerCode === "owner_unavailable"
+        ) {
+            await recordOwnerUnavailableSkip(
+                ctx,
+                sourceId,
+                formatUnknownError(error)
+            );
+            return undefined;
+        }
+        throw error;
     }
 }
 
@@ -697,137 +437,10 @@ export function formatSidecarReceipt(
 }
 
 /**
- * Try to index output via pi-context's public ContextStore.index_external_output
- * API when the @spences10/pi-context package is available at runtime. Returns
- * undefined so the caller can use the direct SQLite fallback when the
- * package/API is unavailable or errors.
- *
- * The API path preserves tool_name, job metadata, session/project scope,
- * redaction, threshold/max-source behavior, and returns enough source/chunk
- * details for receipts via the same context.db.
- */
-interface ContextStoreLike {
-    index_external_output: (input: object) => { source_id?: string } | null;
-}
-interface ContextStoreModule {
-    get_context_store?: (options?: object) => ContextStoreLike;
-}
-
-async function tryIndexViaExternalApi(
-    text: string,
-    job: {
-        id: string;
-        command: string;
-        logPath: string;
-        exitCode?: number;
-        status?: string;
-    },
-    ctx: SidecarContext,
-    toolName: string,
-    dbPath: string
-): Promise<string | undefined> {
-    // Dynamic import — may fail at runtime when the package is not in the
-    // module resolution graph (e.g. pi-context not loaded as an extension).
-    let storeModule: ContextStoreModule | undefined;
-
-    // Strategy 1: try importing via package name (works when pi's runtime
-    // resolver includes pi-context in the module graph). Build the specifier
-    // dynamically to avoid a static TypeScript error for the undeclared dep.
-    try {
-        const parts = ["@spences10", "pi-context", "store"];
-        storeModule = (await import(parts.join("/"))) as ContextStoreModule;
-    } catch {
-        // Fallback: scan known pi installation paths for the package.
-        const home = homedir();
-        const candidates = [
-            join(
-                home,
-                ".pi",
-                "agent",
-                "npm",
-                "node_modules",
-                "@spences10",
-                "pi-context",
-                "dist",
-                "store.js"
-            ),
-            join(
-                home,
-                ".pi",
-                "agent",
-                "local",
-                "pi-context",
-                "dist",
-                "store.js"
-            ),
-        ];
-        for (const storePath of candidates) {
-            try {
-                if (existsSync(storePath)) {
-                    storeModule = (await import(
-                        storePath
-                    )) as ContextStoreModule;
-                    break;
-                }
-            } catch {
-                /* continue */
-            }
-        }
-    }
-    if (!storeModule) return undefined;
-
-    const getContextStore = storeModule.get_context_store;
-    if (typeof getContextStore !== "function") return undefined;
-
-    try {
-        const identity = readSessionIdentity(ctx);
-        if (identity.stale) {
-            throw new StaleSessionIdentityError();
-        }
-        const sessionId = identity.value;
-        const projectPath = ctx?.cwd ?? process.cwd();
-
-        const store = getContextStore({
-            db_path: dbPath,
-            project_path: projectPath,
-            session_id: sessionId,
-        });
-
-        if (typeof store.index_external_output !== "function") return undefined;
-
-        const inputSummary = JSON.stringify({
-            command: job.command,
-            jobId: job.id,
-            exitCode: job.exitCode,
-            status: job.status,
-            logPath: job.logPath,
-        });
-
-        const result = store.index_external_output({
-            text,
-            tool_name: toolName,
-            input_summary: inputSummary,
-            session_id: sessionId,
-            project_path: projectPath,
-            force: true,
-        }) as { source_id?: string } | null | undefined;
-
-        if (result?.source_id) {
-            return result.source_id;
-        }
-    } catch {
-        // API error — fall through to direct DB
-    }
-
-    return undefined;
-}
-
-/**
  * Optional test/caller controls for indexing behavior. Classification remains advisory.
  */
 export interface SidecarIndexOptions {
     classify?: (text: string) => LogCounts;
-    useExternalApi?: boolean;
     /** Override log reads for deterministic transient-I/O tests. */
     readLog?: (path: string) => Promise<string>;
     /** Override the durable failure log path for tests. */
@@ -1010,233 +623,6 @@ export async function prepareInlineOutput(
     };
 }
 
-/**
- * Split text into ~4 KiB chunks, matching the sidecar's chunk_text().
- */
-export function chunkText(
-    text: string,
-    sourceId: string
-): {
-    id: string;
-    sourceId: string;
-    ordinal: number;
-    title: string;
-    content: string;
-    byteCount: number;
-}[] {
-    // Keep the chunker deliberately lossless. Splitting by paragraphs and
-    // lines is attractive, but a line larger than the target size can leave
-    // an earlier chunk behind while silently dropping that line. Iterating by
-    // Unicode code point preserves the complete text and never splits a UTF-8
-    // sequence in the middle.
-    const targetBytes = 4096;
-    const chunks: string[] = [];
-    let current: string[] = [];
-    let currentBytes = 0;
-    for (const character of text) {
-        const characterBytes = Buffer.byteLength(character, "utf8");
-        if (current.length > 0 && currentBytes + characterBytes > targetBytes) {
-            chunks.push(current.join(""));
-            current = [character];
-            currentBytes = characterBytes;
-        } else {
-            current.push(character);
-            currentBytes += characterBytes;
-        }
-    }
-    if (current.length > 0) chunks.push(current.join(""));
-    if (chunks.length === 0) chunks.push(text);
-
-    return chunks.map((content, index) => ({
-        id: `${sourceId}_${String(index + 1).padStart(4, "0")}`,
-        sourceId,
-        ordinal: index + 1,
-        title:
-            content
-                .split("\n")
-                .find((l) => l.trim())
-                ?.trim()
-                .slice(0, 120) ?? "(empty)",
-        content,
-        byteCount: Buffer.byteLength(content, "utf8"),
-    }));
-}
-
-/**
- * Build a short preview from the first content lines.
- */
-function makePreview(text: string): string {
-    const lines = text.split("\n");
-    const previewLines = lines.slice(0, 40);
-    let result = previewLines.join("\n");
-    if (Buffer.byteLength(result, "utf8") > 4096) {
-        result = Buffer.from(result, "utf8").subarray(0, 4096).toString("utf8");
-    }
-    if (lines.length > 40) result += "\n...";
-    return result;
-}
-
-/**
- * Direct SQLite indexing fallback — writes job output into the sidecar's
- * context.db using the same schema that context_search / context_get /
- * context_list expect. Used when the pi-context external API is unavailable.
- */
-function writeSeverityCountsBestEffort(
-    db: DatabaseSync,
-    sourceId: string,
-    counts: LogCounts | undefined
-): void {
-    if (!counts) return;
-    try {
-        db.prepare(
-            `INSERT INTO context_source_severity
-             (source_id, err_line_count, warn_line_count, classified_line_count)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(source_id) DO UPDATE SET
-               err_line_count = excluded.err_line_count,
-               warn_line_count = excluded.warn_line_count,
-               classified_line_count = excluded.classified_line_count`
-        ).run(sourceId, counts.err, counts.warn, counts.total);
-    } catch {
-        // Severity is advisory metadata; older sidecar schemas must still index output.
-    }
-}
-
-async function indexViaDirectDb(
-    text: string,
-    job: {
-        id: string;
-        command: string;
-        logPath: string;
-        exitCode?: number;
-        status?: string;
-    },
-    ctx: SidecarContext,
-    toolName: string,
-    dbPath: string,
-    severityCounts?: LogCounts
-): Promise<string | undefined> {
-    const bytes = Buffer.byteLength(text, "utf8");
-    const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-    const identity = readSessionIdentity(ctx);
-    if (identity.stale) {
-        throw new StaleSessionIdentityError();
-    }
-    const sessionId = identity.value;
-    const projectPath = ctx?.cwd ?? process.cwd();
-
-    const db = new DatabaseSync(dbPath, {
-        enableForeignKeyConstraints: true,
-        // Avoid a multi-second main-thread stall; bounded retries handle longer locks.
-        timeout: 250,
-    });
-
-    try {
-        // Check if the source table exists (sidecar schema applied)
-        const tableCheck = db
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='context_sources'"
-            )
-            .get();
-        if (!tableCheck) {
-            return;
-        }
-
-        const contentHash = createHash("sha256").update(text).digest("hex");
-        // Deduplicate repeated indexing of the same job, but never merge
-        // two different jobs. A source row carries one jobId, so sharing
-        // it across jobs would make the second job impossible to find.
-        const existing = db
-            .prepare(
-                `SELECT id FROM context_sources
-                 WHERE tool_name = ? AND content_hash = ?
-                   AND (project_path = ? OR project_path IS NULL)
-                   AND json_valid(input_summary)
-                   AND json_extract(input_summary, '$.jobId') = ?
-                 LIMIT 1`
-            )
-            .get(toolName, contentHash, projectPath, job.id) as
-            | { id: string }
-            | undefined;
-        if (existing) {
-            // Re-indexing is internal maintenance, not a context read. Do
-            // not charge these bytes to returned_byte_count; that counter
-            // tracks bytes actually returned by context retrieval.
-            writeSeverityCountsBestEffort(db, existing.id, severityCounts);
-            return existing.id;
-        }
-
-        // Keep the source and all chunks atomic. A schema mismatch or FTS
-        // trigger failure must not leave an orphan source that prevents a
-        // later retry from indexing the job.
-        db.exec("BEGIN");
-
-        // Generate a unique source ID matching the sidecar's format
-        const sourceId = `ctx_bg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
-        const createdAt = Date.now();
-        const preview = makePreview(text);
-        const previewBytes = Buffer.byteLength(preview, "utf8");
-        const inputSummary = JSON.stringify({
-            command: job.command,
-            jobId: job.id,
-            exitCode: job.exitCode,
-            status: job.status,
-            logPath: job.logPath,
-        });
-
-        // Insert source record
-        db.prepare(
-            `INSERT INTO context_sources
-             (id, session_id, project_path, tool_name, input_summary,
-              created_at, byte_count, line_count, content_hash,
-              preview_byte_count, returned_byte_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-        ).run(
-            sourceId,
-            sessionId,
-            projectPath,
-            toolName,
-            inputSummary,
-            createdAt,
-            bytes,
-            lines,
-            contentHash,
-            previewBytes
-        );
-
-        // Insert chunks (FTS5 trigger auto-populates context_chunks_fts)
-        const chunks = chunkText(text, sourceId);
-        const insertChunk = db.prepare(
-            `INSERT INTO context_chunks
-             (id, source_id, ordinal, title, content, byte_count)
-             VALUES (?, ?, ?, ?, ?, ?)`
-        );
-
-        for (const chunk of chunks) {
-            insertChunk.run(
-                chunk.id,
-                chunk.sourceId,
-                chunk.ordinal,
-                chunk.title,
-                chunk.content,
-                chunk.byteCount
-            );
-        }
-        db.exec("COMMIT");
-        writeSeverityCountsBestEffort(db, sourceId, severityCounts);
-        return sourceId;
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // Preserve the original schema or I/O error.
-        }
-        throw error;
-    } finally {
-        db.close();
-    }
-}
-
 function getSqliteErrorCode(error: unknown): string | number | undefined {
     if (!error || typeof error !== "object") return undefined;
     const sqliteError = error as { code?: unknown; errcode?: unknown };
@@ -1244,6 +630,16 @@ function getSqliteErrorCode(error: unknown): string | number | undefined {
     return typeof code === "string" || typeof code === "number"
         ? code
         : undefined;
+}
+
+function formatUnknownError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === "string") return error;
+    try {
+        return JSON.stringify(error) ?? "Unknown error";
+    } catch {
+        return "Unknown error";
+    }
 }
 
 function getIndexErrorInput(error: unknown, message: string) {
@@ -1399,63 +795,104 @@ export async function indexJobOutputWithOutcome(
     } catch {
         // Classification is advisory; keep the existing indexing path intact.
     }
-    const dbPath = sidecarDbPath();
-    if (!existsSync(dbPath)) {
-        const outcome: SidecarIndexOutcome = {
+    const client = await getSidecarOwnerClient();
+    if (!client) {
+        if (readSessionIdentity(ctx).stale) {
+            const errorMessage = new StaleSessionIdentityError().message;
+            sidecarIndexStats.failed += 1;
+            await reportSidecarIndexFailure(
+                ctx,
+                {
+                    jobId: job.id,
+                    reason: "index_failed",
+                    category: "stale",
+                    errorMessage,
+                },
+                options.failureLogPath
+            );
+            return {
+                status: "failed",
+                eligible: true,
+                reason: "index_failed",
+                errorCategory: "stale",
+                errorMessage,
+            };
+        }
+        await recordOwnerUnavailableSkip(
+            ctx,
+            job.id,
+            "pi-context owner descriptor unavailable",
+            options.failureLogPath
+        );
+        return {
             status: "skipped",
             eligible: true,
             reason: "sidecar_unavailable",
             errorCategory: "unavailable",
         };
-        sidecarIndexStats.skipped += 1;
-        sidecarIndexStats.unavailableSkipped += 1;
-        return outcome;
     }
 
+    const projectPath = ctx.cwd ?? process.cwd();
+    const inputSummary = JSON.stringify({
+        command: job.command,
+        jobId: job.id,
+        exitCode: job.exitCode,
+        status: job.status,
+        logPath: job.logPath,
+    });
     const startedAt = Date.now();
     const writeAttempt = await retryIndexOperation(async () => {
-        // Try pi-context's public external-indexing API first.
-        const apiSourceId =
-            options.useExternalApi === false
-                ? undefined
-                : await tryIndexViaExternalApi(
-                      text,
-                      job,
-                      ctx,
-                      toolName,
-                      dbPath
-                  );
-        return (
-            apiSourceId ??
-            (await indexViaDirectDb(
-                text,
-                job,
-                ctx,
-                toolName,
-                dbPath,
-                severityCounts
-            ))
-        );
+        const identity = readSessionIdentity(ctx);
+        if (identity.stale) throw new StaleSessionIdentityError();
+        const input: StoreContextInput = {
+            text,
+            tool_name: toolName,
+            input_summary: inputSummary,
+            session_id: identity.value,
+            project_path: projectPath,
+            force: true,
+        };
+        const response = await client.indexOutput(input);
+        const stored = requireOwnerResult(response);
+        return stored?.source_id;
     });
     const retryCount = writeAttempt.retryCount;
     const sourceId = writeAttempt.ok ? writeAttempt.value : undefined;
     const lastError = writeAttempt.ok ? undefined : writeAttempt.error;
     const waitMs = Date.now() - startedAt;
-    if (!lastError && !sourceId) {
-        const outcome: SidecarIndexOutcome = {
+    if (
+        lastError &&
+        ["owner_unavailable", "disabled"].includes(
+            (lastError as { ownerCode?: string }).ownerCode ?? ""
+        )
+    ) {
+        await recordOwnerUnavailableSkip(
+            ctx,
+            job.id,
+            formatUnknownError(lastError),
+            options.failureLogPath
+        );
+        return {
             status: "skipped",
             eligible: true,
-            reason: "schema_unavailable",
-            errorCategory: "schema",
+            reason: "sidecar_unavailable",
+            errorCategory: "unavailable",
             retryCount: retryCount + readRetryCount,
             waitMs,
         };
+    }
+    if (!lastError && !sourceId) {
         sidecarIndexStats.skipped += 1;
-        sidecarIndexStats.schemaSkipped += 1;
-        return outcome;
+        return {
+            status: "skipped",
+            eligible: true,
+            reason: "owner_skipped",
+            retryCount: retryCount + readRetryCount,
+            waitMs,
+        };
     }
     if (!lastError && sourceId) {
-        const indexedSource = findJobSourceDetailsInSidecar(job.id) ?? {
+        const indexedSource = (await findJobSourceDetailsInSidecar(job.id)) ?? {
             sourceId,
             chunkIds: [],
         };
@@ -1485,8 +922,7 @@ export async function indexJobOutputWithOutcome(
         return outcome;
     }
 
-    const errorMessage =
-        lastError instanceof Error ? lastError.message : String(lastError);
+    const errorMessage = formatUnknownError(lastError);
     const errorCode = getSqliteErrorCode(lastError);
     const errorCategory: SidecarIndexOutcome["errorCategory"] =
         lastError instanceof StaleSessionIdentityError

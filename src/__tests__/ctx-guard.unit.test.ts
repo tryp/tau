@@ -348,10 +348,10 @@ void describe("sidecar indexing under a stale ctx", () => {
         assert.equal(job.sidecarIndexErrorCategory, "stale");
         const { getSidecarIndexStats, resetSidecarIndexStats } =
             await import("../features/sidecar.ts");
-        // Exactly three reads consult identity: the external-API probe, direct-DB
-        // attempt, and preflight before appendEntry. The preflight detects stale
-        // ctx and records the dropped entry without invoking appendEntry.
-        assert.equal(getSidecarIndexStats().staleSessionIdentity, 3);
+        // One read rejects the stale identity before the unavailable-owner
+        // fallback, and one guards failure-entry persistence without invoking
+        // appendEntry.
+        assert.equal(getSidecarIndexStats().staleSessionIdentity, 2);
         assert.equal(getSidecarIndexStats().entriesDroppedWhenCtxStale, 1);
         resetSidecarIndexStats();
     });

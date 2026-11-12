@@ -1,13 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { schedulePeriodicTmuxRunDirCleanup } from "../features/bash-tmux.ts";
-import {
-    canRunSidecarPurge,
-    scheduleSidecarPurge,
-} from "../features/sidecar.ts";
+import { scheduleBackgroundJobRestore } from "../features/startup-maintenance.ts";
 import registerTau, { resolveMaintenanceDelayMs } from "../index.ts";
 import { forEachWithinTimeBudget } from "../features/tmux-orphan-reaper.ts";
-import { scheduleBackgroundJobRestore } from "../features/startup-maintenance.ts";
 
 const realSetTimeout = globalThis.setTimeout;
 
@@ -91,42 +87,25 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 void describe("deferred startup maintenance", () => {
-    void it("permits sidecar purge only after the turn is idle long enough", () => {
-        assert.equal(canRunSidecarPurge(true, 0, 10_000), false);
-        assert.equal(canRunSidecarPurge(false, 5_001, 10_000), false);
-        assert.equal(canRunSidecarPurge(false, 5_000, 10_000), true);
-    });
-
-    void it("defers and unrefs sidecar purge and background-job restore", () => {
+    void it("defers and unrefs background-job restore", () => {
         const fakeTimers = new FakeTimers();
         const oldSetTimeout = globalThis.setTimeout;
         const oldClearTimeout = globalThis.clearTimeout;
         globalThis.setTimeout = fakeTimers.setTimeout as typeof setTimeout;
         globalThis.clearTimeout = fakeTimers.clear as typeof clearTimeout;
-        let purges = 0;
         let restores = 0;
         try {
-            scheduleSidecarPurge(() => {
-                purges++;
-            }, 5_000);
             scheduleBackgroundJobRestore(() => {
                 restores++;
             });
-            assert.equal(purges, 0);
             assert.equal(restores, 0);
-            assert.equal(fakeTimers.records.length, 2);
-            assert.ok(fakeTimers.records.every((timer) => timer.unrefCalled));
-            assert.ok(
-                fakeTimers.records.every((timer) => timer.due > fakeTimers.now)
-            );
+            assert.equal(fakeTimers.records.length, 1);
+            assert.ok(fakeTimers.records[0].unrefCalled);
+            assert.equal(fakeTimers.records[0].due, 100);
             fakeTimers.advance(99);
-            assert.equal(purges, 0);
             assert.equal(restores, 0);
             fakeTimers.advance(1);
             assert.equal(restores, 1);
-            assert.equal(purges, 0);
-            fakeTimers.advance(4_900);
-            assert.equal(purges, 1);
         } finally {
             globalThis.setTimeout = oldSetTimeout;
             globalThis.clearTimeout = oldClearTimeout;

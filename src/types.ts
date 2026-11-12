@@ -41,7 +41,7 @@ export interface SidecarIndexOutcome {
     reason?:
         | "empty_output"
         | "sidecar_unavailable"
-        | "schema_unavailable"
+        | "owner_skipped"
         | "read_failed"
         | "log_missing"
         | "index_failed";
@@ -75,7 +75,6 @@ export interface SidecarIndexStats {
     entriesDroppedWhenCtxStale: number;
     emptySkipped: number;
     unavailableSkipped: number;
-    schemaSkipped: number;
     /**
      * Session identity was unreadable because the captured ctx was stale.
      *

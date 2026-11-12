@@ -25,6 +25,9 @@ importers:
       '@earendil-works/pi-tui':
         specifier: '*'
         version: 0.74.0
+      '@spences10/pi-context':
+        specifier: file:../pi-context
+        version: file:../pi-context(@earendil-works/pi-ai@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)(typebox@1.1.38)
       marked:
         specifier: 15.0.12
         version: 15.0.12
@@ -967,6 +970,36 @@ packages:
   '@smithy/util-utf8@2.3.0':
     resolution: {integrity: sha512-R8Rdn8Hy72KKcebgLiv8jQcQkXoLMOGGv5uI1/k0l+snqkOzQ1R0ChUBCxWMlBsFMekWjq0wRudIweFs7sKT5A==}
     engines: {node: '>=14.0.0'}
+
+  '@spences10/pi-context@file:../pi-context':
+    resolution: {directory: ../pi-context, type: directory}
+    engines: {node: '>=24.15.0'}
+    peerDependencies:
+      '@earendil-works/pi-coding-agent': '*'
+      typebox: '*'
+
+  '@spences10/pi-redact@0.0.14':
+    resolution: {integrity: sha512-Ey4rzVAuy+Q/xTeXw2iOIs2ES1N8m9hvvPFFESezRVs6u9gc99DN0q/bSSVvzuEt6CxGlQ6WVKsoNAmo29JRCw==}
+    engines: {node: '>=24.15.0'}
+    peerDependencies:
+      '@earendil-works/pi-ai': '*'
+      '@earendil-works/pi-coding-agent': '*'
+
+  '@spences10/pi-settings@0.0.3':
+    resolution: {integrity: sha512-4lBrQYD6neY5sSYbnUVKnystMDerF0H1jKVeci+TsQLfp8pV0kIWO3zoGp1fzKgBKpXbr0ip7trxDHUbBSnNRg==}
+    peerDependencies:
+      '@earendil-works/pi-coding-agent': '*'
+
+  '@spences10/pi-sqlite-core@0.0.2':
+    resolution: {integrity: sha512-ZEuFs3FmEgILltKu7FRBW2yI4tdCqz76nVit6Z7H7TLEoAiGZ39DVFJNjnz0SvGOu2F8q8VhZTFdcQnaqTsnlA==}
+    engines: {node: '>=24.15.0'}
+
+  '@spences10/pi-tui-modal@0.0.24':
+    resolution: {integrity: sha512-dPlm+CoqEDPzfK3eIXB3z9Ui8D5IhBxuwwn2SbPym+cYUJ7C9doX1FueFH8K6qZJ2FL4FNjOBaHy6+Qo1oWJAg==}
+    engines: {node: '>=24.15.0'}
+    peerDependencies:
+      '@earendil-works/pi-coding-agent': '*'
+      '@earendil-works/pi-tui': '*'
 
   '@tokenizer/inflate@0.4.1':
     resolution: {integrity: sha512-2mAv+8pkG6GIZiF1kNg1jAjh27IDxEPKwdGul3snfztFerfPGI1LjDezZp3i7BElXompqEtPmoPx6c2wgtWsOA==}
@@ -4276,6 +4309,34 @@ snapshots:
     dependencies:
       '@smithy/util-buffer-from': 2.2.0
       tslib: 2.8.1
+
+  '@spences10/pi-context@file:../pi-context(@earendil-works/pi-ai@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)(typebox@1.1.38)':
+    dependencies:
+      '@earendil-works/pi-coding-agent': 0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+      '@spences10/pi-redact': 0.0.14(@earendil-works/pi-ai@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))
+      '@spences10/pi-settings': 0.0.3(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))
+      '@spences10/pi-sqlite-core': 0.0.2
+      '@spences10/pi-tui-modal': 0.0.24(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)
+      typebox: 1.1.38
+    transitivePeerDependencies:
+      - '@earendil-works/pi-ai'
+      - '@earendil-works/pi-tui'
+
+  '@spences10/pi-redact@0.0.14(@earendil-works/pi-ai@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))':
+    dependencies:
+      '@earendil-works/pi-ai': 0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+      '@earendil-works/pi-coding-agent': 0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+
+  '@spences10/pi-settings@0.0.3(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))':
+    dependencies:
+      '@earendil-works/pi-coding-agent': 0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+
+  '@spences10/pi-sqlite-core@0.0.2': {}
+
+  '@spences10/pi-tui-modal@0.0.24(@earendil-works/pi-coding-agent@0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3))(@earendil-works/pi-tui@0.74.0)':
+    dependencies:
+      '@earendil-works/pi-coding-agent': 0.74.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+      '@earendil-works/pi-tui': 0.74.0
 
   '@tokenizer/inflate@0.4.1':
     dependencies:

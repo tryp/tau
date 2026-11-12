@@ -76,6 +76,7 @@
   },
   "packageManager": "pnpm@10.33.1",
   "dependencies": {
+    "@spences10/pi-context": "file:../pi-context",
     "marked": "15.0.12",
     "ms": "2.1.3",
     "playwright-core": "1.60.0",
