@@ -11,7 +11,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { register_context_sidecar_owner } from "@spences10/pi-context";
+import {
+    get_context_sidecar_client,
+    register_context_sidecar_owner,
+} from "@spences10/pi-context";
 import {
     findJobSourceDetailsInSidecar,
     findJobSourceIdInSidecar,
@@ -936,6 +939,37 @@ void describe("indexJobOutputInSidecar", () => {
         );
     });
 
+    void it("counts unavailable-owner skips when both event destinations fail", async () => {
+        await closeOwner?.();
+        closeOwner = undefined;
+        const job = testJob({
+            id: "job-double-diagnostic-failure",
+            logPath: writeLog("fixture output"),
+        });
+        const context = {
+            sessionManager: { getSessionId: () => "warning-session-fixture" },
+            appendEntry: () => {
+                throw new Error(
+                    "This extension ctx is stale after session replacement or reload"
+                );
+            },
+        };
+        const missingDirectoryLogPath = join(
+            tmpDir,
+            "missing-diagnostics-dir",
+            "sidecar-failures.jsonl"
+        );
+
+        const outcome = await indexJobOutputWithOutcome(job, context, "bash", {
+            failureLogPath: missingDirectoryLogPath,
+        });
+
+        assert.equal(outcome.status, "skipped");
+        assert.equal(getSidecarIndexStats().unavailableSkipped, 1);
+        // One drop for stale appendEntry and one for the failed JSONL fallback.
+        assert.equal(getSidecarIndexStats().entriesDroppedWhenCtxStale, 2);
+    });
+
     void it("keeps inline text when a forced index cannot be created", async () => {
         // A forced index must never make the result worse: if the sidecar is
         // unavailable, the output is returned as-is rather than replaced by a
@@ -977,6 +1011,93 @@ void describe("indexJobOutputInSidecar", () => {
         assert.equal(prepared.empty, false);
         assert.ok(prepared.text.length <= INLINE_FALLBACK_MAX_CHARS + 100);
         assert.match(prepared.text, /\[truncated/);
+    });
+
+    void it("indexes when optional severity classification is unavailable", async () => {
+        createDb(tmpDir);
+        const output = "indexing survives unavailable severity classification";
+        const job = testJob({
+            id: "job-severity-unavailable",
+            logPath: writeLog(output),
+        });
+
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            { cwd: tmpDir },
+            "bash_bg",
+            {
+                classify: () => {
+                    throw new Error("severity table unavailable");
+                },
+            }
+        );
+
+        assert.equal(outcome.status, "indexed");
+        assert.ok(outcome.source?.sourceId);
+        assert.equal(await readJobOutputFromSidecar(job.id), output);
+    });
+
+    void it("retries owner-client busy responses and records the successful wait", async () => {
+        createDb(tmpDir);
+        const registeredClient = get_context_sidecar_client();
+        assert.ok(registeredClient);
+        const originalIndexOutput =
+            registeredClient.indexOutput.bind(registeredClient);
+        let calls = 0;
+        const client = {
+            ...registeredClient,
+            indexOutput: async (
+                input: Parameters<typeof originalIndexOutput>[0]
+            ) => {
+                calls += 1;
+                if (calls <= 2) {
+                    return {
+                        ok: false as const,
+                        classification: "error" as const,
+                        error: {
+                            code: "busy" as const,
+                            message: "database is busy",
+                            retryable: true as const,
+                        },
+                        receipt: "busy-retry-test",
+                    };
+                }
+                return originalIndexOutput(input);
+            },
+        };
+        const entries: Array<{ type: string; data: unknown }> = [];
+        const job = testJob({
+            id: "job-owner-busy-retry",
+            logPath: writeLog("successful after busy retries"),
+        });
+
+        const outcome = await indexJobOutputWithOutcome(
+            job,
+            {
+                cwd: tmpDir,
+                sessionManager: {
+                    getSessionId: () => "owner-busy-retry-session",
+                },
+                appendEntry: (type, data) => entries.push({ type, data }),
+            },
+            "bash_bg",
+            { ownerClient: client }
+        );
+
+        assert.equal(calls, 3, JSON.stringify(outcome));
+        assert.equal(outcome.status, "indexed");
+        assert.equal(outcome.retryCount, 2);
+        assert.ok((outcome.waitMs ?? 0) >= 150);
+        assert.ok(outcome.source?.sourceId);
+        const waitEntry = entries.find(
+            (entry) => entry.type === "sidecar-index-wait"
+        );
+        assert.ok(waitEntry);
+        assert.deepEqual(waitEntry.data, {
+            jobId: job.id,
+            retryCount: 2,
+            waitMs: outcome.waitMs,
+        });
     });
 
     void it("deduplicates repeated indexing of one job", async () => {

@@ -263,7 +263,9 @@ async function recordOwnerUnavailableSkip(
     try {
         await appendFile(logPath, `${line}\n`);
     } catch {
-        // Sidecar diagnostics must not change the background job result.
+        // Sidecar diagnostics must not change the background job result, but
+        // record that both durable destinations dropped this event.
+        sidecarIndexStats.entriesDroppedWhenCtxStale += 1;
     }
 }
 
@@ -440,6 +442,8 @@ export function formatSidecarReceipt(
  * Optional test/caller controls for indexing behavior. Classification remains advisory.
  */
 export interface SidecarIndexOptions {
+    /** Owner-client seam for deterministic retry tests; normal callers omit it. */
+    ownerClient?: ContextSidecarClient;
     classify?: (text: string) => LogCounts;
     /** Override log reads for deterministic transient-I/O tests. */
     readLog?: (path: string) => Promise<string>;
@@ -795,7 +799,7 @@ export async function indexJobOutputWithOutcome(
     } catch {
         // Classification is advisory; keep the existing indexing path intact.
     }
-    const client = await getSidecarOwnerClient();
+    const client = options.ownerClient ?? (await getSidecarOwnerClient());
     if (!client) {
         if (readSessionIdentity(ctx).stale) {
             const errorMessage = new StaleSessionIdentityError().message;
