@@ -1799,6 +1799,7 @@ type PendingCompletionDelivery = {
     state: TauState;
     sessionId: string;
     queueKey: string;
+    deliveryBoundary?: "turn_end" | "settled";
 };
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
@@ -1989,6 +1990,7 @@ function recordCompletionTelemetry(
         count?: number;
         scope?: "success" | "all" | "terminal-implicit";
         delivery?: "immediate" | "deferred-batch" | "suppressed";
+        deliveryBoundary?: "turn_end" | "settled";
     } = {}
 ): void {
     const appendEntry = (
@@ -2049,6 +2051,9 @@ function recordCompletionTelemetry(
             ...(fields.count !== undefined ? { count: fields.count } : {}),
             ...(fields.scope ? { scope: fields.scope } : {}),
             ...(fields.delivery ? { delivery: fields.delivery } : {}),
+            ...(fields.deliveryBoundary
+                ? { deliveryBoundary: fields.deliveryBoundary }
+                : {}),
         });
     } catch {
         completionTelemetryUnavailableCount++;
@@ -2388,6 +2393,9 @@ function completeCompletionDeliveryHandoff(
                     ? undefined
                     : Math.max(0, job.endTime - job.startTime),
             delivery: "immediate",
+            ...(delivery.deliveryBoundary
+                ? { deliveryBoundary: delivery.deliveryBoundary }
+                : {}),
         });
     }
 }
@@ -2936,8 +2944,14 @@ function deliverCompletionNotification(
     completeCompletionDeliveryHandoff(delivery, sent);
 }
 
-function flushPendingCompletionDeliveries(): void {
-    if (completionAgentBusy || pendingCompletionDeliveries.length === 0) return;
+function flushPendingCompletionDeliveries(
+    boundary: "turn_end" | "settled"
+): void {
+    if (
+        (boundary === "settled" && completionAgentBusy) ||
+        pendingCompletionDeliveries.length === 0
+    )
+        return;
     const pending = pendingCompletionDeliveries.splice(0);
     const groups: PendingCompletionDelivery[] = [];
     for (const delivery of pending) {
@@ -2948,7 +2962,7 @@ function flushPendingCompletionDeliveries(): void {
                 candidate.sessionId === delivery.sessionId
         );
         if (!group) {
-            group = { ...delivery, jobs: [] };
+            group = { ...delivery, jobs: [], deliveryBoundary: boundary };
             groups.push(group);
         }
         const known = new Set(group.jobs.map(completionAttemptIdentity));
@@ -3011,7 +3025,7 @@ function queueCompletionDelivery(
             });
         }
     }
-    flushPendingCompletionDeliveries();
+    flushPendingCompletionDeliveries("settled");
 }
 
 /**
@@ -3673,6 +3687,11 @@ export function registerBackgroundJobs(
             settledCompletionFlushTimer = undefined;
         }
     });
+    eventPi.on?.("turn_end", () => {
+        if (completionAgentBusy) {
+            flushPendingCompletionDeliveries("turn_end");
+        }
+    });
     eventPi.on?.("agent_settled", () => {
         const token = completionLifecycleToken;
         if (settledCompletionFlushTimer) return;
@@ -3683,7 +3702,7 @@ export function registerBackgroundJobs(
             settledCompletionFlushTimer = undefined;
             if (token !== completionLifecycleToken) return;
             completionAgentBusy = false;
-            flushPendingCompletionDeliveries();
+            flushPendingCompletionDeliveries("settled");
         }, 0);
     });
     eventPi.on?.("session_shutdown", () => {

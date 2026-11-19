@@ -449,10 +449,15 @@ void describe("job completion regression coverage", () => {
         await invoke("session_shutdown");
     });
 
-    void it("holds completion delivery until the session is settled", async () => {
+    void it("delivers a pending completion at turn_end and never resends at settled", async () => {
         const state = new TauState();
-        const { pi, sentMessages, sentMessageOptions, invoke } =
-            registerTestTools(state);
+        const {
+            pi,
+            sentMessages,
+            sentMessageOptions,
+            appendedEntries,
+            invoke,
+        } = registerTestTools(state);
         const job = makeJob({
             id: "job-settlement-boundary",
             status: "completed",
@@ -468,12 +473,27 @@ void describe("job completion regression coverage", () => {
         await invoke("agent_end");
         assert.equal(sentMessages.length, 0);
 
+        await invoke("turn_end");
+        assert.equal(sentMessages.length, 1);
         await invoke("agent_settled");
-        // The flush is deferred by one timer turn; wait for that turn rather
-        // than relying on an arbitrary wall-clock delay.
+        // The settled flush is deferred by one timer turn; it must find the
+        // queue empty after the turn boundary already delivered the notice.
         await new Promise((resolve) => setTimeout(resolve, 0));
 
         assert.equal(sentMessages.length, 1);
+        const delivered = appendedEntries
+            .filter(
+                (entry) =>
+                    entry.customType === "background-completion-telemetry"
+            )
+            .map((entry) => entry.data)
+            .filter(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered"
+            );
+        assert.equal(delivered.length, 1);
+        assert.equal(delivered[0]?.deliveryBoundary, "turn_end");
         const message = sentMessages[0] as { customType: string };
         assert.equal(message.customType, "job-completion");
         assert.deepEqual(sentMessageOptions[0], {
@@ -487,9 +507,32 @@ void describe("job completion regression coverage", () => {
         );
     });
 
-    void it("does not flush a settled batch into a newer agent run", async () => {
+    void it("keeps a completion inside the batch debounce until a later turn_end", async () => {
         const state = new TauState();
         const { pi, sentMessages, invoke } = registerTestTools(state);
+        const job = makeJob({
+            id: "job-turn-end-during-debounce",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+
+        await invoke("agent_start");
+        notifyCompletion(job, state, pi as never, notificationContext());
+        await invoke("turn_end");
+        assert.equal(sentMessages.length, 0);
+
+        flushCompletionBatch();
+        assert.equal(sentMessages.length, 0);
+        await invoke("turn_end");
+        assert.equal(sentMessages.length, 1);
+        await invoke("session_shutdown");
+    });
+
+    void it("does not flush a settled batch into a newer agent run", async () => {
+        const state = new TauState();
+        const { pi, sentMessages, appendedEntries, invoke } =
+            registerTestTools(state);
         const job = makeJob({
             id: "job-stale-settled-flush",
             status: "completed",
@@ -510,6 +553,19 @@ void describe("job completion regression coverage", () => {
         await invoke("agent_settled");
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(sentMessages.length, 1);
+        const delivered = appendedEntries
+            .filter(
+                (entry) =>
+                    entry.customType === "background-completion-telemetry"
+            )
+            .map((entry) => entry.data)
+            .filter(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered"
+            );
+        assert.equal(delivered.length, 1);
+        assert.equal(delivered[0]?.deliveryBoundary, "settled");
     });
 
     void it("drops deferred completion delivery during shutdown", async () => {
