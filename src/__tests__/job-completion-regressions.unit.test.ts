@@ -1277,15 +1277,13 @@ void describe("jobs ack", () => {
         await harness.invoke("session_shutdown");
     });
 
-    void it("plain ack permits failure delivery while silent ack suppresses it", async () => {
+    void it("plain ack of a running job permits its later failure delivery", async () => {
         for (const silent of [false, true]) {
             const state = new TauState();
             const harness = registerTestTools(state);
             const job = makeJob({
                 id: `tmux-ack-failure-${silent}`,
-                status: "failed",
-                exitCode: 1,
-                endTime: Date.now(),
+                status: "running",
             });
             state.backgroundJobs.set(job.id, job);
             await harness.jobs.execute(
@@ -1299,6 +1297,11 @@ void describe("jobs ack", () => {
                 null,
                 null
             );
+            // The job fails after the ack: a plain ack promised only to mute
+            // success, so this failure must still be announced.
+            job.status = "failed";
+            job.exitCode = 1;
+            job.endTime = Date.now();
             await harness.invoke("agent_start");
             notifyCompletion(
                 job,
@@ -1314,7 +1317,7 @@ void describe("jobs ack", () => {
         }
     });
 
-    void it("ack preserves terminal status and exit code and reports unknown ids", async () => {
+    void it("ack of a finished job mutes failures too and reports unknown ids", async () => {
         const state = new TauState();
         const harness = registerTestTools(state);
         const job = makeJob({
@@ -1333,11 +1336,104 @@ void describe("jobs ack", () => {
         assert.match(result.content[0].text, /tmux-1-9: skipped/);
         assert.equal(job.status, "failed");
         assert.equal(job.exitCode, 7);
+        // A finished job's outcome is already in hand, so acknowledging it mutes
+        // the failure notice as well; only a running job keeps its failure.
+        assert.equal(job.completionMuted, "all");
         assert.ok(
             harness.appendedEntries.some(
                 ({ data }) =>
-                    data.event === "acked-by-agent" && data.scope === "success"
+                    data.event === "acked-by-agent" && data.scope === "all"
             )
+        );
+    });
+
+    void it("ack of a running job keeps failure notices", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({ id: "tmux-ack-running", status: "running" });
+        state.backgroundJobs.set(job.id, job);
+        await harness.jobs.execute(
+            "tc",
+            { action: "ack", jobId: job.id },
+            null,
+            null,
+            null
+        );
+        assert.equal(job.completionMuted, "success");
+        assert.equal(job.status, "running");
+    });
+
+    void it("muted completions are dropped with a suppressed-acknowledged record", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-ack-muted-drop",
+            status: "failed",
+            exitCode: 1,
+            endTime: Date.now(),
+        });
+        state.backgroundJobs.set(job.id, job);
+        await harness.invoke("agent_start");
+        notifyCompletion(
+            job,
+            state,
+            harness.pi as never,
+            notificationContext()
+        );
+        job.completionMuted = "all";
+        flushCompletionBatch();
+        assert.ok(
+            harness.appendedEntries.some(
+                ({ data }) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "suppressed-acknowledged" &&
+                    data.jobId === job.id
+            )
+        );
+        await harness.invoke("session_shutdown");
+    });
+
+    void it("jobs list suggests an ack only for jobs that would notify", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const failed = makeJob({ id: "tmux-list-failed", status: "failed" });
+        const quietSuccess = makeJob({
+            id: "tmux-list-quiet",
+            status: "completed",
+            completionDeliveredAt: undefined,
+        });
+        state.backgroundJobs.set(failed.id, failed);
+        state.backgroundJobs.set(quietSuccess.id, quietSuccess);
+        const before = await harness.jobs.execute(
+            "tc",
+            { action: "list" },
+            null,
+            null,
+            null
+        );
+        assert.match(before.content[0].text, /tmux-list-failed/);
+        assert.doesNotMatch(
+            before.content[0].text,
+            /jobs ack.*tmux-list-quiet/
+        );
+        assert.match(before.content[0].text, /jobs ack tmux-list-failed/);
+        await harness.jobs.execute(
+            "tc",
+            { action: "ack", jobId: failed.id },
+            null,
+            null,
+            null
+        );
+        const after = await harness.jobs.execute(
+            "tc",
+            { action: "list" },
+            null,
+            null,
+            null
+        );
+        assert.doesNotMatch(
+            after.content[0].text,
+            /Unacknowledged terminal jobs/
         );
     });
 

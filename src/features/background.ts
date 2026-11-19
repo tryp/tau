@@ -2154,6 +2154,17 @@ export function flushCompletionBatch(): void {
     // still wants the final completion notification). In either case,
     // deliver the notification (which cancels any remaining linked callbacks).
     // Failed completions are always delivered.
+    const mutedDropped = freshBatch.filter(
+        ({ job }) => job.completionMuted === "all"
+    );
+    for (const item of mutedDropped) {
+        recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
+            reason: "suppressed-acknowledged",
+            status: item.job.status,
+            exitCode: item.job.exitCode,
+            delivery: "suppressed",
+        });
+    }
     const deliverable = freshBatch.filter(
         ({ job }) => job.completionMuted !== "all"
     );
@@ -2202,6 +2213,26 @@ function completionNeedsDelivery(jobs: CompletionBatchItem[]): boolean {
                 (job.wantsCompletionNotification ||
                     hasLinkedCallbacksForJob(job.id))
         )
+    );
+}
+
+/**
+ * True when this job still owes the agent a notification. Mirrors
+ * {@link completionNeedsDelivery} for a single job so `jobs list` only suggests
+ * an ack for jobs that would actually produce a notice - not for the successful
+ * completions that are suppressed by default - and stops suggesting it once the
+ * notice was delivered or the job was acknowledged.
+ */
+function jobHasPendingNotice(job: BackgroundJob): boolean {
+    if (job.status === "running") return false;
+    if (job.completionMuted === "all") return false;
+    if (acknowledgedCompletionAt.has(`job:${job.id}`)) return false;
+    if (job.completionDeliveredAt !== undefined || job.completionNotified)
+        return false;
+    return (
+        job.status !== "completed" ||
+        job.wantsCompletionNotification ||
+        hasLinkedCallbacksForJob(job.id)
     );
 }
 
@@ -4625,20 +4656,27 @@ export function registerBackgroundJobs(
                             lines.push(`${id}: skipped (not found).`);
                             continue;
                         }
-                        job.completionMuted = params.silent ? "all" : "success";
+                        // A terminal job's outcome is already in hand, so
+                        // acknowledging it mutes failures too; a running job's
+                        // failure is still unknown, so plain ack keeps it.
+                        const scope: "success" | "all" =
+                            params.silent || job.status !== "running"
+                                ? "all"
+                                : "success";
+                        job.completionMuted = scope;
                         job.wantsCompletionNotification = false;
-                        if (params.silent || job.status === "completed") {
+                        if (scope === "all") {
                             clearJobFromCompletionBatch(id, true);
                         }
                         acknowledgedCompletionAt.set(`job:${id}`, Date.now());
                         recordCompletionTelemetry(pi, "acked-by-agent", {
                             jobId: id,
-                            scope: params.silent ? "all" : "success",
+                            scope,
                         });
                         processed++;
-                        if (params.silent) failuresMuted++;
+                        if (scope === "all") failuresMuted++;
                         lines.push(
-                            `${id}: acknowledged${params.silent ? " (failures muted)" : " (success notices muted)"}.`
+                            `${id}: acknowledged${scope === "all" ? " (failures muted too)" : " (success notices muted; failures still reported)"}.`
                         );
                     }
                     const skippedText = skipped.length
@@ -4670,13 +4708,7 @@ export function registerBackgroundJobs(
                                         ...state.backgroundJobs.values(),
                                         ...state.recentTerminalJobs,
                                     ]
-                                        .filter(
-                                            (job) =>
-                                                job.status !== "running" &&
-                                                !acknowledgedCompletionAt.has(
-                                                    `job:${job.id}`
-                                                )
-                                        )
+                                        .filter(jobHasPendingNotice)
                                         .map((job) => job.id);
                                     const base =
                                         lines.length > 0
@@ -4857,10 +4889,9 @@ export function registerBackgroundJobs(
                         job.status !== "running" &&
                         !state.pendingBackgroundAgents.has(job.id)
                     ) {
-                        job.completionMuted = "success";
+                        job.completionMuted = "all";
                         job.wantsCompletionNotification = false;
-                        if (job.status === "completed")
-                            clearJobFromCompletionBatch(job.id, true);
+                        clearJobFromCompletionBatch(job.id, true);
                         acknowledgedCompletionAt.set(
                             `job:${job.id}`,
                             Date.now()
@@ -5221,10 +5252,9 @@ export function registerBackgroundJobs(
                         job.status !== "running" &&
                         !state.pendingBackgroundAgents.has(job.id)
                     ) {
-                        job.completionMuted = "success";
+                        job.completionMuted = "all";
                         job.wantsCompletionNotification = false;
-                        if (job.status === "completed")
-                            clearJobFromCompletionBatch(job.id, true);
+                        clearJobFromCompletionBatch(job.id, true);
                         acknowledgedCompletionAt.set(
                             `job:${job.id}`,
                             Date.now()
