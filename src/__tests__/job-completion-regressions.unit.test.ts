@@ -63,11 +63,11 @@ function registerTestTools(
     processQueuedMessages: () => void;
     appendedEntries: { customType: string; data: Record<string, unknown> }[];
     cancelledQueueKeys: string[];
-    invoke: (event: string) => Promise<void>;
+    invoke: (event: string, payload?: unknown) => Promise<void>;
 } {
     let jobs: TestTool | undefined;
     let jobDecide: TestTool | undefined;
-    const handlers = new Map<string, () => unknown>();
+    const handlers = new Map<string, (payload?: unknown) => unknown>();
     const sentMessages: unknown[] = [];
     const sentMessageOptions: unknown[] = [];
     const queuedMessages: {
@@ -141,8 +141,8 @@ function registerTestTools(
         },
         appendedEntries,
         cancelledQueueKeys,
-        invoke: async (event: string) => {
-            await handlers.get(event)?.();
+        invoke: async (event: string, payload?: unknown) => {
+            await handlers.get(event)?.(payload);
         },
     };
 }
@@ -505,6 +505,70 @@ void describe("job completion regression coverage", () => {
             (sentMessageOptions[0] as { queueKey: string }).queueKey,
             /^tau:bg:completion:[0-9a-f-]{36}:\d+$/
         );
+    });
+
+    void it("does not resume an aborted turn to deliver a notice", async () => {
+        // Delivering at turn_end queues a followUp turn. An aborted turn is the
+        // user (or a gate) asking the agent to stop, so the notice waits for the
+        // settled path instead of resurrecting the run it just abandoned.
+        const state = new TauState();
+        const { pi, sentMessages, appendedEntries, invoke } =
+            registerTestTools(state);
+        const job = makeJob({
+            id: "job-aborted-turn-end",
+            status: "failed",
+            exitCode: 2,
+            wantsCompletionNotification: true,
+        });
+
+        await invoke("agent_start");
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        await invoke("turn_end", { message: { stopReason: "aborted" } });
+        assert.equal(sentMessages.length, 0);
+
+        await invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(sentMessages.length, 1);
+        const delivered = appendedEntries
+            .map((entry) => entry.data)
+            .filter(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered"
+            );
+        assert.equal(delivered.length, 1);
+        assert.equal(delivered[0]?.deliveryBoundary, "settled");
+        await invoke("session_shutdown");
+    });
+
+    void it("labels an idle delivery apart from a boundary flush", async () => {
+        // A job that finishes while no run is active is delivered immediately;
+        // counting that as `settled` would mix a sub-second wait into the
+        // end-of-run tail this change is measured against.
+        const state = new TauState();
+        const { pi, sentMessages, appendedEntries, invoke } =
+            registerTestTools(state);
+        const job = makeJob({
+            id: "job-idle-delivery",
+            status: "completed",
+            exitCode: 0,
+            wantsCompletionNotification: true,
+        });
+
+        notifyCompletion(job, state, pi as never, notificationContext());
+        flushCompletionBatch();
+        assert.equal(sentMessages.length, 1);
+        const delivered = appendedEntries
+            .map((entry) => entry.data)
+            .filter(
+                (data) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered"
+            );
+        assert.equal(delivered.length, 1);
+        assert.equal(delivered[0]?.deliveryBoundary, "idle");
+        await invoke("session_shutdown");
     });
 
     void it("keeps a completion inside the batch debounce until a later turn_end", async () => {

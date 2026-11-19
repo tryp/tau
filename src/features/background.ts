@@ -1799,7 +1799,7 @@ type PendingCompletionDelivery = {
     state: TauState;
     sessionId: string;
     queueKey: string;
-    deliveryBoundary?: "turn_end" | "settled";
+    deliveryBoundary?: DeliveryBoundary;
 };
 
 const pendingCompletionDeliveries: PendingCompletionDelivery[] = [];
@@ -1990,7 +1990,7 @@ function recordCompletionTelemetry(
         count?: number;
         scope?: "success" | "all" | "terminal-implicit";
         delivery?: "immediate" | "deferred-batch" | "suppressed";
-        deliveryBoundary?: "turn_end" | "settled";
+        deliveryBoundary?: DeliveryBoundary;
     } = {}
 ): void {
     const appendEntry = (
@@ -2944,11 +2944,29 @@ function deliverCompletionNotification(
     completeCompletionDeliveryHandoff(delivery, sent);
 }
 
-function flushPendingCompletionDeliveries(
-    boundary: "turn_end" | "settled"
-): void {
+/**
+ * Where a completion notice was drained. `turn_end` is the first in-run boundary
+ * after the job finished; `settled` is the end-of-run fallback; `idle` means the
+ * agent was not running a turn at all, so the notice went out immediately and
+ * neither boundary delayed it. Keeping them apart is what makes the timing
+ * measurable: folding immediate deliveries into `settled` would mix a
+ * sub-second wait with the end-of-run tail and describe neither.
+ */
+type DeliveryBoundary = "turn_end" | "settled" | "idle";
+
+function turnWasAborted(event: unknown): boolean {
+    const message = (
+        event as { message?: { stopReason?: unknown } } | undefined
+    )?.message;
+    return message?.stopReason === "aborted";
+}
+
+function flushPendingCompletionDeliveries(boundary: DeliveryBoundary): void {
+    // Only the turn boundary may drain while a run is active: it is the one
+    // moment a notice can be inserted without landing between a tool call and
+    // its result. Everything else waits for a turn_end or the settled fallback.
     if (
-        (boundary === "settled" && completionAgentBusy) ||
+        (boundary !== "turn_end" && completionAgentBusy) ||
         pendingCompletionDeliveries.length === 0
     )
         return;
@@ -3025,7 +3043,7 @@ function queueCompletionDelivery(
             });
         }
     }
-    flushPendingCompletionDeliveries("settled");
+    flushPendingCompletionDeliveries("idle");
 }
 
 /**
@@ -3687,8 +3705,12 @@ export function registerBackgroundJobs(
             settledCompletionFlushTimer = undefined;
         }
     });
-    eventPi.on?.("turn_end", () => {
-        if (completionAgentBusy) {
+    eventPi.on?.("turn_end", (event: unknown) => {
+        // Delivering here queues a followUp turn, so an aborted turn - the user
+        // or a gate asked the agent to stop - must not resurrect the run from
+        // the boundary it just abandoned. Leave the notice pending; the settled
+        // path still carries it.
+        if (completionAgentBusy && !turnWasAborted(event)) {
             flushPendingCompletionDeliveries("turn_end");
         }
     });
