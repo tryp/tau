@@ -1240,6 +1240,66 @@ void describe("completion notice audit trail", () => {
     });
 });
 
+void describe("completion notice age", () => {
+    void it("states the wait when the notice is older than the stale bound", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-late-failure",
+            status: "failed",
+            exitCode: 1,
+            startTime: Date.now() - 12 * 60 * 1000,
+            endTime: Date.now() - 10 * 60 * 1000,
+        });
+        state.backgroundJobs.set(job.id, job);
+        await harness.invoke("agent_start");
+        notifyCompletion(
+            job,
+            state,
+            harness.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        await harness.invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const text = harness.sentMessages
+            .map((message) => JSON.stringify(message))
+            .join("\n");
+        assert.match(text, /tmux-late-failure/);
+        assert.match(text, /ended 10m0s ago/);
+        await harness.invoke("session_shutdown");
+    });
+
+    void it("omits the wait for a prompt notice", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-prompt-failure",
+            status: "failed",
+            exitCode: 1,
+            startTime: Date.now() - 90 * 1000,
+            endTime: Date.now() - 5 * 1000,
+        });
+        state.backgroundJobs.set(job.id, job);
+        await harness.invoke("agent_start");
+        notifyCompletion(
+            job,
+            state,
+            harness.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        await harness.invoke("agent_settled");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const text = harness.sentMessages
+            .map((message) => JSON.stringify(message))
+            .join("\n");
+        assert.match(text, /tmux-prompt-failure/);
+        assert.doesNotMatch(text, /ended /);
+        await harness.invoke("session_shutdown");
+    });
+});
+
 void describe("jobs ack", () => {
     void it("ack cancels a pending successful delivery and records telemetry", async () => {
         const state = new TauState();

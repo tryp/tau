@@ -2390,12 +2390,26 @@ function logUnidentifiableCompletion(item: CompletionBatchItem): void {
     );
 }
 
+/**
+ * Age of a notice relative to the job's end, when it is older than the same
+ * bound the batch uses to call a completion stale. The header duration is total
+ * runtime, which hides the wait: a job that ran 6 minutes and is announced 42
+ * minutes later reads as "6m" unless the wait is stated beside it.
+ */
+function noticeLateSuffix(job: BackgroundJob): string {
+    if (job.endTime === undefined) return "";
+    const ageMs = Date.now() - job.endTime;
+    return ageMs > ACKNOWLEDGED_STALE_MAX_AGE_MS ? formatDuration(ageMs) : "";
+}
+
 function completionDigestLine(item: CompletionBatchItem): string {
     const job = item.job;
     const status = typeof job.status === "string" ? job.status : "unknown";
     const failed = status !== "completed" || job.exitCode !== 0;
     const parts = [`${job.id}`, failed ? `FAILED ${status}` : status];
     if (job.exitCode !== undefined) parts.push(`exit=${job.exitCode}`);
+    const late = noticeLateSuffix(job);
+    if (late) parts.push(`ended=${late}`);
     if (typeof job.command === "string" && job.command.trim()) {
         parts.push(`command=${JSON.stringify(oneLine(job.command, 60))}`);
     }
@@ -2474,8 +2488,9 @@ function sendIndividualFailure(
             ? ` (${item.outstandingJobs} jobs outstanding)`
             : "";
     const logEvidence = completionLogEvidence(job);
+    const late = noticeLateSuffix(job);
     const lines = [
-        `❌ ${job.id} ${job.status ?? "failed"} (${duration})${outstandingSuffix}`,
+        `❌ ${job.id} ${job.status ?? "failed"} (${duration}${late ? `, ended ${late} ago` : ""})${outstandingSuffix}`,
         ...(job.exitCode !== undefined ? [`Exit code: ${job.exitCode}`] : []),
         ...(logEvidence?.text ? [`Output evidence: ${logEvidence.text}`] : []),
         `Command: ${job.command}`,
