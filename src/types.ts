@@ -194,6 +194,8 @@ export interface BackgroundJob {
     queued?: boolean;
     /** True once the agent has consumed output via attach — suppresses completion notification. */
     outputConsumed?: boolean;
+    /** Last time output was revealed to the agent, regardless of observed job status. */
+    observedOutputAt?: number;
     /** True once the normal completion notification has been queued. */
     completionNotified?: boolean;
     /** Monotonic TauState job counter captured at creation; stable across restore. */

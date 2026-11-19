@@ -524,6 +524,149 @@ void describe("job completion regression coverage", () => {
         assert.equal(sentMessages.length, 0);
     });
 
+    void it("suppresses a failed completion read after end while status still says running", async () => {
+        const state = new TauState();
+        const { jobs, pi, sentMessages, appendedEntries } =
+            registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-observed-after-end-"));
+        const job = makeJob({
+            id: "job-observed-after-end",
+            status: "running",
+            endTime: Date.now() - 10,
+            exitCode: undefined,
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "failure output already read\\n");
+        state.backgroundJobs.set(job.id, job);
+        try {
+            await jobs.execute(
+                "tc-output-lag",
+                { action: "output", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(job.status, "running");
+            assert.ok(job.observedOutputAt! > job.endTime!);
+            job.status = "failed";
+            job.exitCode = 7;
+            notifyCompletion(job, state, pi as never, notificationContext());
+            flushCompletionBatch();
+            assert.equal(sentMessages.length, 0);
+            const terminals = appendedEntries.filter(
+                ({ data }) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "suppressed-observed" &&
+                    data.jobId === job.id
+            );
+            assert.equal(terminals.length, 1);
+            assert.equal(terminals[0]?.data.delivery, "suppressed");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("delivers failure when output was read before the job ended", async () => {
+        const state = new TauState();
+        const { jobs, pi, sentMessages } = registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-observed-before-end-"));
+        const job = makeJob({
+            id: "job-observed-before-end",
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "partial output\\n");
+        state.backgroundJobs.set(job.id, job);
+        try {
+            await jobs.execute(
+                "tc-output-running",
+                { action: "output", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            markJobTerminal(job, "failed", 8);
+            job.endTime = job.observedOutputAt! + 1;
+            notifyCompletion(job, state, pi as never, notificationContext());
+            flushCompletionBatch();
+            assert.equal(sentMessages.length, 1);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("suppresses an explicitly requested successful notice after output was read", async () => {
+        const state = new TauState();
+        const { jobs, pi, sentMessages, appendedEntries } =
+            registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-observed-success-"));
+        const job = makeJob({
+            id: "job-observed-success",
+            status: "running",
+            wantsCompletionNotification: true,
+            endTime: Date.now() - 10,
+            logPath: join(dir, "job.log"),
+        });
+        writeFileSync(job.logPath, "success output\\n");
+        state.backgroundJobs.set(job.id, job);
+        try {
+            await jobs.execute(
+                "tc-output-success",
+                { action: "output", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            job.status = "completed";
+            job.exitCode = 0;
+            notifyCompletion(job, state, pi as never, notificationContext());
+            flushCompletionBatch();
+            assert.equal(sentMessages.length, 0);
+            assert.equal(
+                appendedEntries.filter(
+                    ({ data }) =>
+                        data.event === "delivery-terminal" &&
+                        data.reason === "suppressed-observed" &&
+                        data.jobId === job.id
+                ).length,
+                1
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("does not suppress observed output without an end time or from jobs list", async () => {
+        const state = new TauState();
+        const { jobs, pi, sentMessages } = registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-observed-guards-"));
+        const noEnd = makeJob({
+            id: "job-observed-no-end",
+            status: "failed",
+            logPath: join(dir, "no-end.log"),
+        });
+        const listed = makeJob({
+            id: "job-listed-failure",
+            status: "failed",
+            endTime: Date.now() - 100,
+            logPath: join(dir, "listed.log"),
+        });
+        writeFileSync(noEnd.logPath, "failure\\n");
+        writeFileSync(listed.logPath, "failure\\n");
+        state.backgroundJobs.set(noEnd.id, noEnd);
+        state.backgroundJobs.set(listed.id, listed);
+        try {
+            await jobs.execute("tc-list", { action: "list" }, null, null, null);
+            assert.equal(listed.observedOutputAt, undefined);
+            noEnd.observedOutputAt = Date.now();
+            notifyCompletion(noEnd, state, pi as never, notificationContext());
+            notifyCompletion(listed, state, pi as never, notificationContext());
+            flushCompletionBatch();
+            assert.equal(sentMessages.length, 2);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     void it("cancels a queued success after jobs output and records queue telemetry", async () => {
         const state = new TauState();
         const { jobs, pi, queuedMessages, sentMessages, appendedEntries } =

@@ -438,6 +438,9 @@ void describe("bash_bg deadline wake (decision deadline, never a kill)", () => {
         assert.equal(result.details?.status, "running");
         assert.equal(job.outputConsumed, undefined);
 
+        // Keep the output observation strictly before terminal time; equal
+        // millisecond timestamps are conservatively treated as post-end.
+        mock.timers.tick(1);
         // Exercise the normal proc-close completion path after attach returned.
         job.proc!.emit("close", 0);
         await job.outputIndexPromise;

@@ -1963,6 +1963,7 @@ function recordCompletionTelemetry(
             | "delivered"
             | "suppressed-stale"
             | "suppressed-acknowledged"
+            | "suppressed-observed"
             | "cancelled";
         ageSeconds?: number;
         batchSize?: number;
@@ -2523,7 +2524,29 @@ function deliverCompletionNotification(
     delivery: PendingCompletionDelivery
 ): void {
     const originalJobs = delivery.jobs;
-    const unconsumed = pruneConsumedCompletions(originalJobs);
+    const notObservedAfterEnd = originalJobs.filter((item) => {
+        const { job } = item;
+        if (
+            job.outputConsumed ||
+            job.observedOutputAt === undefined ||
+            job.endTime === undefined ||
+            job.observedOutputAt < job.endTime
+        ) {
+            return true;
+        }
+        recordCompletionItemTelemetry(delivery.pi, "delivery-terminal", item, {
+            reason: "suppressed-observed",
+            ageSeconds: Math.max(
+                0,
+                Math.floor((Date.now() - job.endTime) / 1000)
+            ),
+            status: job.status,
+            exitCode: job.exitCode,
+            delivery: "suppressed",
+        });
+        return false;
+    });
+    const unconsumed = pruneConsumedCompletions(notObservedAfterEnd);
     for (const item of originalJobs) {
         if (item.job.outputConsumed) {
             const now = Date.now();
@@ -2545,6 +2568,7 @@ function deliverCompletionNotification(
                     ),
                     status: item.job.status,
                     exitCode: item.job.exitCode,
+                    delivery: "suppressed",
                 }
             );
         }
@@ -2566,6 +2590,7 @@ function deliverCompletionNotification(
             ),
             status: item.job.status,
             exitCode: item.job.exitCode,
+            delivery: "suppressed",
         });
         return false;
     });
@@ -4754,6 +4779,7 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        job.observedOutputAt = Date.now();
                         // Agent has seen this terminal job's output —
                         // suppress completion notification and cancel reminds.
                         if (job.status !== "running") {
@@ -4983,6 +5009,7 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        job.observedOutputAt = Date.now();
                         const source = await sourceDetailsForJob(job);
                         const metadata = getOutputMetadata(
                             output,
@@ -5066,6 +5093,7 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
+                        job.observedOutputAt = Date.now();
                         const runtime = formatDuration(
                             Date.now() - job.startTime
                         );
@@ -5120,6 +5148,7 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    job.observedOutputAt = Date.now();
                     const metadata = getOutputMetadata(
                         output,
                         outputReadFailed(job, output)
@@ -5348,6 +5377,7 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
+                    job.observedOutputAt = Date.now();
                     const metadata = getOutputMetadata(
                         output,
                         outputReadFailed(job, output)
