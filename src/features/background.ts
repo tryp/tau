@@ -1437,6 +1437,17 @@ function outputDetails(
     });
 }
 
+/**
+ * Record that the agent has seen this job's output, so a later completion notice
+ * for it can be suppressed. A read that failed (the log is gone) reveals nothing
+ * about the outcome, so it must not license suppressing a notice: a failure whose
+ * output the agent could not read still has to be announced.
+ */
+function recordOutputObserved(job: BackgroundJob, output: string): void {
+    if (outputReadFailed(job, output)) return;
+    job.observedOutputAt = Date.now();
+}
+
 function outputReadFailed(job: BackgroundJob, output: string): boolean {
     return output === "(no output yet)" && !existsSync(job.logPath);
 }
@@ -4779,10 +4790,15 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
-                        job.observedOutputAt = Date.now();
+                        recordOutputObserved(job, output);
                         // Agent has seen this terminal job's output —
                         // suppress completion notification and cancel reminds.
-                        if (job.status !== "running") {
+                        // A failed read reveals nothing, so it consumes nothing:
+                        // the notice is then the only place the exit evidence appears.
+                        if (
+                            job.status !== "running" &&
+                            !outputReadFailed(job, output)
+                        ) {
                             job.outputConsumed = true;
                             state.cancelCompletionBatchForJob?.(job.id);
                             cancelCallbacksForJob(job.id);
@@ -5009,7 +5025,7 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
-                        job.observedOutputAt = Date.now();
+                        recordOutputObserved(job, output);
                         const source = await sourceDetailsForJob(job);
                         const metadata = getOutputMetadata(
                             output,
@@ -5093,7 +5109,7 @@ export function registerBackgroundJobs(
                             job.logPath,
                             MAX_OUTPUT_PREVIEW_CHARS
                         );
-                        job.observedOutputAt = Date.now();
+                        recordOutputObserved(job, tail);
                         const runtime = formatDuration(
                             Date.now() - job.startTime
                         );
@@ -5148,7 +5164,7 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
-                    job.observedOutputAt = Date.now();
+                    recordOutputObserved(job, output);
                     const metadata = getOutputMetadata(
                         output,
                         outputReadFailed(job, output)
@@ -5176,7 +5192,10 @@ export function registerBackgroundJobs(
                             }),
                         };
                     }
-                    if (job.status !== "running") {
+                    if (
+                        job.status !== "running" &&
+                        !outputReadFailed(job, output)
+                    ) {
                         job.outputConsumed = true;
                         state.cancelCompletionBatchForJob?.(job.id);
                     }
@@ -5377,7 +5396,7 @@ export function registerBackgroundJobs(
                         job.logPath,
                         MAX_OUTPUT_PREVIEW_CHARS
                     );
-                    job.observedOutputAt = Date.now();
+                    recordOutputObserved(job, output);
                     const metadata = getOutputMetadata(
                         output,
                         outputReadFailed(job, output)
@@ -5385,7 +5404,11 @@ export function registerBackgroundJobs(
                     const source = await sourceDetailsForJob(job);
                     // Agent has seen this terminal job's output —
                     // suppress completion notification and cancel reminds.
-                    if (job.status !== "running") {
+                    // A failed read reveals nothing, so it consumes nothing.
+                    if (
+                        job.status !== "running" &&
+                        !outputReadFailed(job, output)
+                    ) {
                         job.outputConsumed = true;
                         state.cancelCompletionBatchForJob?.(job.id);
                         cancelCallbacksForJob(job.id);

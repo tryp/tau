@@ -318,10 +318,16 @@ void describe("job completion regression coverage", () => {
     void it("suppresses a queued completion after attach consumes output", async () => {
         const state = new TauState();
         const { jobs, pi, sentMessages } = registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-attach-race-"));
         const job = makeJob({
             id: "job-attach-race",
             wantsCompletionNotification: true,
+            logPath: join(dir, "job.log"),
         });
+        // The race this pins is about a real log the agent consumes; an empty
+        // log reveals nothing and must not count as consumption (see
+        // "delivers the failure when the output read failed").
+        writeFileSync(job.logPath, "attached output\n");
         createJobDonePromise(job);
         state.backgroundJobs.set(job.id, job);
 
@@ -347,6 +353,7 @@ void describe("job completion regression coverage", () => {
             0,
             "attach-consumed output must suppress the deferred completion"
         );
+        rmSync(dir, { recursive: true, force: true });
     });
 
     void it("restores a cancelled completion for autonomous wake evaluation", () => {
@@ -589,6 +596,45 @@ void describe("job completion regression coverage", () => {
             notifyCompletion(job, state, pi as never, notificationContext());
             flushCompletionBatch();
             assert.equal(sentMessages.length, 1);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    void it("delivers the failure when the output read failed", async () => {
+        // A missing log reveals nothing, so it must not license suppression:
+        // the notice is the only place the exit code and evidence appear.
+        const state = new TauState();
+        const { jobs, pi, sentMessages, appendedEntries } =
+            registerTestTools(state);
+        const dir = mkdtempSync(join(tmpdir(), "tau-observed-unreadable-"));
+        const job = makeJob({
+            id: "job-observed-unreadable",
+            status: "running",
+            logPath: join(dir, "missing.log"),
+        });
+        state.backgroundJobs.set(job.id, job);
+        try {
+            await jobs.execute(
+                "tc-output-missing",
+                { action: "output", jobId: job.id },
+                null,
+                null,
+                null
+            );
+            assert.equal(job.observedOutputAt, undefined);
+            markJobTerminal(job, "failed", 9);
+            notifyCompletion(job, state, pi as never, notificationContext());
+            flushCompletionBatch();
+            assert.equal(sentMessages.length, 1);
+            assert.equal(
+                appendedEntries.filter(
+                    ({ data }) =>
+                        data.event === "delivery-terminal" &&
+                        data.reason === "suppressed-observed"
+                ).length,
+                0
+            );
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
