@@ -435,7 +435,7 @@ export function validateRequestedPolicies(params: {
 /**
  * Arm the bash_bg deadline wake. The deadline is a decision point, not a
  * kill: when it fires the agent is woken once to inspect progress and decide
- * (extend, jobs kill, ignore). The job is never terminated by the deadline,
+ * (extend, jobs kill, or jobs ack to stop the notice while it keeps running). The job is never terminated by the deadline,
  * on any backend — arming this helper on both the tmux and direct-spawn
  * routes is the notification-parity repair.
  *
@@ -1959,6 +1959,7 @@ function recordCompletionTelemetry(
         generation?: number;
         jobGeneration?: number;
         reason?:
+            | "session-shutdown"
             | "delivered"
             | "suppressed-stale"
             | "suppressed-acknowledged"
@@ -1973,6 +1974,8 @@ function recordCompletionTelemetry(
         observedBy?: CompletionTrigger;
         sendKind?: CompletionBatchItem["sendKind"];
         outstandingJobs?: number;
+        count?: number;
+        scope?: "success" | "all" | "terminal-implicit";
         delivery?: "immediate" | "deferred-batch" | "suppressed";
     } = {}
 ): void {
@@ -2031,6 +2034,8 @@ function recordCompletionTelemetry(
             ...(fields.outstandingJobs !== undefined
                 ? { outstandingJobs: fields.outstandingJobs }
                 : {}),
+            ...(fields.count !== undefined ? { count: fields.count } : {}),
+            ...(fields.scope ? { scope: fields.scope } : {}),
             ...(fields.delivery ? { delivery: fields.delivery } : {}),
         });
     } catch {
@@ -2087,6 +2092,12 @@ function countOutstandingJobs(state: TauState, excludeJobId?: string): number {
 }
 
 function isCompletionAcknowledged(item: CompletionBatchItem): boolean {
+    if (
+        item.job.status !== "completed" &&
+        item.job.completionMuted === "success"
+    ) {
+        return false;
+    }
     return (
         acknowledgedCompletionAt.has(
             stableCompletionIdentity(
@@ -2143,8 +2154,12 @@ export function flushCompletionBatch(): void {
     // still wants the final completion notification). In either case,
     // deliver the notification (which cancels any remaining linked callbacks).
     // Failed completions are always delivered.
-    if (!hasFailedCompletion(freshBatch)) {
-        const hasLinked = freshBatch.some(
+    const deliverable = freshBatch.filter(
+        ({ job }) => job.completionMuted !== "all"
+    );
+    if (deliverable.length === 0) return;
+    if (!hasFailedCompletion(deliverable)) {
+        const hasLinked = deliverable.some(
             (j) =>
                 hasLinkedCallbacksForJob(j.job.id) ||
                 j.job.wantsCompletionNotification
@@ -2153,7 +2168,7 @@ export function flushCompletionBatch(): void {
             // No normal follow-up is emitted for an unlinked successful
             // completion. Record this terminal outcome and leave it visible
             // to the optional autonomous wake evaluator.
-            for (const item of freshBatch) {
+            for (const item of deliverable) {
                 recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
                     reason: "cancelled",
                     status: item.job.status,
@@ -2169,11 +2184,13 @@ export function flushCompletionBatch(): void {
         }
     }
 
-    queueCompletionDelivery(freshBatch, pi, state);
+    queueCompletionDelivery(deliverable, pi, state);
 }
 
 function hasFailedCompletion(jobs: CompletionBatchItem[]): boolean {
-    return jobs.some((j) => j.job.status !== "completed");
+    return jobs.some(
+        (j) => j.job.status !== "completed" && j.job.completionMuted !== "all"
+    );
 }
 
 function completionNeedsDelivery(jobs: CompletionBatchItem[]): boolean {
@@ -2417,6 +2434,7 @@ function sendIndividualFailure(
     item: CompletionBatchItem
 ): void {
     const job = item.job;
+    if (job.completionMuted === "all") return;
     const duration = Number.isFinite(job.startTime)
         ? formatDuration(Date.now() - job.startTime)
         : "unknown duration";
@@ -2919,7 +2937,10 @@ function queueCompletionDelivery(
  * Called when the agent cancels callbacks — no point sending stale
  * notifications for jobs the agent has already acknowledged.
  */
-export function clearJobFromCompletionBatch(jobId: string): void {
+export function clearJobFromCompletionBatch(
+    jobId: string,
+    acknowledge = false
+): void {
     const acknowledgedAt = Date.now();
     const acknowledgedItems = [
         ...completionBatch.jobs,
@@ -2928,8 +2949,10 @@ export function clearJobFromCompletionBatch(jobId: string): void {
             (delivery) => delivery.jobs
         ),
     ].filter((item) => item.job.id === jobId);
+    if (acknowledge)
+        acknowledgedCompletionAt.set(`job:${jobId}`, acknowledgedAt);
     for (const item of acknowledgedItems) {
-        if (item.job.outputConsumed) {
+        if (acknowledge || item.job.outputConsumed) {
             acknowledgedCompletionAt.set(`job:${jobId}`, acknowledgedAt);
             acknowledgedCompletionAt.set(
                 stableCompletionIdentity(
@@ -3588,6 +3611,20 @@ export function registerBackgroundJobs(
             clearTimeout(settledCompletionFlushTimer);
             settledCompletionFlushTimer = undefined;
         }
+        const droppedIds = [
+            ...pendingCompletionDeliveries.flatMap((delivery) =>
+                delivery.jobs.map(({ job }) => job.id)
+            ),
+            ...completionBatch.jobs.map(({ job }) => job.id),
+            ...Array.from(queuedCompletionDeliveries.values()).flatMap(
+                (delivery) => delivery.jobs.map(({ job }) => job.id)
+            ),
+        ];
+        recordCompletionTelemetry(eventPi, "dropped-at-shutdown", {
+            jobIds: droppedIds,
+            count: droppedIds.length,
+            reason: "session-shutdown",
+        });
         pendingCompletionDeliveries.length = 0;
         clearAllCompletionBatches();
         stopAllJobLiveness();
@@ -4138,7 +4175,7 @@ export function registerBackgroundJobs(
         promptGuidelines: [
             "Use bash_bg when you want to start a long-running command in background immediately.",
             "This is different from regular bash + Ctrl+Shift+B — bash_bg backgrounds from the start.",
-            "Use timeout to set a decision deadline: when it fires you are woken to check progress and decide (extend, jobs kill, ignore). The job is not terminated automatically.",
+            "Use timeout to set a decision deadline: when it fires you are woken to check progress and decide (extend, jobs kill, or jobs ack to stop the notice while it keeps running). The job is not terminated automatically.",
             "Use remindDelay to schedule a reminder callback (auto-cancels if the job finishes first).",
             "Output accumulates in the log file while the job runs. Use jobs output to read it at any time.",
             "The result details include jobId, status, line metadata, and logPath; terminal output may also include sidecar sourceId/chunkIds.",
@@ -4451,7 +4488,7 @@ export function registerBackgroundJobs(
         name: "jobs",
         label: "Background Jobs",
         description:
-            "List, inspect, kill, or attach to background jobs. Output is read from disk files. " +
+            "List, inspect, kill, acknowledge, or attach to background jobs. jobs ack with jobId or jobIds stops notices without stopping the job; silent=true also mutes failure notices. Output is read from disk files. " +
             "Jobs(attach) is non-blocking — it polls the job periodically and streams progress " +
             "updates to the agent. The agent can abort at any time, and a configurable timeout " +
             "(default 10 min) prevents indefinite blocking. " +
@@ -4467,6 +4504,7 @@ export function registerBackgroundJobs(
             "Use jobs with action 'output' tail=15 to show the last 15 matching lines, the default.",
             "Output results include structured line/empty/error/truncation metadata; use the returned sourceId or chunkIds with context_get for full indexed output.",
             "Use jobs with action 'kill' to terminate a running background job (also cancels linked reminders).",
+            "Use jobs with action 'ack' and jobIds (or jobId) to stop notices without stopping jobs; silent=true also mutes failure notices.",
             "Use jobs with action 'attach' to monitor a running job with progress polling; " +
                 "attach is safe to use — it will not block indefinitely (has a timeout).",
             "Use the optional 'timeout' parameter (seconds) to control how long to wait; " +
@@ -4476,12 +4514,26 @@ export function registerBackgroundJobs(
             "For searching across past or indexed job output, use context_search with tool_name='bash_bg'.",
         ],
         parameters: Type.Object({
-            action: StringEnum(["list", "output", "kill", "attach"] as const, {
-                description: "Action to perform",
-            }),
+            action: StringEnum(
+                ["list", "output", "kill", "attach", "ack"] as const,
+                {
+                    description: "Action to perform",
+                }
+            ),
             jobId: Type.Optional(
                 Type.String({
-                    description: "Job ID for output/kill/attach",
+                    description:
+                        "Job ID for output/kill/attach or a single job to ack",
+                })
+            ),
+            jobIds: Type.Optional(
+                Type.Array(Type.String(), {
+                    description: "Job IDs for action=ack",
+                })
+            ),
+            silent: Type.Optional(
+                Type.Boolean({
+                    description: "For action=ack, also mute failure notices",
                 })
             ),
             grep: Type.Optional(
@@ -4532,6 +4584,76 @@ export function registerBackgroundJobs(
             ctx
         ): Promise<AgentToolResult<JobResultDetails | undefined>> {
             switch (params.action) {
+                case "ack": {
+                    const ids = [
+                        ...new Set([
+                            ...(params.jobIds ?? []),
+                            ...(params.jobId ? [params.jobId] : []),
+                        ]),
+                    ];
+                    if (ids.length === 0) {
+                        const ackable = [
+                            ...new Set(
+                                [
+                                    ...state.backgroundJobs.values(),
+                                    ...state.recentTerminalJobs,
+                                ].map((job) => job.id)
+                            ),
+                        ];
+                        if (ackable.length === 0)
+                            throw new Error(
+                                "No jobs to acknowledge; pass jobIds."
+                            );
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Ack-able jobs: ${ackable.join(", ")}. Pass jobIds to acknowledge.`,
+                                },
+                            ],
+                            details: undefined,
+                        };
+                    }
+                    const skipped: string[] = [];
+                    let processed = 0;
+                    let failuresMuted = 0;
+                    const lines: string[] = [];
+                    for (const id of ids) {
+                        const job = lookupJob(state, id);
+                        if (!job) {
+                            skipped.push(id);
+                            lines.push(`${id}: skipped (not found).`);
+                            continue;
+                        }
+                        job.completionMuted = params.silent ? "all" : "success";
+                        job.wantsCompletionNotification = false;
+                        if (params.silent || job.status === "completed") {
+                            clearJobFromCompletionBatch(id, true);
+                        }
+                        acknowledgedCompletionAt.set(`job:${id}`, Date.now());
+                        recordCompletionTelemetry(pi, "acked-by-agent", {
+                            jobId: id,
+                            scope: params.silent ? "all" : "success",
+                        });
+                        processed++;
+                        if (params.silent) failuresMuted++;
+                        lines.push(
+                            `${id}: acknowledged${params.silent ? " (failures muted)" : " (success notices muted)"}.`
+                        );
+                    }
+                    const skippedText = skipped.length
+                        ? `, ${skipped.length} skipped: ${skipped.join(", ")} not found`
+                        : "";
+                    lines.push(
+                        `Acknowledged ${processed} jobs (${failuresMuted} muted for failures too${skippedText}). The jobs keep running; ack only stops notices.`
+                    );
+                    return {
+                        content: [
+                            { type: "text" as const, text: lines.join("\n") },
+                        ],
+                        details: undefined,
+                    };
+                }
                 case "list": {
                     const running = Array.from(state.backgroundJobs.values());
                     const recent = state.recentTerminalJobs.slice(-5).reverse();
@@ -4543,10 +4665,27 @@ export function registerBackgroundJobs(
                         content: [
                             {
                                 type: "text" as const,
-                                text:
-                                    lines.length > 0
-                                        ? `Background Jobs:\n${lines.join("\n")}`
-                                        : "No background jobs",
+                                text: (() => {
+                                    const unacknowledged = [
+                                        ...state.backgroundJobs.values(),
+                                        ...state.recentTerminalJobs,
+                                    ]
+                                        .filter(
+                                            (job) =>
+                                                job.status !== "running" &&
+                                                !acknowledgedCompletionAt.has(
+                                                    `job:${job.id}`
+                                                )
+                                        )
+                                        .map((job) => job.id);
+                                    const base =
+                                        lines.length > 0
+                                            ? `Background Jobs:\n${lines.join("\n")}`
+                                            : "No background jobs";
+                                    return unacknowledged.length
+                                        ? `${base}\nUnacknowledged terminal jobs: ${unacknowledged.join(", ")} - read with jobs output, or jobs ack ${unacknowledged.join(" ")} to stop notices.`
+                                        : base;
+                                })(),
                             },
                         ],
                         details: undefined,
@@ -4714,6 +4853,32 @@ export function registerBackgroundJobs(
                     const job = lookupJob(state, params.jobId);
                     if (!job) throw new Error(`Job not found: ${params.jobId}`);
 
+                    if (
+                        job.status !== "running" &&
+                        !state.pendingBackgroundAgents.has(job.id)
+                    ) {
+                        job.completionMuted = "success";
+                        job.wantsCompletionNotification = false;
+                        if (job.status === "completed")
+                            clearJobFromCompletionBatch(job.id, true);
+                        acknowledgedCompletionAt.set(
+                            `job:${job.id}`,
+                            Date.now()
+                        );
+                        recordCompletionTelemetry(pi, "acked-by-agent", {
+                            jobId: job.id,
+                            scope: "terminal-implicit",
+                        });
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Job ${job.id} already finished (${job.status}, ${formatDuration((job.endTime ?? Date.now()) - job.startTime)}); acknowledged - no further notices.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
                     if (state.pendingBackgroundAgents.has(job.id)) {
                         cancelPendingBackgroundAgent(state, job.id);
                         clearPendingDecision(state, job);
@@ -5052,6 +5217,33 @@ export function registerBackgroundJobs(
 
             switch (params.decision) {
                 case "kill": {
+                    if (
+                        job.status !== "running" &&
+                        !state.pendingBackgroundAgents.has(job.id)
+                    ) {
+                        job.completionMuted = "success";
+                        job.wantsCompletionNotification = false;
+                        if (job.status === "completed")
+                            clearJobFromCompletionBatch(job.id, true);
+                        acknowledgedCompletionAt.set(
+                            `job:${job.id}`,
+                            Date.now()
+                        );
+                        recordCompletionTelemetry(pi, "acked-by-agent", {
+                            jobId: job.id,
+                            scope: "terminal-implicit",
+                        });
+                        state.pendingDecisionJobId = undefined;
+                        return {
+                            content: [
+                                {
+                                    type: "text" as const,
+                                    text: `Job ${job.id} already finished (${job.status}, ${formatDuration((job.endTime ?? Date.now()) - job.startTime)}); acknowledged - no further notices.`,
+                                },
+                            ],
+                            details: jobDetails(job),
+                        };
+                    }
                     if (state.pendingBackgroundAgents.has(job.id)) {
                         cancelPendingBackgroundAgent(state, job.id);
                         state.pendingDecisionJobId = undefined;

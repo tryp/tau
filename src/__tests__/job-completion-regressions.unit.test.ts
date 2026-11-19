@@ -1239,3 +1239,159 @@ void describe("completion notice audit trail", () => {
         );
     });
 });
+
+void describe("jobs ack", () => {
+    void it("ack cancels a pending successful delivery and records telemetry", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-ack-1",
+            status: "completed",
+            endTime: Date.now(),
+        });
+        state.backgroundJobs.set(job.id, job);
+        await harness.invoke("agent_start");
+        notifyCompletion(
+            job,
+            state,
+            harness.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        const result = await harness.jobs.execute(
+            "tc",
+            { action: "ack", jobId: job.id },
+            null,
+            null,
+            null
+        );
+        assert.match(result.content[0].text, /Acknowledged 1 jobs/);
+        assert.equal(job.status, "completed");
+        assert.ok(
+            harness.appendedEntries.some(
+                ({ data }) =>
+                    data.event === "acked-by-agent" && data.jobId === job.id
+            )
+        );
+        assert.equal(harness.sentMessages.length, 0);
+        await harness.invoke("session_shutdown");
+    });
+
+    void it("plain ack permits failure delivery while silent ack suppresses it", async () => {
+        for (const silent of [false, true]) {
+            const state = new TauState();
+            const harness = registerTestTools(state);
+            const job = makeJob({
+                id: `tmux-ack-failure-${silent}`,
+                status: "failed",
+                exitCode: 1,
+                endTime: Date.now(),
+            });
+            state.backgroundJobs.set(job.id, job);
+            await harness.jobs.execute(
+                "tc",
+                {
+                    action: "ack",
+                    jobId: job.id,
+                    ...(silent ? { silent: true } : {}),
+                },
+                null,
+                null,
+                null
+            );
+            await harness.invoke("agent_start");
+            notifyCompletion(
+                job,
+                state,
+                harness.pi as never,
+                notificationContext()
+            );
+            flushCompletionBatch();
+            await harness.invoke("agent_settled");
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            assert.equal(harness.sentMessages.length > 0, !silent);
+            await harness.invoke("session_shutdown");
+        }
+    });
+
+    void it("ack preserves terminal status and exit code and reports unknown ids", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-ack-terminal",
+            status: "failed",
+            exitCode: 7,
+        });
+        state.backgroundJobs.set(job.id, job);
+        const result = await harness.jobs.execute(
+            "tc",
+            { action: "ack", jobIds: [job.id, "tmux-1-9"] },
+            null,
+            null,
+            null
+        );
+        assert.match(result.content[0].text, /tmux-1-9: skipped/);
+        assert.equal(job.status, "failed");
+        assert.equal(job.exitCode, 7);
+        assert.ok(
+            harness.appendedEntries.some(
+                ({ data }) =>
+                    data.event === "acked-by-agent" && data.scope === "success"
+            )
+        );
+    });
+
+    void it("terminal kill acknowledges instead of claiming a kill", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state);
+        const job = makeJob({
+            id: "tmux-kill-terminal",
+            status: "completed",
+            endTime: Date.now(),
+        });
+        state.backgroundJobs.set(job.id, job);
+        const result = await harness.jobs.execute(
+            "tc",
+            { action: "kill", jobId: job.id },
+            null,
+            null,
+            null
+        );
+        assert.match(result.content[0].text, /already finished \(completed,/);
+        assert.equal(job.status, "completed");
+        assert.ok(
+            harness.appendedEntries.some(
+                ({ data }) =>
+                    data.event === "acked-by-agent" &&
+                    data.scope === "terminal-implicit"
+            )
+        );
+    });
+
+    void it("shutdown records dropped pending deliveries once", async () => {
+        const state = new TauState();
+        const harness = registerTestTools(state, { holdFollowUps: true });
+        const job = makeJob({
+            id: "tmux-shutdown-drop",
+            status: "failed",
+            exitCode: 1,
+            endTime: Date.now(),
+        });
+        state.backgroundJobs.set(job.id, job);
+        await harness.invoke("agent_start");
+        notifyCompletion(
+            job,
+            state,
+            harness.pi as never,
+            notificationContext()
+        );
+        flushCompletionBatch();
+        await harness.invoke("session_shutdown");
+        const records = harness.appendedEntries.filter(
+            ({ data }) => data.event === "dropped-at-shutdown"
+        );
+        assert.equal(records.length, 1);
+        assert.equal(records[0].data.count, 1);
+        assert.deepEqual(records[0].data.jobIds, [job.id]);
+    });
+});

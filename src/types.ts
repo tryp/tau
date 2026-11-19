@@ -215,6 +215,8 @@ export interface BackgroundJob {
      * even though the original linked callback has already been consumed.
      */
     wantsCompletionNotification?: boolean;
+    /** Agent acknowledgement scope for future completion notices. */
+    completionMuted?: "success" | "all";
     /** Indexed output identifiers, populated after terminal completion. */
     sourceId?: string;
     chunkIds?: string[];
