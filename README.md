@@ -171,10 +171,21 @@ Some features (instructions, git-checkpoint) bootstrap at session start; togglin
 
 ### Autonomous wake evaluation
 
-Autonomous wake evaluation is opt-in and periodically checks for background work
-that needs attention (pending decisions, queued agents, paused state, or
-unacknowledged terminal jobs). Healthy running jobs do not wake the agent.
-Configure it in global or project `.pi/settings.json` (project settings win):
+Autonomous wake evaluation runs one timer with two rules over background work.
+
+- **Attention** — pending decisions, queued agents, paused state, or
+  unacknowledged terminal jobs wake the agent as soon as a tick observes them.
+  Each snapshot wakes once; a resolved snapshot retracts the queued wake.
+- **Heartbeat** — work that is *still running* wakes the agent once the parent
+  has been idle for a full interval. The wake carries a status summary (running
+  jobs and any extension-registered background work) and asks for a short reply,
+  so the parent can decide whether to check in or steer instead of discovering a
+  stalled child hours later. It also keeps the parent's prompt cache warm: the
+  default interval is 4 minutes, below the 5 minute provider cache TTL.
+
+Both rules are on by default and share one keyed `tau:wakeup` follow-up, so they
+can never both be waiting. Configure them in global or project
+`.pi/settings.json` (project settings win):
 
 ```json
 {
@@ -187,16 +198,28 @@ Configure it in global or project `.pi/settings.json` (project settings win):
 }
 ```
 
-The interval is bounded to 10 seconds through 1 hour. Wake follow-ups are
-coalesced with the keyed `tau:wakeup` queue entry and are cancelled at session
-shutdown or when no actionable work remains.
+The interval is bounded to 10 seconds through 1 hour and is the idle duration a
+heartbeat requires. `"enabled": false` opts out of both rules. The heartbeat
+deadline is anchored to the parent's last model request rather than to a fixed
+tick, and a busy parent is re-sampled every 30 seconds instead of being
+interrupted — a turn that is already running keeps the cache warm on its own.
+Wake follow-ups are coalesced with the keyed `tau:wakeup` queue entry and are
+cancelled at session shutdown or when no work remains.
+
+Every wake and every skipped-with-work tick records a `tau_wakeup_telemetry`
+session entry (`attention-sent`, `heartbeat-sent`, `heartbeat-resampled`,
+`skipped-no-cancellation`, `registry-failure`) so a quiet engine can be told
+apart from a broken one.
 
 When the optional `pi-subagents` extension is loaded, Tau also consumes its
-process-local background-work attention registry (`Symbol.for("pi-subagents.background-work.v1")`).
-Only attention items for the current session are included; healthy running work
-is ignored. This integration is defensive and optional: missing or malformed
-registries, providers, and provider failures leave Tau's local wake behavior
-unchanged. Tau does not depend on or import `pi-subagents`.
+process-local background-work registry (`Symbol.for("pi-subagents.background-work.v1")`).
+Protocol versions 1 and 2 are read: attention items wake under the attention
+rule, active work feeds the heartbeat, and a v2 per-item `summary` becomes the
+heartbeat line for that item. Only items for the current session are included.
+This integration is defensive and optional: missing or malformed registries,
+providers, and provider failures leave Tau's local wake behavior unchanged, and
+a rejected registry records one `registry-failure` entry instead of failing
+silently. Tau does not depend on or import `pi-subagents`.
 
 ## Tools
 
@@ -266,7 +289,7 @@ src/
     task.ts             task tool, /tasks command (nesting, links, status)
     tools-selector.ts   /tools command, state persistence
     notifications.ts    /notifications, agent_end notification, DnD support
-    wakeup.ts           Opt-in autonomous background-work wake evaluation
+    wakeup.ts           Autonomous background-work wake evaluation (attention + heartbeat)
     bookmark.ts         /bookmark, /unbookmark
     context-files.ts    project instructions, rules, and memory loading
     custom-footer.ts    /footer command

@@ -192,6 +192,16 @@ export class TauState {
     wakeupCancel?: () => void;
     /** Signature of the last actionable snapshot sent as a wake follow-up. */
     wakeupLastSignature?: string;
+    /** Last registry failure already recorded, so one failure is not logged per tick. */
+    wakeupLastRegistryFailure?: string;
+    /** Epoch ms of the last heartbeat wake, for tests and diagnostics. */
+    wakeupLastHeartbeatAt?: number;
+    /**
+     * Which rule queued the follow-up currently in flight, so a heartbeat that
+     * has been overtaken by a new request can be retracted without discarding
+     * an attention wake.
+     */
+    wakeupQueuedKind?: "attention" | "heartbeat";
 
     /**
      * Test-only: force-flush the completion delivery batch.

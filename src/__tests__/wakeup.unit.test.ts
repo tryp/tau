@@ -8,6 +8,8 @@ import {
     evaluateWakeup,
     registerWakeup,
     WAKEUP_DEFAULT_INTERVAL_MS,
+    WAKEUP_HEARTBEAT_MAX_ITEMS,
+    WAKEUP_IDLE_RECHECK_MS,
     WAKEUP_MAX_INTERVAL_MS,
     WAKEUP_MESSAGE_MAX_CHARS,
     WAKEUP_MIN_INTERVAL_MS,
@@ -20,12 +22,19 @@ interface SentMessage {
     options: { deliverAs: string; triggerTurn: boolean; queueKey: string };
 }
 
+interface TelemetryEntry {
+    customType: string;
+    data: Record<string, unknown>;
+}
+
 function makePi() {
     const sent: SentMessage[] = [];
     const cancelled: string[] = [];
+    const entries: TelemetryEntry[] = [];
     return {
         sent,
         cancelled,
+        entries,
         pi: {
             sendMessage(
                 message: SentMessage["message"],
@@ -35,6 +44,9 @@ function makePi() {
             },
             cancelQueuedMessage(key: string) {
                 cancelled.push(key);
+            },
+            appendEntry(customType: string, data: Record<string, unknown>) {
+                entries.push({ customType, data });
             },
             on() {},
         } as never,
@@ -69,19 +81,22 @@ function installBackgroundWorkRegistry(value: unknown): () => void {
     };
 }
 
-function attentionRegistry(provider: Record<string, unknown>): {
+function attentionRegistry(
+    provider: Record<string, unknown>,
+    version = 1
+): {
     version: number;
     providers: Map<string, unknown>;
 } {
     return {
-        version: 1,
+        version,
         providers: new Map([[provider.name as string, provider]]),
     };
 }
 
 void describe("autonomous wake evaluation", () => {
     void beforeEach(() =>
-        mock.timers.enable({ apis: ["setInterval", "Date"] })
+        mock.timers.enable({ apis: ["setInterval", "setTimeout", "Date"] })
     );
     void afterEach(() => mock.timers.reset());
 
@@ -106,13 +121,324 @@ void describe("autonomous wake evaluation", () => {
         );
     });
 
-    void it("does not wake for no work or a healthy running job", () => {
+    void it("does not wake for no work or for running work before the idle interval", () => {
         const state = new TauState();
         const queue = makePi();
         assert.equal(evaluateWakeup(queue.pi, state), false);
         state.backgroundJobs.set("run", job("run", "running"));
+        const now = Date.now();
+        const heartbeat = {
+            now: () => now,
+            intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+            parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS + 1,
+        };
+        // A healthy run is not actionable, and a wake inside the interval would
+        // interrupt a parent whose cache is still warm.
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", heartbeat),
+            false
+        );
         assert.equal(evaluateWakeup(queue.pi, state), false);
         assert.equal(queue.sent.length, 0);
+    });
+
+    void it("heartbeats running work once the parent has idled a full interval", () => {
+        const state = new TauState();
+        state.backgroundJobs.set("run", job("run", "running"));
+        const queue = makePi();
+        const now = Date.now();
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                now: () => now,
+                intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+            }),
+            true
+        );
+        assert.equal(queue.sent.length, 1);
+        assert.equal(queue.sent[0].options.queueKey, WAKEUP_QUEUE_KEY);
+        assert.equal(queue.sent[0].options.triggerTurn, true);
+        assert.match(
+            queue.sent[0].message.content,
+            /Autonomous heartbeat: 1 background item still running/
+        );
+        assert.match(
+            queue.sent[0].message.content,
+            /job run: echo test \| running/
+        );
+        assert.match(
+            queue.sent[0].message.content,
+            /No action needed unless one looks stuck/
+        );
+        assert.match(queue.sent[0].message.content, /Next heartbeat in 4m0s/);
+        assert.equal(state.wakeupLastHeartbeatAt, now);
+        // The heartbeat must not consume the attention signature.
+        assert.equal(state.wakeupLastSignature, undefined);
+        assert.deepEqual(
+            queue.entries.map((entry) => entry.data.event),
+            ["heartbeat-sent"]
+        );
+    });
+
+    void it("heartbeats provider active work using its v2 summary", () => {
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry(
+                {
+                    name: "subagents",
+                    listActiveWork: () => [
+                        {
+                            id: "run-1",
+                            sessionId: "session",
+                            summary:
+                                "run-1 | running | 12m | step 1/2 | active 4s ago",
+                        },
+                        {
+                            id: "run-2",
+                            sessionId: "other",
+                            summary: "other run",
+                        },
+                    ],
+                },
+                2
+            )
+        );
+        try {
+            const queue = makePi();
+            const now = Date.now();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "session", {
+                    now: () => now,
+                    intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                    parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+                }),
+                true
+            );
+            assert.match(
+                queue.sent[0].message.content,
+                /subagents\/run-1: run-1 \| running \| 12m \| step 1\/2 \| active 4s ago/
+            );
+            assert.doesNotMatch(queue.sent[0].message.content, /other run/);
+        } finally {
+            restore();
+        }
+    });
+
+    void it("keeps a v1 provider readable but refuses a summary it cannot declare", () => {
+        const restoreOne = installBackgroundWorkRegistry(
+            attentionRegistry({
+                name: "subagents",
+                listActiveWork: () => [{ id: "run-1", sessionId: "session" }],
+            })
+        );
+        try {
+            const queue = makePi();
+            const now = Date.now();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "session", {
+                    now: () => now,
+                    intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                    parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+                }),
+                true
+            );
+            assert.match(
+                queue.sent[0].message.content,
+                /subagents\/run-1: running/
+            );
+        } finally {
+            restoreOne();
+        }
+
+        const restoreTwo = installBackgroundWorkRegistry(
+            attentionRegistry(
+                {
+                    name: "subagents",
+                    listActiveWork: () => [
+                        {
+                            id: "run-1",
+                            sessionId: "session",
+                            summary: "line one\nline two",
+                        },
+                    ],
+                },
+                2
+            )
+        );
+        try {
+            const state = new TauState();
+            const queue = makePi();
+            const now = Date.now();
+            assert.equal(
+                evaluateWakeup(queue.pi, state, "session", {
+                    now: () => now,
+                    intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                    parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+                }),
+                false
+            );
+            assert.equal(queue.sent.length, 0);
+            const [failure] = queue.entries;
+            assert.equal(failure?.customType, "tau_wakeup_telemetry");
+            assert.deepEqual(
+                {
+                    event: failure?.data.event,
+                    failure: failure?.data.failure,
+                },
+                { event: "registry-failure", failure: "malformed-item" }
+            );
+        } finally {
+            restoreTwo();
+        }
+    });
+
+    void it("keeps an attention wake ahead of the heartbeat", () => {
+        const state = new TauState();
+        state.backgroundJobs.set("run", job("run", "running"));
+        state.recentTerminalJobs.push(job("done", "failed"));
+        const queue = makePi();
+        const now = Date.now();
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                now: () => now,
+                intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+            }),
+            true
+        );
+        assert.equal(queue.sent.length, 1);
+        assert.match(queue.sent[0].message.content, /need attention/);
+        assert.doesNotMatch(
+            queue.sent[0].message.content,
+            /Autonomous heartbeat/
+        );
+    });
+
+    void it("bounds the heartbeat item list and counts the remainder", () => {
+        const state = new TauState();
+        for (let index = 0; index < WAKEUP_HEARTBEAT_MAX_ITEMS + 3; index++) {
+            state.backgroundJobs.set(
+                `run-${index}`,
+                job(`run-${index}`, "running")
+            );
+        }
+        const queue = makePi();
+        const now = Date.now();
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                now: () => now,
+                intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+            }),
+            true
+        );
+        const content = queue.sent[0].message.content;
+        assert.match(content, /11 background items still running/);
+        assert.match(content, /- and 3 more/);
+        assert.ok(content.length <= WAKEUP_MESSAGE_MAX_CHARS);
+    });
+
+    void it("replaces the queued heartbeat on the next interval instead of stacking", () => {
+        const state = new TauState();
+        state.backgroundJobs.set("run", job("run", "running"));
+        const queue = makePi();
+        // Ordered log: what matters is that no send can happen while an earlier
+        // wake is still queued, which send counts alone cannot show.
+        const log: string[] = [];
+        const instrumented = queue.pi as unknown as {
+            sendMessage: (
+                message: SentMessage["message"],
+                options: SentMessage["options"]
+            ) => void;
+            cancelQueuedMessage: (key: string) => void;
+        };
+        const sendOriginal = instrumented.sendMessage;
+        const cancelOriginal = instrumented.cancelQueuedMessage;
+        instrumented.sendMessage = (message, options) => {
+            log.push("send");
+            sendOriginal(message, options);
+        };
+        instrumented.cancelQueuedMessage = (key) => {
+            log.push("cancel");
+            cancelOriginal(key);
+        };
+        const first = Date.now();
+        const anchor = first - WAKEUP_DEFAULT_INTERVAL_MS;
+        const options = {
+            intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+            parentRequestStartedAt: anchor,
+        };
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                ...options,
+                now: () => first,
+            }),
+            true
+        );
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                ...options,
+                now: () => first + WAKEUP_DEFAULT_INTERVAL_MS,
+            }),
+            true
+        );
+        assert.deepEqual(
+            queue.sent.map((sent) => sent.options.queueKey),
+            [WAKEUP_QUEUE_KEY, WAKEUP_QUEUE_KEY]
+        );
+        // The host queue appends by key, so "one wake in flight" only holds if
+        // each send retracts the previous one first. Two consecutive sends in
+        // this log is the stacking bug.
+        const sendPositions = log.flatMap((entry, index) =>
+            entry === "send" ? [index] : []
+        );
+        assert.equal(sendPositions.length, 2);
+        assert.ok(log.slice(0, sendPositions[1]).includes("cancel"));
+        assert.equal(state.wakeupQueuedKind, "heartbeat");
+        assert.equal(
+            queue.entries.filter(
+                (entry) => entry.data.event === "heartbeat-sent"
+            ).length,
+            2
+        );
+    });
+
+    void it("retracts a queued heartbeat before replacing it with an attention wake", () => {
+        const state = new TauState();
+        state.backgroundJobs.set("run", job("run", "running"));
+        const queue = makePi();
+        const now = Date.now();
+        const options = {
+            intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+            parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+        };
+        // Heartbeat only: nothing is actionable yet.
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                ...options,
+                now: () => now,
+            }),
+            true
+        );
+        assert.equal(queue.sent.length, 1);
+        assert.equal(state.wakeupQueuedKind, "heartbeat");
+        const cancelledAfterHeartbeat = queue.cancelled.length;
+        assert.ok(cancelledAfterHeartbeat >= 1);
+
+        // A failure lands while the heartbeat is still queued. The attention
+        // wake must retract that heartbeat, or the session runs two turns.
+        state.recentTerminalJobs.push(job("done", "failed"));
+        assert.equal(
+            evaluateWakeup(queue.pi, state, "session", {
+                ...options,
+                now: () => now + 1_000,
+            }),
+            true
+        );
+        assert.equal(queue.sent.length, 2);
+        assert.match(queue.sent[1].message.content, /need attention/);
+        assert.equal(queue.cancelled.at(-1), WAKEUP_QUEUE_KEY);
+        assert.ok(queue.cancelled.length > cancelledAfterHeartbeat);
+        assert.equal(state.wakeupQueuedKind, "attention");
     });
 
     void it("fails closed for an absent or malformed provider registry", () => {
@@ -487,7 +813,8 @@ void describe("autonomous wake evaluation", () => {
         assert.equal(evaluateWakeup(queue.pi, state), true);
         assert.equal(queued.length, 1);
         assert.match(queued[0].message.content, /done-2/);
-        assert.deepEqual(queue.cancelled, [WAKEUP_QUEUE_KEY]);
+        // One retraction before each send: the host queue appends by key.
+        assert.deepEqual(queue.cancelled, [WAKEUP_QUEUE_KEY, WAKEUP_QUEUE_KEY]);
     });
 
     void it("disables autonomous delivery on hosts without queue cancellation", () => {
@@ -510,7 +837,9 @@ void describe("autonomous wake evaluation", () => {
         evaluateWakeup(queue.pi, state);
         done.outputConsumed = true;
         assert.equal(evaluateWakeup(queue.pi, state), false);
-        assert.deepEqual(queue.cancelled, [WAKEUP_QUEUE_KEY]);
+        // One retraction before the send (the queue appends, it does not
+        // replace) and one after the acknowledgement cleared the state.
+        assert.deepEqual(queue.cancelled, [WAKEUP_QUEUE_KEY, WAKEUP_QUEUE_KEY]);
     });
 
     void it("starts on session_start only when enabled and stops on shutdown", async () => {
@@ -580,6 +909,162 @@ void describe("autonomous wake evaluation", () => {
         } finally {
             restoreRegistry();
             rmSync(cwd, { recursive: true, force: true });
+        }
+    });
+
+    /** Register the wakeup timer against a temp cwd and a scripted parent. */
+    async function startTimerSession(options: {
+        settings?: Record<string, unknown>;
+        initialState?: (state: TauState) => void;
+        isIdle?: () => boolean;
+    }) {
+        const cwd = mkdtempSync(join("/tmp", "pi-tau-wakeup-"));
+        mkdirSync(join(cwd, ".pi"));
+        writeFileSync(
+            join(cwd, ".pi", "settings.json"),
+            JSON.stringify(options.settings ?? {})
+        );
+        const state = new TauState();
+        options.initialState?.(state);
+        const queue = makePi();
+        const handlers = new Map<
+            string,
+            (event: unknown, ctx: Record<string, unknown>) => unknown
+        >();
+        (
+            queue.pi as unknown as {
+                on: (
+                    event: string,
+                    fn: (
+                        event: unknown,
+                        ctx: Record<string, unknown>
+                    ) => unknown
+                ) => void;
+            }
+        ).on = (event, fn) => handlers.set(event, fn);
+        registerWakeup(queue.pi, state);
+        const sessionContext = {
+            cwd,
+            sessionManager: { getSessionId: () => "session-current" },
+            isIdle: options.isIdle ?? (() => true),
+        };
+        await handlers.get("session_start")?.({}, sessionContext);
+        return {
+            state,
+            queue,
+            handlers,
+            sessionContext,
+            cleanup: async (): Promise<void> => {
+                await handlers.get("session_shutdown")?.({}, sessionContext);
+                rmSync(cwd, { recursive: true, force: true });
+            },
+        };
+    }
+
+    void it("heartbeats a running job from the timer without any configuration", async () => {
+        const session = await startTimerSession({
+            initialState: (state) =>
+                state.backgroundJobs.set("run", job("run", "running")),
+        });
+        try {
+            // No tau.wakeup block: both rules are on by default.
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS - 1);
+            assert.equal(session.queue.sent.length, 0);
+            mock.timers.tick(1);
+            assert.equal(session.queue.sent.length, 1);
+            assert.match(
+                session.queue.sent[0].message.content,
+                /Autonomous heartbeat: 1 background item still running/
+            );
+            assert.equal(session.state.wakeupLastHeartbeatAt, Date.now());
+        } finally {
+            await session.cleanup();
+        }
+    });
+
+    void it("resamples a busy parent instead of waking it", async () => {
+        let idle = false;
+        const session = await startTimerSession({
+            isIdle: () => idle,
+            initialState: (state) =>
+                state.backgroundJobs.set("run", job("run", "running")),
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS);
+            assert.equal(session.queue.sent.length, 0);
+            assert.deepEqual(
+                session.queue.entries.map((entry) => entry.data.event),
+                ["heartbeat-resampled"]
+            );
+            idle = true;
+            mock.timers.tick(WAKEUP_IDLE_RECHECK_MS);
+            assert.equal(session.queue.sent.length, 1);
+        } finally {
+            await session.cleanup();
+        }
+    });
+
+    void it("re-anchors the deadline to each new parent request", async () => {
+        const session = await startTimerSession({
+            initialState: (state) =>
+                state.backgroundJobs.set("run", job("run", "running")),
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS - 1);
+            await session.handlers.get("message_start")?.(
+                { message: { role: "assistant" } },
+                session.sessionContext
+            );
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS - 1);
+            assert.equal(session.queue.sent.length, 0);
+            mock.timers.tick(1);
+            assert.equal(session.queue.sent.length, 1);
+        } finally {
+            await session.cleanup();
+        }
+    });
+
+    void it("retracts a queued heartbeat when a parent request starts", async () => {
+        const session = await startTimerSession({
+            // Idle for the probe but settling underneath: the host queues the
+            // follow-up instead of delivering it, which is the window where a
+            // heartbeat can go stale.
+            isIdle: () => true,
+            initialState: (state) =>
+                state.backgroundJobs.set("run", job("run", "running")),
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS);
+            assert.equal(session.queue.sent.length, 1);
+            assert.equal(session.state.wakeupQueuedKind, "heartbeat");
+            const cancelledBefore = session.queue.cancelled.length;
+            await session.handlers.get("message_start")?.(
+                { message: { role: "assistant" } },
+                session.sessionContext
+            );
+            // The request that just started is the news the heartbeat wanted
+            // to deliver, so it must be retracted rather than spend a turn.
+            assert.equal(session.queue.cancelled.length, cancelledBefore + 1);
+            assert.equal(session.queue.cancelled.at(-1), WAKEUP_QUEUE_KEY);
+            assert.equal(session.state.wakeupQueuedKind, undefined);
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS - 1);
+            assert.equal(session.queue.sent.length, 1);
+        } finally {
+            await session.cleanup();
+        }
+    });
+
+    void it("honours an explicit opt-out", async () => {
+        const session = await startTimerSession({
+            settings: { tau: { wakeup: { enabled: false } } },
+            initialState: (state) =>
+                state.backgroundJobs.set("run", job("run", "running")),
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS * 3);
+            assert.equal(session.queue.sent.length, 0);
+        } finally {
+            await session.cleanup();
         }
     });
 });
