@@ -494,10 +494,15 @@ void describe("job completion regression coverage", () => {
             );
         assert.equal(delivered.length, 1);
         assert.equal(delivered[0]?.deliveryBoundary, "turn_end");
+        // `steer`, not `followUp`: the host injects a steered message before the
+        // next LLM call of this run, while a followUp waits for a queue that the
+        // agent loop polls only where it would stop (agent-loop.ts:262-268).
+        assert.equal(delivered[0]?.deliverAs, "steer");
+        assert.equal(delivered[0]?.delivery, "in-run-steer");
         const message = sentMessages[0] as { customType: string };
         assert.equal(message.customType, "job-completion");
         assert.deepEqual(sentMessageOptions[0], {
-            deliverAs: "followUp",
+            deliverAs: "steer",
             triggerTurn: true,
             queueKey: (sentMessageOptions[0] as { queueKey: string }).queueKey,
         });
@@ -508,9 +513,10 @@ void describe("job completion regression coverage", () => {
     });
 
     void it("does not resume an aborted turn to deliver a notice", async () => {
-        // Delivering at turn_end queues a followUp turn. An aborted turn is the
-        // user (or a gate) asking the agent to stop, so the notice waits for the
-        // settled path instead of resurrecting the run it just abandoned.
+        // Draining at turn_end steers the notice into the run's next LLM call. An
+        // aborted turn is the user (or a gate) asking the agent to stop, so the
+        // notice waits for the settled path instead of resurrecting the run it
+        // just abandoned.
         const state = new TauState();
         const { pi, sentMessages, appendedEntries, invoke } =
             registerTestTools(state);
@@ -539,6 +545,11 @@ void describe("job completion regression coverage", () => {
             );
         assert.equal(delivered.length, 1);
         assert.equal(delivered[0]?.deliveryBoundary, "settled");
+        // The settled flush drains an agent that is stopping, so the notice keeps
+        // the turn-triggering mode; `steer` there would queue into a run that is
+        // already over.
+        assert.equal(delivered[0]?.deliverAs, "followUp");
+        assert.equal(delivered[0]?.delivery, "immediate");
         await invoke("session_shutdown");
     });
 

@@ -1989,7 +1989,12 @@ function recordCompletionTelemetry(
         outstandingJobs?: number;
         count?: number;
         scope?: "success" | "all" | "terminal-implicit";
-        delivery?: "immediate" | "deferred-batch" | "suppressed";
+        delivery?:
+            | "immediate"
+            | "in-run-steer"
+            | "deferred-batch"
+            | "suppressed";
+        deliverAs?: "steer" | "followUp" | "nextTurn";
         deliveryBoundary?: DeliveryBoundary;
     } = {}
 ): void {
@@ -2051,6 +2056,7 @@ function recordCompletionTelemetry(
             ...(fields.count !== undefined ? { count: fields.count } : {}),
             ...(fields.scope ? { scope: fields.scope } : {}),
             ...(fields.delivery ? { delivery: fields.delivery } : {}),
+            ...(fields.deliverAs ? { deliverAs: fields.deliverAs } : {}),
             ...(fields.deliveryBoundary
                 ? { deliveryBoundary: fields.deliveryBoundary }
                 : {}),
@@ -2371,6 +2377,7 @@ function completeCompletionDeliveryHandoff(
     queuedCompletionDeliveries.set(delivery.queueKey, delivery);
     recordCompletionTelemetry(pi, "queued", {
         queueKey: delivery.queueKey,
+        deliverAs: completionDeliveryMode(delivery),
         jobIds: delivery.jobs.map(({ job }) => job.id),
     });
     const deliveredAt = Date.now();
@@ -2392,7 +2399,15 @@ function completeCompletionDeliveryHandoff(
                 job.endTime === undefined
                     ? undefined
                     : Math.max(0, job.endTime - job.startTime),
-            delivery: "immediate",
+            // `steer` is injected at the boundary this record's ageMs was
+            // measured at; `followUp` from a settled/idle agent is immediate.
+            // Recording the mode keeps a future handoff-vs-visibility gap
+            // readable from telemetry instead of only from transcripts.
+            deliverAs: completionDeliveryMode(delivery),
+            delivery:
+                completionDeliveryMode(delivery) === "steer"
+                    ? "in-run-steer"
+                    : "immediate",
             ...(delivery.deliveryBoundary
                 ? { deliveryBoundary: delivery.deliveryBoundary }
                 : {}),
@@ -2442,6 +2457,33 @@ function completionDigestLine(item: CompletionBatchItem): string {
     return `- ${parts.join(" | ")}`;
 }
 
+/**
+ * Delivery mode for a completion notice.
+ *
+ * `steer` is the only mode the host injects mid-run: it is documented as
+ * "delivered after the current assistant turn finishes executing its tool
+ * calls, before the next LLM call" (pi-mono `docs/extensions.md`), which is the
+ * boundary `turn_end` flushes at. `followUp` reads like "the next turn" but the
+ * agent loop polls that queue only where it says "Agent would stop here"
+ * (`packages/agent/src/agent-loop.ts:262-268`), so on a long tool-driven run it
+ * delivers at the end of the run, however early the handoff was - measured at
+ * p50 68.5 min on a sippi session
+ * (`issues/2026-11-18-stale-job-notices/report.md`, "Update 2026-11-20").
+ *
+ * `triggerTurn: false` is not an alternative: it appends to the host's
+ * `_pendingCustomMessages`, which is persisted but never read by the running
+ * loop, whose context is a snapshot of the messages array taken when the run
+ * started (`packages/agent/src/agent.ts:462-467`).
+ *
+ * Every other boundary drains an idle or settling agent, where `steer` would
+ * queue a turn nothing is polling for, so those keep `followUp`.
+ */
+function completionDeliveryMode(
+    delivery: PendingCompletionDelivery
+): "steer" | "followUp" {
+    return delivery.deliveryBoundary === "turn_end" ? "steer" : "followUp";
+}
+
 function sendCompletionPayload(
     delivery: PendingCompletionDelivery,
     jobs: CompletionBatchItem[],
@@ -2457,7 +2499,7 @@ function sendCompletionPayload(
         delivery.pi,
         { customType: "job-completion", content, display: true, details },
         {
-            deliverAs: "followUp",
+            deliverAs: completionDeliveryMode(delivery),
             triggerTurn: true,
             queueKey: individualDelivery.queueKey,
         }
@@ -2850,7 +2892,7 @@ function deliverCompletionNotification(
                 },
             },
             {
-                deliverAs: "followUp",
+                deliverAs: completionDeliveryMode(delivery),
                 triggerTurn: true,
                 queueKey: delivery.queueKey,
             }
@@ -2936,7 +2978,7 @@ function deliverCompletionNotification(
             },
         },
         {
-            deliverAs: "followUp",
+            deliverAs: completionDeliveryMode(delivery),
             triggerTurn: true,
             queueKey: delivery.queueKey,
         }
@@ -2946,10 +2988,12 @@ function deliverCompletionNotification(
 
 /**
  * Where a completion notice was drained. `turn_end` is the first in-run boundary
- * after the job finished; `settled` is the end-of-run fallback; `idle` means the
- * agent was not running a turn at all, so the notice went out immediately and
- * neither boundary delayed it. Keeping them apart is what makes the timing
- * measurable: folding immediate deliveries into `settled` would mix a
+ * after the job finished and delivers with `steer`, so the notice lands in the
+ * next LLM call of the same run; `settled` is the end-of-run fallback and
+ * delivers with `followUp`, which is right there because the run is stopping;
+ * `idle` means the agent was not running a turn at all, so the notice went out
+ * immediately and neither boundary delayed it. Keeping them apart is what makes
+ * the timing measurable: folding immediate deliveries into `settled` would mix a
  * sub-second wait with the end-of-run tail and describe neither.
  */
 type DeliveryBoundary = "turn_end" | "settled" | "idle";
@@ -3706,10 +3750,10 @@ export function registerBackgroundJobs(
         }
     });
     eventPi.on?.("turn_end", (event: unknown) => {
-        // Delivering here queues a followUp turn, so an aborted turn - the user
-        // or a gate asked the agent to stop - must not resurrect the run from
-        // the boundary it just abandoned. Leave the notice pending; the settled
-        // path still carries it.
+        // Draining here steers the notice into the next LLM call of this run, so
+        // an aborted turn - the user or a gate asked the agent to stop - must not
+        // resurrect the run from the boundary it just abandoned. Leave the notice
+        // pending; the settled path still carries it.
         if (completionAgentBusy && !turnWasAborted(event)) {
             flushPendingCompletionDeliveries("turn_end");
         }
