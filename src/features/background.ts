@@ -1749,6 +1749,7 @@ type CompletionTrigger =
     | "kill"
     | "deadline"
     | "cancel-miss-rearm"
+    | "stale-send-rearm"
     | "flush-suppressed-rearm"
     | "restore"
     | "other";
@@ -2360,15 +2361,25 @@ function completeCompletionDeliveryHandoff(
     const { pi } = delivery;
     if (!sent) {
         pendingStaleCompletionSendCount++;
+        const wakeStates = new Set<TauState>();
         for (const item of delivery.jobs) {
-            recordCompletionItemTelemetry(pi, "delivery-terminal", item, {
-                reason: "cancelled",
-                status: item.job.status,
-                exitCode: item.job.exitCode,
+            recordCompletionItemTelemetry(pi, "delivery-requeued", item, {
+                trigger: "stale-send-rearm",
                 queueKey: delivery.queueKey,
                 sendKind: item.sendKind,
             });
+            // The extension context rejected the send, so no host queue owns
+            // this completion. Restore it to the same wake-visible state used
+            // by a cancellation miss; a later healthy delivery attempt can
+            // enqueue it without treating this handoff as terminal.
+            restoreCompletionForWake(
+                item.job,
+                wakeStates,
+                delivery.state,
+                "stale-send-rearm"
+            );
         }
+        for (const state of wakeStates) state.wakeupEvaluate?.();
         return;
     }
 

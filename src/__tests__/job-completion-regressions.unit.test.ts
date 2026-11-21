@@ -52,7 +52,10 @@ function makeJob(
 
 function registerTestTools(
     state: TauState,
-    options: { holdFollowUps?: boolean; staleSend?: boolean } = {}
+    options: {
+        holdFollowUps?: boolean;
+        staleSend?: boolean | { value: boolean };
+    } = {}
 ): {
     jobs: TestTool;
     jobDecide: TestTool;
@@ -95,7 +98,11 @@ function registerTestTools(
             message: unknown,
             messageOptions: { deliverAs?: string; queueKey?: string }
         ) {
-            if (options.staleSend) {
+            if (
+                typeof options.staleSend === "object"
+                    ? options.staleSend.value
+                    : options.staleSend
+            ) {
                 throw new Error(
                     "This extension ctx is stale after session replacement or reload"
                 );
@@ -160,12 +167,15 @@ void describe("job completion regression coverage", () => {
         clearAllCompletionBatches();
     });
 
-    void it("does not retain or count a stale-host completion as queued", () => {
+    void it("requeues a stale-host completion for a later healthy send", () => {
         const state = new TauState();
-        const { pi, appendedEntries, cancelledQueueKeys } = registerTestTools(
-            state,
-            { staleSend: true }
-        );
+        let wakeCount = 0;
+        state.wakeupEvaluate = () => {
+            wakeCount++;
+        };
+        const staleSend = { value: true };
+        const { pi, appendedEntries, cancelledQueueKeys, sentMessages } =
+            registerTestTools(state, { staleSend });
         const job = makeJob({
             id: "job-stale-send-context",
             status: "failed",
@@ -175,27 +185,35 @@ void describe("job completion regression coverage", () => {
         notifyCompletion(job, state, pi as never, notificationContext());
         flushCompletionBatch();
 
-        const staleEvents = appendedEntries.map((entry) => entry.data);
-        assert.ok(staleEvents.some((data) => data.event === "notify-called"));
+        const requeuedEvents = appendedEntries.map((entry) => entry.data);
         assert.ok(
-            staleEvents.some(
-                (data) =>
-                    data.event === "delivery-terminal" &&
-                    data.reason === "cancelled"
-            )
+            requeuedEvents.some((data) => data.event === "notify-called")
         );
         assert.ok(
-            staleEvents.some(
+            requeuedEvents.some(
                 (data) =>
-                    data.event === "stale-context-skipped" && data.count === 1
+                    data.event === "delivery-requeued" && data.jobId === job.id
             )
         );
         assert.equal(
-            staleEvents.some((data) => data.event === "queued"),
+            requeuedEvents.some(
+                (data) =>
+                    data.event === "delivery-terminal" && data.jobId === job.id
+            ),
+            false,
+            "a stale send is not a terminal delivery outcome"
+        );
+        assert.equal(job.completionNotified, false);
+        assert.ok(
+            wakeCount > 0,
+            "requeued completion is exposed to wake evaluation"
+        );
+        assert.equal(sentMessages.length, 0);
+        assert.equal(
+            requeuedEvents.some((data) => data.event === "queued"),
             false,
             "a stale host context must not be recorded as queued"
         );
-        state.cancelCompletionBatchForJob?.(job.id);
         assert.deepEqual(
             cancelledQueueKeys.filter((key) =>
                 key.startsWith("tau:bg:completion:")
@@ -203,29 +221,24 @@ void describe("job completion regression coverage", () => {
             []
         );
 
-        const nextState = new TauState();
-        const healthy = registerTestTools(nextState);
-        const nextJob = makeJob({
-            id: "job-after-stale-send",
-            status: "failed",
-            exitCode: 1,
-        });
-        nextState.backgroundJobs.set(nextJob.id, nextJob);
-        notifyCompletion(
-            nextJob,
-            nextState,
-            healthy.pi as never,
-            notificationContext()
-        );
+        // Model a later attempt after the host context is healthy again.
+        staleSend.value = false;
+        notifyCompletion(job, state, pi as never, notificationContext());
         flushCompletionBatch();
+        assert.equal(sentMessages.length, 1);
         assert.ok(
-            healthy.appendedEntries.some(({ data }) => data.event === "queued")
+            appendedEntries.some(
+                ({ data }) =>
+                    data.event === "delivery-terminal" &&
+                    data.reason === "delivered" &&
+                    data.jobId === job.id
+            )
         );
-        assert.equal(
-            healthy.appendedEntries.some(
-                ({ data }) => data.event === "stale-context-skipped"
+        assert.ok(
+            appendedEntries.some(
+                ({ data }) =>
+                    data.event === "stale-context-skipped" && data.count === 1
             ),
-            false,
             "the stale-send counter is persisted at the failed delivery attempt"
         );
     });
