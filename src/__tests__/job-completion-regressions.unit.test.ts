@@ -1846,6 +1846,10 @@ void describe("jobs ack", () => {
 
     void it("shutdown records dropped pending deliveries once", async () => {
         const state = new TauState();
+        let wakeupCancelled = false;
+        state.wakeupCancel = () => {
+            wakeupCancelled = true;
+        };
         const harness = registerTestTools(state, { holdFollowUps: true });
         const job = makeJob({
             id: "tmux-shutdown-drop",
@@ -1869,5 +1873,7 @@ void describe("jobs ack", () => {
         assert.equal(records.length, 1);
         assert.equal(records[0].data.count, 1);
         assert.deepEqual(records[0].data.jobIds, [job.id]);
+        assert.equal(state.wakeupShutdownBegun, true);
+        assert.equal(wakeupCancelled, true);
     });
 });

@@ -912,6 +912,34 @@ void describe("autonomous wake evaluation", () => {
         }
     });
 
+    void it("does not evaluate or reschedule a timer tick after shutdown begins", async () => {
+        const session = await startTimerSession({
+            initialState: (state) =>
+                state.recentTerminalJobs.push(job("failed", "failed")),
+        });
+        try {
+            session.state.wakeupShutdownBegun = true;
+            assert.equal(
+                evaluateWakeup(
+                    session.queue.pi,
+                    session.state,
+                    "session-current"
+                ),
+                false
+            );
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS);
+            assert.equal(session.queue.sent.length, 0);
+
+            // If the shutdown-time tick re-armed itself, clearing the fence for
+            // this assertion would let the next interval expose that timer.
+            session.state.wakeupShutdownBegun = false;
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS * 2);
+            assert.equal(session.queue.sent.length, 0);
+        } finally {
+            await session.cleanup();
+        }
+    });
+
     /** Register the wakeup timer against a temp cwd and a scripted parent. */
     async function startTimerSession(options: {
         settings?: Record<string, unknown>;

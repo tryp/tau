@@ -190,6 +190,8 @@ export class TauState {
     wakeupEvaluate?: () => void;
     /** Stop the wake timer and retract its queued follow-up. */
     wakeupCancel?: () => void;
+    /** Set by the first shutdown handler to fence wake evaluation immediately. */
+    wakeupShutdownBegun = false;
     /** Signature of the last actionable snapshot sent as a wake follow-up. */
     wakeupLastSignature?: string;
     /** Last registry failure already recorded, so one failure is not logged per tick. */

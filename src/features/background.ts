@@ -3772,6 +3772,11 @@ export function registerBackgroundJobs(
         }, 0);
     });
     eventPi.on?.("session_shutdown", () => {
+        // This feature registers before wakeup.ts. Fence autonomous evaluation
+        // and stop its timer before recording shutdown/drop telemetry, so an
+        // intervening tick cannot enqueue work into the dying session.
+        state.wakeupShutdownBegun = true;
+        state.wakeupCancel?.();
         completionLifecycleToken++;
         completionAgentBusy = false;
         if (settledCompletionFlushTimer) {

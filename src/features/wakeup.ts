@@ -635,6 +635,7 @@ export function evaluateWakeup(
     sessionId?: string,
     options: WakeupEvaluationOptions = {}
 ): boolean {
+    if (state.wakeupShutdownBegun) return false;
     // Without deterministic queue cancellation, a changed or resolved snapshot
     // could leave a stale follow-up (or enqueue a duplicate) on older hosts.
     // Disable autonomous delivery rather than pretending replacement worked.
@@ -741,7 +742,7 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
 
     function tick(): void {
         timer = undefined;
-        if (!active) return;
+        if (!active || state.wakeupShutdownBegun) return;
         const now = Date.now();
         const idleMs = now - lastRequestStartedAt;
         if (idleMs < intervalMs) {
@@ -814,6 +815,7 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
     });
 
     pi.on("session_start", async (_event, ctx) => {
+        state.wakeupShutdownBegun = false;
         stop();
         latestContext = ctx;
         const config = loadWakeupConfig(ctx.cwd);
