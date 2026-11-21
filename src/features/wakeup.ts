@@ -93,6 +93,9 @@ type ProviderWorkFailure =
 interface ProviderWork {
     entries: ProviderWorkEntry[];
     failure?: ProviderWorkFailure;
+    itemCount?: number;
+    matchedItemCount?: number;
+    firstUnmatchedSessionIdKind?: "path" | "uuid" | "other";
 }
 
 type ProviderAttentionAction = {
@@ -109,6 +112,14 @@ function isBoundedString(value: unknown, maxChars: number): value is string {
         value.trim() === value &&
         !value.includes("\0")
     );
+}
+
+function sessionIdKind(sessionId: string): "path" | "uuid" | "other" {
+    if (sessionId.startsWith("/")) return "path";
+    if (/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(sessionId)) {
+        return "uuid";
+    }
+    return "other";
 }
 
 const INVALID_SUMMARY = Symbol("invalid-summary");
@@ -170,6 +181,9 @@ function collectProviderWork(
 
         const entries: ProviderWorkEntry[] = [];
         const keys = new Set<string>();
+        let itemCount = 0;
+        let matchedItemCount = 0;
+        let firstUnmatchedSessionIdKind: ProviderWork["firstUnmatchedSessionIdKind"];
         for (const [registryKey, candidate] of registry.providers) {
             if (
                 typeof registryKey !== "string" ||
@@ -216,7 +230,14 @@ function collectProviderWork(
                 if (summary === INVALID_SUMMARY) {
                     return { entries: [], failure: "malformed-item" };
                 }
-                if (item.sessionId !== sessionId) continue;
+                itemCount += 1;
+                if (item.sessionId !== sessionId) {
+                    firstUnmatchedSessionIdKind ??= sessionIdKind(
+                        item.sessionId
+                    );
+                    continue;
+                }
+                matchedItemCount += 1;
                 const key = JSON.stringify([candidate.name, item.id]);
                 if (keys.has(key)) continue;
                 keys.add(key);
@@ -227,7 +248,12 @@ function collectProviderWork(
                 });
             }
         }
-        return { entries };
+        return {
+            entries,
+            itemCount,
+            matchedItemCount,
+            firstUnmatchedSessionIdKind,
+        };
     } catch {
         return { entries: [], failure: "malformed-registry" };
     }
@@ -463,6 +489,7 @@ export function cancelQueuedWakeup(pi: ExtensionAPI): boolean {
 export type WakeupTelemetryEvent =
     | "attention-sent"
     | "heartbeat-sent"
+    | "heartbeat-skip-no-sources"
     | "heartbeat-resampled"
     | "skipped-no-cancellation"
     | "registry-failure";
@@ -612,7 +639,21 @@ function evaluateHeartbeat(
     const providerActive = collectProviderWork("active", sessionId);
     reportProviderFailure(pi, state, providerActive.failure);
     const sources = collectHeartbeatSources(state, providerActive.entries, now);
-    if (sources.length === 0) return false;
+    if (sources.length === 0) {
+        if (
+            (providerActive.itemCount ?? 0) > 0 &&
+            providerActive.matchedItemCount === 0 &&
+            !state.wakeupNoSourceMismatchReported
+        ) {
+            state.wakeupNoSourceMismatchReported = true;
+            recordWakeupTelemetry(pi, "heartbeat-skip-no-sources", {
+                providerItems: providerActive.itemCount,
+                unmatchedSessionIdKind:
+                    providerActive.firstUnmatchedSessionIdKind ?? "other",
+            });
+        }
+        return false;
+    }
 
     sendWakeup(pi, formatHeartbeatMessage(sources, intervalMs));
     state.wakeupQueuedKind = "heartbeat";
@@ -772,6 +813,7 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
     const noteRequestStart = (): void => {
         lastRequestStartedAt = Date.now();
         sawRequestStart = true;
+        state.wakeupNoSourceMismatchReported = false;
         if (!active) return;
         // A queued heartbeat describes a session that was waiting a full
         // interval for news. The request starting now is that news, and the
@@ -832,7 +874,13 @@ export function registerWakeup(pi: ExtensionAPI, state: TauState): void {
             });
             return;
         }
-        sessionId = ctx.sessionManager.getSessionId();
+        // The background-work provider uses getSessionFile() ?? getSessionId()
+        // (pi-subagents/src/runs/shared/session-identity.ts). Keep this
+        // path-first contract aligned so provider session IDs match here.
+        sessionId =
+            ctx.sessionManager.getSessionFile?.() ??
+            ctx.sessionManager.getSessionId();
+        state.wakeupNoSourceMismatchReported = false;
         active = true;
         schedule(intervalMs);
     });

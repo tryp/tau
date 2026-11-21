@@ -22,3 +22,29 @@ Updated the stale-host regression test to verify requeue followed by a successfu
 
 - `pnpm install --frozen-lockfile` passed. The worktree's `file:../pi-context` dependency required a temporary sibling symlink at `/home/dev/src/wt/pi-context`; it was removed after validation.
 - No known implementation risks. A stale context cannot itself deliver the retry; the notice is restored to wake-visible state for a later healthy attempt.
+
+---
+
+# Heartbeat session-identity fix
+
+## Root cause
+
+pi-tau filtered background-work provider items against the bare UUID returned by `getSessionId()`, while pi-subagents publishes the session identity as `getSessionFile() ?? getSessionId()` (path-first). Since live provider items carry the parent `.jsonl` path, the exact-match filter discarded every child item and the heartbeat saw no sources.
+
+## Changes
+
+- `src/features/wakeup.ts` now resolves its session identity path-first, falling back to the session UUID when no session file is available. A contract comment points to the pi-subagents `session-identity.ts` helper.
+- The provider collection returns bounded diagnostic counts and classifies the first unmatched identity as path, UUID, or other without persisting the raw identity. When there are provider items but none match and the heartbeat has no sources, pi-tau appends `heartbeat-skip-no-sources` once per parent idle gap. Telemetry uses the existing best-effort, never-throwing writer. An empty provider list remains silent.
+- `src/state.ts` tracks whether the mismatch event has been recorded in the current idle gap; a new parent request resets the rate limit.
+- `src/__tests__/wakeup.unit.test.ts` covers path-form matching, UUID fallback without a session file, mismatch telemetry and rate limiting, silence for an empty list, and silence when at least one provider item matches.
+
+## Validation
+
+- Focused: `node --experimental-strip-types --test src/__tests__/wakeup.unit.test.ts` — 33 tests passed, 0 failed.
+- Full: `pnpm test` — 1,693 tests passed, 0 failed, 0 skipped; exit 0.
+- Typecheck: `pnpm check` — exit 0.
+- `git diff --check` — clean.
+
+## Commit
+
+The final commit hash is included in the structured completion report. A Git commit cannot embed its own object hash in `REPORT.md` without changing that hash.

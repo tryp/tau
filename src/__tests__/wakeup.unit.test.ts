@@ -180,6 +180,84 @@ void describe("autonomous wake evaluation", () => {
         );
     });
 
+    void it("records provider session identity mismatches once per idle gap", () => {
+        const restore = installBackgroundWorkRegistry(
+            attentionRegistry({
+                name: "subagents",
+                listActiveWork: () => [
+                    { id: "child", sessionId: "/sessions/other.jsonl" },
+                ],
+            })
+        );
+        try {
+            const queue = makePi();
+            const state = new TauState();
+            const now = Date.now();
+            const options = {
+                now: () => now,
+                intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+            };
+            assert.equal(
+                evaluateWakeup(
+                    queue.pi,
+                    state,
+                    "/sessions/current.jsonl",
+                    options
+                ),
+                false
+            );
+            assert.equal(
+                evaluateWakeup(
+                    queue.pi,
+                    state,
+                    "/sessions/current.jsonl",
+                    options
+                ),
+                false
+            );
+            const mismatchEntries = queue.entries.filter(
+                (entry) => entry.data.event === "heartbeat-skip-no-sources"
+            );
+            assert.equal(mismatchEntries.length, 1);
+            assert.equal(mismatchEntries[0].data.providerItems, 1);
+            assert.equal(
+                mismatchEntries[0].data.unmatchedSessionIdKind,
+                "path"
+            );
+            assert.equal(queue.sent.length, 0);
+        } finally {
+            restore();
+        }
+
+        const restoreEmpty = installBackgroundWorkRegistry(
+            attentionRegistry({
+                name: "subagents",
+                listActiveWork: () => [],
+            })
+        );
+        try {
+            const queue = makePi();
+            const now = Date.now();
+            assert.equal(
+                evaluateWakeup(queue.pi, new TauState(), "session", {
+                    now: () => now,
+                    intervalMs: WAKEUP_DEFAULT_INTERVAL_MS,
+                    parentRequestStartedAt: now - WAKEUP_DEFAULT_INTERVAL_MS,
+                }),
+                false
+            );
+            assert.equal(
+                queue.entries.some(
+                    (entry) => entry.data.event === "heartbeat-skip-no-sources"
+                ),
+                false
+            );
+        } finally {
+            restoreEmpty();
+        }
+    });
+
     void it("heartbeats provider active work using its v2 summary", () => {
         const restore = installBackgroundWorkRegistry(
             attentionRegistry(
@@ -218,6 +296,12 @@ void describe("autonomous wake evaluation", () => {
                 /subagents\/run-1: run-1 \| running \| 12m \| step 1\/2 \| active 4s ago/
             );
             assert.doesNotMatch(queue.sent[0].message.content, /other run/);
+            assert.equal(
+                queue.entries.some(
+                    (entry) => entry.data.event === "heartbeat-skip-no-sources"
+                ),
+                false
+            );
         } finally {
             restore();
         }
@@ -945,6 +1029,9 @@ void describe("autonomous wake evaluation", () => {
         settings?: Record<string, unknown>;
         initialState?: (state: TauState) => void;
         isIdle?: () => boolean;
+        sessionId?: string;
+        sessionFile?: string;
+        provider?: Record<string, unknown>;
     }) {
         const cwd = mkdtempSync(join("/tmp", "pi-tau-wakeup-"));
         mkdirSync(join(cwd, ".pi"));
@@ -955,6 +1042,9 @@ void describe("autonomous wake evaluation", () => {
         const state = new TauState();
         options.initialState?.(state);
         const queue = makePi();
+        const restoreRegistry = options.provider
+            ? installBackgroundWorkRegistry(attentionRegistry(options.provider))
+            : (): void => {};
         const handlers = new Map<
             string,
             (event: unknown, ctx: Record<string, unknown>) => unknown
@@ -973,7 +1063,12 @@ void describe("autonomous wake evaluation", () => {
         registerWakeup(queue.pi, state);
         const sessionContext = {
             cwd,
-            sessionManager: { getSessionId: () => "session-current" },
+            sessionManager: {
+                getSessionId: () => options.sessionId ?? "session-current",
+                ...(options.sessionFile === undefined
+                    ? {}
+                    : { getSessionFile: () => options.sessionFile }),
+            },
             isIdle: options.isIdle ?? (() => true),
         };
         await handlers.get("session_start")?.({}, sessionContext);
@@ -984,10 +1079,62 @@ void describe("autonomous wake evaluation", () => {
             sessionContext,
             cleanup: async (): Promise<void> => {
                 await handlers.get("session_shutdown")?.({}, sessionContext);
+                restoreRegistry();
                 rmSync(cwd, { recursive: true, force: true });
             },
         };
     }
+
+    void it("matches provider work against the path-first session file identity", async () => {
+        const session = await startTimerSession({
+            sessionFile: "/sessions/current.jsonl",
+            provider: {
+                name: "subagents",
+                listActiveWork: () => [
+                    { id: "child", sessionId: "/sessions/current.jsonl" },
+                ],
+                listAttentionWork: () => [],
+            },
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS);
+            assert.equal(session.queue.sent.length, 1);
+            assert.match(
+                session.queue.sent[0].message.content,
+                /subagents\/child: running/
+            );
+            assert.equal(
+                session.queue.entries.some(
+                    (entry) => entry.data.event === "heartbeat-sent"
+                ),
+                true
+            );
+        } finally {
+            await session.cleanup();
+        }
+    });
+
+    void it("falls back to UUID session identity when no session file exists", async () => {
+        const sessionId = "f6a1e9ef-d6ad-4aa8-a7ad-d61ee99f80ce";
+        const session = await startTimerSession({
+            sessionId,
+            provider: {
+                name: "subagents",
+                listActiveWork: () => [{ id: "child", sessionId }],
+                listAttentionWork: () => [],
+            },
+        });
+        try {
+            mock.timers.tick(WAKEUP_DEFAULT_INTERVAL_MS);
+            assert.equal(session.queue.sent.length, 1);
+            assert.match(
+                session.queue.sent[0].message.content,
+                /subagents\/child: running/
+            );
+        } finally {
+            await session.cleanup();
+        }
+    });
 
     void it("heartbeats a running job from the timer without any configuration", async () => {
         const session = await startTimerSession({

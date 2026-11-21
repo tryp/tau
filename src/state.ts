@@ -196,6 +196,8 @@ export class TauState {
     wakeupLastSignature?: string;
     /** Last registry failure already recorded, so one failure is not logged per tick. */
     wakeupLastRegistryFailure?: string;
+    /** One provider session-identity mismatch report per parent idle gap. */
+    wakeupNoSourceMismatchReported = false;
     /** Epoch ms of the last heartbeat wake, for tests and diagnostics. */
     wakeupLastHeartbeatAt?: number;
     /**
