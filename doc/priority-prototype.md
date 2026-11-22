@@ -47,3 +47,28 @@ After-change: `pnpm test` 1698 passed / 0 failed; `pnpm check` passed; `pnpm lin
 The tmux server is pi's parent. Its pty echo hop remains at inherited nice 19 until tmux is restarted from an elevated launcher. LSP children remain at nice 19 until hover latency is measured and shows a need. This is a scoped prototype, not a claim that every child in the tree is demoted.
 
 Retire this transitional mechanism when pi/core or Node exposes supported priority-setting and spawn-priority APIs and a tested host-level policy can replace the wrappers, or when measured UI latency shows the split is no longer needed. Revisit tmux pane routing after a wrapper design can preserve its bookkeeping and pass the lifecycle suite.
+
+## Review finding (parent session, 2026-11-22)
+
+The inventory above says LSP servers "remain at nice 19". That holds only for
+servers started *before* elevation. `nice` is copied at fork, so anything the
+elevated main thread spawns afterwards inherits `nice 0`:
+
+    renice: 715666 (process ID) old priority 19, new priority 0
+    self nice: 0, unwrapped child nice: 0
+
+Verified by running the same prlimit+renice sequence and then spawning an
+unwrapped child and reading `/proc/<pid>/stat` field 19. LSP servers are spawned
+by the pi host, not by any extension spawn site, so they are exactly the
+unwrapped case: after this prototype elevates, every restarted `marksman` runs at
+interactive priority.
+
+That is the failure mode the two-sided design exists to prevent, and it is why
+this branch is not landed. To land it, either route the host's LSP spawn through
+the demotion helper (core support, or a wrapper the extension owns), or ship
+`mode: "demote"` as the default so demotion is active and elevation stays opt-in.
+Demotion alone is monotone and safe today: the routed children are already at
+nice 19 by inheritance, so the wrapper only makes that explicit and keeps holding
+once elevation is enabled. Elevation should stay opt-in until both the LSP spawn
+and the tmux pane command are routed, because those two are where the load and
+the tooling actually live.
