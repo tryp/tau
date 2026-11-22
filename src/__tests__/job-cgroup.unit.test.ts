@@ -93,22 +93,30 @@ void describe("job cgroup tier", () => {
         rmSync(cgroup, { recursive: true, force: true });
     });
 
-    void it("reports an invalid or missing tier without throwing", () => {
-        for (const env of [{}, { PI_JOB_CGROUP: "relative/path" }]) {
-            let recorded: unknown;
-            assert.doesNotThrow(() => {
-                recorded = joinJobCgroup(
-                    4242,
-                    (_type, data) => (recorded = data),
-                    env
-                );
+    void it("reports an invalid tier without throwing, and records it", () => {
+        let recorded: unknown;
+        assert.doesNotThrow(() => {
+            recorded = joinJobCgroup(4242, (_type, data) => (recorded = data), {
+                PI_JOB_CGROUP: "relative/path",
             });
-            assert.equal((recorded as { ok: boolean }).ok, false);
-            assert.equal(
-                typeof (recorded as { reason: string }).reason,
-                "string"
-            );
-        }
+        });
+        assert.equal((recorded as { ok: boolean }).ok, false);
+        assert.equal(typeof (recorded as { reason: string }).reason, "string");
         assert.equal(resolveJobCgroup("relative/path"), undefined);
+    });
+
+    void it("records nothing per spawn when no tier is configured", () => {
+        // Unset is the default configuration, not a failure. Recording it on
+        // every spawn put an entry in the session for every bash_bg, agent and
+        // workflow launch of every flat session; the startup record covers it.
+        const entries: unknown[] = [];
+        const result = joinJobCgroup(
+            4242,
+            (_type, data) => entries.push(data),
+            {}
+        );
+        assert.equal(result.ok, false);
+        assert.equal(result.reason, "PI_JOB_CGROUP is unset");
+        assert.deepEqual(entries, []);
     });
 });

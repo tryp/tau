@@ -102,6 +102,7 @@ import { registerPermissions } from "./features/permissions/commands.ts";
 import { registerPlanTools } from "./features/plan-tools.ts";
 import { registerTauCommand } from "./features/features-register.ts";
 import { registerWakeup } from "./features/wakeup.ts";
+import { tierStatus } from "./job-cgroup.ts";
 import { restoreFeaturesState } from "./features/features-state.ts";
 import { isTmuxAvailable } from "./tmux.ts";
 import {
@@ -288,6 +289,15 @@ export default function (pi: ExtensionAPI) {
         lastActivityAt = Date.now();
         return { action: "continue" };
     });
+
+    // Report the cgroup tier this session resolved, once per session: a flat
+    // session (no launcher, or a launcher that fell back) is otherwise
+    // indistinguishable from a tiered one until someone measures under load.
+    try {
+        pi.appendEntry("pi-tier-join", { phase: "startup", ...tierStatus() });
+    } catch {
+        // Reporting the tier must never prevent a session from starting.
+    }
 
     pi.on("agent_start", async (_event, ctx) => {
         turnProcessing = true;

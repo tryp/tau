@@ -58,6 +58,10 @@ export function joinJobCgroup(
     write: (path: string, data: string) => void = writeFileSync
 ): JobCgroupResult {
     const value = env.PI_JOB_CGROUP;
+    // Unset is the default configuration, not a failure: recording it per spawn
+    // would add an entry to every bash_bg/agent/workflow spawn in every flat
+    // session. The startup record from tierStatus() reports the flat case once.
+    const configured = Boolean(value);
     let result: JobCgroupResult;
     if (!value) {
         result = { ok: false, reason: "PI_JOB_CGROUP is unset" };
@@ -93,6 +97,7 @@ export function joinJobCgroup(
         }
     }
 
+    if (!configured) return result;
     try {
         appendEntry?.("pi-tier-join", {
             pid,
