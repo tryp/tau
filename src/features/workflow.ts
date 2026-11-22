@@ -38,7 +38,7 @@ import {
     unlinkSync,
     writeFileSync,
 } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawnDemoted } from "../priority.ts";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -328,7 +328,7 @@ export async function executeAgent(
             execPath: process.execPath,
             platform: process.platform,
         });
-        const proc = spawn(invocation.command, invocation.args, {
+        const proc = spawnDemoted(invocation.command, invocation.args, {
             cwd,
             detached: true,
             stdio: ["ignore", "pipe", "pipe"],

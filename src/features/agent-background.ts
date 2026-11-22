@@ -8,7 +8,8 @@
  * in-memory sessions and large sessions use the summary-only fallback.
  */
 
-import { spawn } from "node:child_process";
+import { spawnDemoted } from "../priority.ts";
+import type { ChildProcess } from "node:child_process";
 import {
     createWriteStream,
     existsSync,
@@ -258,10 +259,10 @@ export function registerAgentBackground(
             promptFile: options.promptFile,
         });
 
-        let proc: ReturnType<typeof spawn>;
+        let proc: ChildProcess;
         try {
             validateWorkingDirectory(options.execCwd);
-            proc = spawn("pi", spawnArgs, {
+            proc = spawnDemoted("pi", spawnArgs, {
                 cwd: options.execCwd,
                 detached: true,
                 stdio: ["pipe", "pipe", "pipe"],

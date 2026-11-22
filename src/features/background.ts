@@ -5,11 +5,8 @@
  * and the pill-bar status widget.
  */
 
-import {
-    spawn,
-    type ChildProcess,
-    type SpawnOptions,
-} from "node:child_process";
+import { type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawnDemoted } from "../priority.ts";
 import { randomUUID } from "node:crypto";
 import {
     closeSync,
@@ -231,7 +228,7 @@ function spawnBashProcess(
     options: SpawnOptions
 ): ChildProcess {
     validateWorkingDirectory(cwd);
-    const proc = spawn("bash", ["-c", command], {
+    const proc = spawnDemoted("bash", ["-c", command], {
         ...options,
         cwd,
         env: options.env ?? { ...process.env },

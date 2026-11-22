@@ -33,6 +33,7 @@ import { registerToolHints } from "./features/tool-hints/index.ts";
 import { registerTimeoutNerf } from "./features/timeout-nerf/index.ts";
 import { isSafeCommand } from "./plan-utils.ts";
 import { Text } from "@earendil-works/pi-tui";
+import { elevateMainThread, priorityCounters } from "./priority.ts";
 import {
     initPermissionState,
     reloadSettingsIfNeeded,
@@ -127,6 +128,7 @@ export function resolveMaintenanceDelayMs(configuredDelay: number): number {
 }
 
 export default function (pi: ExtensionAPI) {
+    void elevateMainThread();
     const state = new TauState();
     let tmuxRunDirSweepTimer: ReturnType<typeof setInterval> | undefined;
     let startupGeneration = 0;
@@ -827,6 +829,10 @@ Existing code to reuse (with paths), and Verification steps.${taskTree}`,
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
+        pi.appendEntry("priority-counters", {
+            ...priorityCounters,
+            elevationSkipped: { ...priorityCounters.elevationSkipped },
+        });
         sessionShuttingDown = true;
         cancelMaintenanceWorker();
         process.stdin.off("data", noteTerminalActivity);
