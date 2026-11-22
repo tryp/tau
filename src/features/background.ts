@@ -33,6 +33,7 @@ import {
     type Stage0SweepResult,
 } from "./pipe-nerf/stage0-retention.ts";
 import { runMaintenanceTask } from "../maintenance/client.ts";
+import { joinJobCgroup, type JobCgroupJoiner } from "../job-cgroup.ts";
 import { recordMaintenanceEvent } from "../maintenance/events.ts";
 import {
     findJobSourceDetailsInSidecar,
@@ -225,10 +226,12 @@ export function installSpawnErrorHandler(proc: ChildProcess): void {
     proc.once("error", () => {});
 }
 
-function spawnBashProcess(
+export function spawnBashProcess(
     command: string,
     cwd: string,
-    options: SpawnOptions
+    options: SpawnOptions,
+    joinChild?: JobCgroupJoiner,
+    appendEntry?: (customType: string, data: unknown) => void
 ): ChildProcess {
     validateWorkingDirectory(cwd);
     const proc = spawn("bash", ["-c", command], {
@@ -237,6 +240,7 @@ function spawnBashProcess(
         env: options.env ?? { ...process.env },
     });
     installSpawnErrorHandler(proc);
+    if (proc.pid && joinChild) joinChild(proc.pid, appendEntry);
     return proc;
 }
 
@@ -3747,7 +3751,8 @@ export function startTimeoutTimer(
 
 export function registerBackgroundJobs(
     pi: ExtensionAPI,
-    state: TauState
+    state: TauState,
+    joinChild: JobCgroupJoiner = joinJobCgroup
 ): void {
     const eventPi = pi as ExtensionAPI & {
         on?: (event: string, handler: (...args: unknown[]) => unknown) => void;
@@ -3909,6 +3914,10 @@ export function registerBackgroundJobs(
             }
 
             // ── Direct spawn path (fallback when tmux unavailable) ───
+            // Tmux-backed bash_bg is intentionally not joined here: the tmux
+            // server creates that shell, and the launcher places its panes in
+            // the panes tier (CPUWeight=200). Host LSP children are separate
+            // pi-host spawns, not owned by this extension.
             const jobId = generateJobId(++state.jobCounter);
             const logPath = logPathForJob(jobId);
             mkdirSync(dirname(logPath), { recursive: true });
@@ -4516,10 +4525,13 @@ export function registerBackgroundJobs(
             const logFd = openSync(logPath, "w");
             let proc: ChildProcess;
             try {
-                proc = spawnBashProcess(params.command, execCwd, {
-                    stdio: ["pipe", logFd, logFd],
-                    detached: true,
-                });
+                proc = spawnBashProcess(
+                    params.command,
+                    execCwd,
+                    { stdio: ["pipe", logFd, logFd], detached: true },
+                    joinChild,
+                    (type, data) => pi.appendEntry(type, data)
+                );
             } finally {
                 closeSync(logFd);
             }

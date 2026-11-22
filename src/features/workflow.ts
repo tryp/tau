@@ -40,6 +40,7 @@ import {
 } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
+import { joinJobCgroup, type JobCgroupJoiner } from "../job-cgroup.ts";
 import { join, resolve } from "node:path";
 
 import type {
@@ -282,13 +283,35 @@ export function extractAgentText(jsonStream: string): string {
  * per-agent timeout so a single stuck subprocess can never block the whole
  * workflow; aborts and timeouts both SIGTERM the detached process group.
  */
+// Host LSP children are deliberately not routed here: the pi host starts them
+// in /home/dev/src/pi-lsp-adapter/src/lsp/client.ts (injectable spawner ~line 146,
+// defaultSpawner ~line 524), outside this extension's spawn ownership.
+export function spawnAndJoinWorkflowAgent(
+    command: string,
+    args: string[],
+    cwd: string,
+    joinChild: JobCgroupJoiner,
+    appendEntry?: (customType: string, data: unknown) => void
+): ReturnType<typeof spawn> {
+    const proc = spawn(command, args, {
+        cwd,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    installSpawnErrorHandler(proc);
+    if (proc.pid) joinChild(proc.pid, appendEntry);
+    return proc;
+}
+
 export async function executeAgent(
     prompt: string,
     opts: Record<string, unknown> | undefined,
     cwd: string,
     model?: string,
     signal?: AbortSignal,
-    timeoutMs: number = AGENT_TIMEOUT_MS
+    timeoutMs: number = AGENT_TIMEOUT_MS,
+    joinChild: JobCgroupJoiner = joinJobCgroup,
+    appendEntry?: (customType: string, data: unknown) => void
 ): Promise<string> {
     const id = randomBytes(8).toString("hex");
     const promptFile = join(tmpdir(), `pi-wf-agent-${id}.md`);
@@ -328,12 +351,13 @@ export async function executeAgent(
             execPath: process.execPath,
             platform: process.platform,
         });
-        const proc = spawn(invocation.command, invocation.args, {
+        const proc = spawnAndJoinWorkflowAgent(
+            invocation.command,
+            invocation.args,
             cwd,
-            detached: true,
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        installSpawnErrorHandler(proc);
+            joinChild,
+            appendEntry
+        );
 
         const logStream = createWriteStream(logFile, { flags: "w" });
         let output = "";
@@ -426,7 +450,9 @@ export async function executeWorkflowScript(
     cwd: string,
     abortController: AbortController,
     model?: string,
-    onProgress?: (event: WorkflowProgressEvent) => void
+    onProgress?: (event: WorkflowProgressEvent) => void,
+    joinChild: JobCgroupJoiner = joinJobCgroup,
+    appendEntry?: (customType: string, data: unknown) => void
 ): Promise<{ result: string; cachedResults: WorkflowAgentResult[] }> {
     const cachedResults = [...run.cachedResults];
     let agentCount = 0;
@@ -483,7 +509,10 @@ export async function executeWorkflowScript(
                 opts,
                 cwd,
                 agentModel,
-                abortController.signal
+                abortController.signal,
+                AGENT_TIMEOUT_MS,
+                joinChild,
+                appendEntry
             );
 
             // Cache the result
@@ -1148,7 +1177,9 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                     // The cached results are written to run.cachedResults
                     // after executeWorkflowScript returns.
                     updateWorkflowStatus(state, ctx);
-                }
+                },
+                joinJobCgroup,
+                (type, data) => pi.appendEntry(type, data)
             );
 
             // Mark completed

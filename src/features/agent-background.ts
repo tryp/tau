@@ -53,6 +53,7 @@ import {
     jobDetails,
 } from "./background.ts";
 import { trackJobOutputIndex } from "./sidecar.ts";
+import { joinJobCgroup, type JobCgroupJoiner } from "../job-cgroup.ts";
 
 interface AgentProcessOptions {
     mode: "fork" | "summary";
@@ -61,6 +62,23 @@ interface AgentProcessOptions {
     sessionFile?: string;
     modelArg?: string;
     thinkingLevel?: string;
+}
+
+export function spawnAndJoinAgentProcess(
+    command: string,
+    args: string[],
+    cwd: string,
+    joinChild: JobCgroupJoiner,
+    appendEntry?: (customType: string, data: unknown) => void
+): ReturnType<typeof spawn> {
+    const proc = spawn(command, args, {
+        cwd,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    installSpawnErrorHandler(proc);
+    if (proc.pid) joinChild(proc.pid, appendEntry);
+    return proc;
 }
 
 // ─── Context continuity ─────────────────────────────────────────────
@@ -204,7 +222,8 @@ export function estimateConversationBytes(entries: SessionEntry[]): number {
 
 export function registerAgentBackground(
     pi: ExtensionAPI,
-    state: TauState
+    state: TauState,
+    joinChild: JobCgroupJoiner = joinJobCgroup
 ): void {
     const failAgentStart = (
         job: BackgroundJob,
@@ -261,12 +280,13 @@ export function registerAgentBackground(
         let proc: ReturnType<typeof spawn>;
         try {
             validateWorkingDirectory(options.execCwd);
-            proc = spawn("pi", spawnArgs, {
-                cwd: options.execCwd,
-                detached: true,
-                stdio: ["pipe", "pipe", "pipe"],
-            });
-            installSpawnErrorHandler(proc);
+            proc = spawnAndJoinAgentProcess(
+                "pi",
+                spawnArgs,
+                options.execCwd,
+                joinChild,
+                (type, data) => pi.appendEntry(type, data)
+            );
         } catch (error) {
             failAgentStart(job, options.promptFile, ctx, error);
             return;
